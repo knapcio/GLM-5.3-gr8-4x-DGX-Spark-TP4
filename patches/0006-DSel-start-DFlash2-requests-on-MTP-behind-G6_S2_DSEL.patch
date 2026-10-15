@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Thu, 15 Oct 2026 08:14:47 +0200
+Subject: [PATCH 06/13] DSel: start DFlash2 requests on MTP behind
+ G6_S2_DSEL_START=mtp
+
+The drafter's prompt-tail drafts become the first probe; d[2..K] are chained at
+admit. Unset (or dflash) keeps today's start on DFlash2.
+---
+ docs/SETTINGS.md                            |  1 +
+ engine/runtime/g6m4.cu                      | 10 +++++++++-
+ engine/runtime/s2/tests/batch_dsel_test.cpp | 17 +++++++++++++++++
+ engine/runtime/s2_batch.h                   |  9 ++++++++-
+ 4 files changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/docs/SETTINGS.md b/docs/SETTINGS.md
+index e5314ac..094bf51 100644
+--- a/docs/SETTINGS.md
++++ b/docs/SETTINGS.md
+@@ -93,6 +93,7 @@ the short version.
+ | `G6_S2_ADAPT` | 0 | S2: choose each round's MTP draft count (1..k) from the sessions' accept rates and the S2 step costs; 1 adds ~1 GiB of main-step graphs |
+ | `G6_S2_GROW` | 1 | S2: a session below R holds the KV pages it needs now and takes more as its output grows, admitted and grown only while every live session can still reach prompt + `max_tokens` + guard; a session that cannot grow sits out rounds. 0 = every run holds that worst case from admission |
+ | `G6_S2_DSEL` | 1 | S2 with DFlash2: a request that decodes alone drafts each round with DFlash2 or MTP, whichever is expected to commit more tokens per ms (prose +4.5% on RigMark, code level); 0 = DFlash2 every round. `G6_S2_DSEL_MARGIN` (0.15), `G6_S2_DSEL_DWELL` (8 rounds) and `G6_S2_DSEL_PROBE` (4) tune it |
++| `G6_S2_DSEL_START` | dflash | S2 drafter choice: `mtp` = a DFlash2 request starts on MTP (the drafter's prompt-tail drafts are its first probe) and moves to DFlash2 when the evidence says so. Every rank must set the same value |
+ | `G6_DEC_EVPROF` | unset | measurement: N = per-stage decode step times from event nodes in the captured main-step graphs, printed every N main steps (rank logs) |
+ | `G6_DEC_PROF` | unset | measurement, plain launches only: the same stages with a synchronize at every mark |
+ | `G6_DFL_PFCTX` | 1 | `--dflash`: 0 = no prompt context from the prefill (measurement); the drafter then starts from the last prompt token |
+diff --git a/engine/runtime/g6m4.cu b/engine/runtime/g6m4.cu
+index e67991c..dd1770b 100644
+--- a/engine/runtime/g6m4.cu
++++ b/engine/runtime/g6m4.cu
+@@ -448,6 +448,11 @@ int main(int argc, char** argv)
+     const int dfl_i4 = env_choice("G6_DFL_HEAD_I4", 1, 0, &dfe);
+     if (dfl_i4 < 0) die(dfe);
+     if (dfl_i4 && !dfl) die("G6_DFL_HEAD_I4=1 needs --dflash-manifest");
++    // G6_S2_DSEL_START=mtp (s2_batch.h DSel::start_mtp; default dflash): a DFlash2 request starts on MTP. In the S2 runtime
++    // signature
++    const char* dse = getenv("G6_S2_DSEL_START");
++    const bool dsel_start_mtp = dse && !strcmp(dse, "mtp");
++    if (dse && *dse && !dsel_start_mtp && strcmp(dse, "dflash")) die("G6_S2_DSEL_START: mtp or dflash");
+     g6::Fabric fabg, fabdg;
+     bool fabg_on = false, fabdg_on = false;
+     auto qs_fabric = [&](g6::Fabric& fb, const Model& mm, int port_off, const char* what) {
+@@ -1147,11 +1152,13 @@ int main(int argc, char** argv)
+                 if (const char* e = getenv("G6_S2_DSEL_MARGIN")) h.dsel.margin = atof(e);
+                 if (const char* e = getenv("G6_S2_DSEL_DWELL")) h.dsel.dwell = std::max(1, atoi(e));
+                 if (const char* e = getenv("G6_S2_DSEL_PROBE")) h.dsel.probe = std::max(1, atoi(e));
++                h.dsel.start_mtp = dsel_start_mtp;
+                 h.dsel.d.draft_round = 5.6 + 2.5;
+                 h.dsel.m.draft_round = 2.5 + 3.0;
+                 h.dsel.m.draft_each = 2.1;
+                 if (R == 0 && h.dsel.on) fprintf(stderr, "# s2 drafter choice on: DFlash2 or MTP per round (dwell %d, margin %.2f, probe %d)\n",
+                                                     h.dsel.dwell, h.dsel.margin, h.dsel.probe);
++                if (R == 0 && h.dsel.on && h.dsel.start_mtp) fprintf(stderr, "# s2 drafter choice: requests start on MTP\n");
+                 // a 1-token prompt has no prefill: the drafter starts from its prompt step (dfl_lo = first, as plain)
+                 h.dispatch.dfl_ok = [&](int q) { return dfl_owner == q || slot_prompt[q] == 1; };
+                 h.dispatch.dfl_start = [&](int q) {    // the offline loop's fill steps: Dfl::pf_feat -> the ring
+@@ -1205,7 +1212,8 @@ int main(int argc, char** argv)
+                 (set_id.empty() ? "" : " set " + set_id) + (qs_mode ? " qasplit " + std::to_string(qs_mode) : "") +
+                 (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "") +
+                 (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
+-                (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "");
++                (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
++                (dsel_start_mtp ? " dselstart mtp" : "");
+             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
+                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
+             g6s2::ControlLinks links = g6s2::bootstrap(bc);
+diff --git a/engine/runtime/s2/tests/batch_dsel_test.cpp b/engine/runtime/s2/tests/batch_dsel_test.cpp
+index 77505f6..d256995 100644
+--- a/engine/runtime/s2/tests/batch_dsel_test.cpp
++++ b/engine/runtime/s2/tests/batch_dsel_test.cpp
+@@ -67,6 +67,23 @@ int main()
+     b.admit({0}, {s});
+     for (int i = 0; i < 40; ++i) CHECK(b.round({0}));
+     CHECK(std::count(rounds.begin(), rounds.end(), 'm') == 0);
++    // DSel::start_mtp: the same request starts on MTP (first round 'm', its d[2..K] chained at admit), and the drafter's
++    // prompt-tail probe and later probes move it to DFlash2; every committed token is still the target's
++    {
++        Batch c(3, 32, h);
++        c.dflash(7, g6rt::SpecLen());
++        DSel s2 = sel;
++        s2.start_mtp = true;
++        c.dsel(s2);
++        rounds.clear(); got.clear();
++        c.admit({0}, {s});
++        for (int i = 0; i < 60; ++i) CHECK(c.round({0}));
++        CHECK(rounds.size() == 60 && rounds[0] == 'm' && rounds.back() == 'd');
++        CHECK(c.stats(0).switches == 1 && c.stats(0).mtp_rounds >= 8);
++        bool ex = true;
++        for (size_t i = 0; i < got.size(); ++i) ex &= got[i] == target(9 + (int)i);
++        CHECK(ex && got.size() > 60);
++    }
+     std::printf("batch_dsel_test: %s (%ld rounds, %ld on MTP, %ld switches)\n", fails ? "FAIL" : "PASS", b.stats(0).rounds,
+                 b.stats(0).mtp_rounds, b.stats(0).switches);
+     return fails ? 1 : 0;
+diff --git a/engine/runtime/s2_batch.h b/engine/runtime/s2_batch.h
+index 3242cd7..17c6c75 100644
+--- a/engine/runtime/s2_batch.h
++++ b/engine/runtime/s2_batch.h
+@@ -163,6 +163,9 @@ struct DSel
+     int dwell = 8;                    // rounds on a drafter before the next switch (4 switched code to MTP too often)
+     double margin = 0.15;             // switch when the other drafter's tokens per ms is this much higher (0.05: code -2.7%)
+     int probe = 4;                    // every probe-th MTP round the drafter step also drafts (scored next round)
++    // G6_S2_DSEL_START=mtp: a request starts on MTP and the drafter's prompt-tail drafts are its first probe (default:
++    // it starts on DFlash2)
++    bool start_mtp = false;
+     g6rt::SpecLen d, m;               // DFlash2 and MTP estimates; draft_round / draft_each hold each round's drafting ms
+ };
+ class Batch
+@@ -178,7 +181,9 @@ public:
+         {
+             const int q = qs[k];
+             if (q < 0 || q >= S2N_SLOTS || st_[q].on) throw std::runtime_error("s2: admit: slot " + std::to_string(q) + " is out of range or in use");
+-            if (prompt(q, ss[k]) && !st_[q].dfl && st_[q].force < 0) live.push_back(q);
++            if (!prompt(q, ss[k]) || st_[q].force >= 0) continue;
++            if (!st_[q].dfl) live.push_back(q);
++            else if (st_[q].mtp) chain({q}, {int(Step::TAIL)}, K_);   // DSel::start_mtp: d[2..K] for its first round
+         }
+         std::vector<int> all;
+         for (int q = 0; q < S2N_SLOTS; ++q) if (active(q)) all.push_back(q);
+@@ -522,6 +527,7 @@ private:
+         {
+             sel_.d = fresh(sel_.d);
+             sel_.m = fresh(sel_.m);
++            x.mtp = sel_.start_mtp;
+         }
+         if (x.dfl && !(h_.dfl && h_.dfl_start)) throw std::runtime_error("s2: DFlash2 session without drafter hooks");
+         stats_[q].acc.assign(std::max(K_, x.dfl ? DFL_B - 1 : 0) + 1, 0);
+@@ -559,6 +565,7 @@ private:
+             x.d[1] = u[M - 1];
+             const bool query = s == PS - 1 && x.force < 0;
+             if (x.dfl) drafts(q, DflReq{q, M, rows[0].pos, query ? t[M - 1] : 0, x.lo, query});
++            if (x.dfl && x.mtp && query) { x.pb = n; std::copy(x.dd, x.dd + DFL_B, x.pd); std::copy(x.dl, x.dl + DFL_B, x.pl); }
+         }
+         return true;
+     }

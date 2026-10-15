@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Thu, 15 Oct 2026 03:46:44 +0200
+Subject: [PATCH 05/13] DFlash2 drafter head on the INT4 records behind
+ G6_DFL_HEAD_I4
+
+G6_DFL_HEAD_I4=1 (default 0, needs --dflash-manifest): the DFlash2 drafter's
+head GEMV binds the INT4 g32 records of the rank's vocab slice instead of the
+target's MXFP8 records (dflash.cuh dfl_head_i4). It reuses the MTP draft's
+copy when G6_DRAFT_HEAD_I4 made one (same slice, same G6_DRAFT_HEAD_KS pair
+repack), else makes one the same way (rank.cuh head_i4_records, now shared by
+both). In the S2 runtime signature. The target's head and the verify step
+are unchanged.
+
+In selector mode the head's raw logits pick each row's global top-16
+(k_top_local) and enter the walk's scores (logit + pred . hp . succ).
+Offline proxy on the MTP draft vectors (19,096 head inputs, E9 held-out):
+target token in the top-16 97.00% MXFP8 vs 97.02% INT4 (paired +0.02 pt
+[-0.05, +0.09]); top-16 overlap 96.1%; |dlogit| on the top-16 median 0.13,
+p99 0.54.
+---
+ docs/SETTINGS.md          |  1 +
+ engine/runtime/dflash.cuh | 16 ++++++++++++++++
+ engine/runtime/g6m4.cu    | 12 +++++++++++-
+ engine/runtime/rank.cuh   | 37 ++++++++++++++++++++++---------------
+ 4 files changed, 50 insertions(+), 16 deletions(-)
+
+diff --git a/docs/SETTINGS.md b/docs/SETTINGS.md
+index f92ddd2..e5314ac 100644
+--- a/docs/SETTINGS.md
++++ b/docs/SETTINGS.md
+@@ -88,6 +88,7 @@ the short version.
+ | `G6_IDXQ_SPLIT` | 0 | decode: the indexer's wq_b (idx_q, 4096 outputs, replicated) split by output tiles the same way on the same fabric, on the indexer layers: each rank's tiles are published, q_b runs while the gather is on the wire, then the gather. Same bits as 0. Independent of `G6_QA_SPLIT` |
+ | `G6_MTP_SPLIT` | 0 | MTP draft steps (needs `--mtp`): eh_proj (6144 outputs, 78 MB replicated), then layer 78's q_a / kv_a / indexer k and weights (as `G6_QA_SPLIT=1`) and idx_q (as `G6_IDXQ_SPLIT=1`), split by output tiles and gathered on a draft gather fabric (port + 72). Same bits as 0 |
+ | `G6_DRAFT_HEAD_I4` | 0 | MTP draft steps (needs `--mtp`): the draft's lm_head GEMV reads INT4 g32 records of the rank's vocab slice, made at boot on the GPU from its MXFP8 records (134 MB more per rank at TP4), instead of the MXFP8 records: 45% fewer head bytes per draft step. The target's head and the verify steps are unchanged, so the committed tokens are the target's; drafts (and their log-probabilities, which `--spec-adaptive` reads) can differ from the MXFP8 head's (offline, E9 held-out: first-draft acceptance -0.07 pt [-0.32, +0.17]). Same on every rank. `G6_DRAFT_HEAD_KS` (32, 2..32) / `G6_DRAFT_HEAD_TPC` (1) = the GEMV's k parts per tile and tiles per CTA; every rank must set the same values |
++| `G6_DFL_HEAD_I4` | 0 | DFlash2 drafter (needs `--dflash-manifest`): its lm_head GEMV reads the same INT4 g32 records as `G6_DRAFT_HEAD_I4` (the MTP draft's copy when that is on, else one made the same way; same `G6_DRAFT_HEAD_KS` / `_TPC`). In selector mode the head's raw logits choose each row's top-16 candidates and enter their walk scores, so INT4 can change both. The target's head and the verify steps are unchanged. Every rank must set the same value |
+ | `G6_GV_MULTI` | 1 | steps of up to 8 rows run the GEMVs on the layer input (q_a, kv_a, the indexer's k and weights) as one launch; 0 = one launch each (same bits) |
+ | `G6_S2_ADAPT` | 0 | S2: choose each round's MTP draft count (1..k) from the sessions' accept rates and the S2 step costs; 1 adds ~1 GiB of main-step graphs |
+ | `G6_S2_GROW` | 1 | S2: a session below R holds the KV pages it needs now and takes more as its output grows, admitted and grown only while every live session can still reach prompt + `max_tokens` + guard; a session that cannot grow sits out rounds. 0 = every run holds that worst case from admission |
+diff --git a/engine/runtime/dflash.cuh b/engine/runtime/dflash.cuh
+index 0e6a3d6..9798b05 100644
+--- a/engine/runtime/dflash.cuh
++++ b/engine/runtime/dflash.cuh
+@@ -679,6 +679,22 @@ inline void dfl_build(Dfl& D, const Model& main, const Find& find, const DflMeta
+             D.fc.codec == bind::MXFP8 ? "MXFP8" : "BF16");
+ }
+ 
++// G6_DFL_HEAD_I4=1 (g6m4; default 0, needs --dflash-manifest): the drafter's head GEMV reads INT4 g32 records of this
++// rank's vocab slice (rank.cuh head_i4_records; the MTP draft's copy when G6_DRAFT_HEAD_I4 made one, same slice and ks)
++// instead of the target's MXFP8 records. The head feeds the drafter two ways: argmax mode samples from its logits
++// (k_head_local / merge, as the MTP draft); selector mode takes each row's global top-16 by raw logit (k_top_local, merged
++// in k_walk) and scores them as logit + pred[prev] . hp[s] . succ[c], so INT4 can change both which 16 are candidates and
++// their scores. The target's head and the verify step are unchanged. After dfl_build, before the drafter's graphs.
++inline void dfl_head_i4(Dfl& D, const uint8_t* rec, int tpc, int ks)
++{
++    bind::Tensor t;
++    t.p = rec; t.nd = 3;
++    t.shape[0] = D.vn / 16; t.shape[1] = HID / 32; t.shape[2] = head_i4::I4GR;
++    if (const char* e = bind::make_gv(t, bind::INT4, tpc, ks, dfl::B, D.xf_head, D.hlog, gv::O_F32, D.head.lm_head))
++        die(std::string("G6_DFL_HEAD_I4: ") + e);
++    if (D.head.lm_head.O != D.vn || D.head.lm_head.K != HID) die("G6_DFL_HEAD_I4: INT4 head is not this rank's vocab slice");
++}
++
+ // ---------------------------------------------------------------- the step, in phases
+ inline void dfl_xfrag(const __half* src, int K_, u32* f16, u32* b16, cudaStream_t st)
+ {
+diff --git a/engine/runtime/g6m4.cu b/engine/runtime/g6m4.cu
+index b7c2a48..e67991c 100644
+--- a/engine/runtime/g6m4.cu
++++ b/engine/runtime/g6m4.cu
+@@ -442,6 +442,12 @@ int main(int argc, char** argv)
+     // rank's vocab slice; the target's head is unchanged. In the S2 runtime signature with its split.
+     const DraftHeadI4 dhead = draft_head_i4_env();
+     if (dhead.on && !mtp) die("G6_DRAFT_HEAD_I4=1 needs --mtp");
++    // G6_DFL_HEAD_I4=1 (dflash.cuh dfl_head_i4; default 0): the DFlash2 drafter's head reads the same INT4 records (the MTP
++    // draft's copy when there is one), with G6_DRAFT_HEAD_KS / _TPC. In the S2 runtime signature.
++    std::string dfe;
++    const int dfl_i4 = env_choice("G6_DFL_HEAD_I4", 1, 0, &dfe);
++    if (dfl_i4 < 0) die(dfe);
++    if (dfl_i4 && !dfl) die("G6_DFL_HEAD_I4=1 needs --dflash-manifest");
+     g6::Fabric fabg, fabdg;
+     bool fabg_on = false, fabdg_on = false;
+     auto qs_fabric = [&](g6::Fabric& fb, const Model& mm, int port_off, const char* what) {
+@@ -684,6 +690,9 @@ int main(int argc, char** argv)
+         // G6_DFL_PFCTX=0 (measurement): the drafter gets no prompt context from the prefill and starts at the last prompt token
+         const bool pfctx = MP && !(getenv("G6_DFL_PFCTX") && atoi(getenv("G6_DFL_PFCTX")) == 0);
+         dfl_build(DF, m, dfind, meta, fabf.dev(), dmalloc<u64>(1), dfl_sel < 0 ? meta.sel : dfl_sel == 1, st, pfctx);
++        if (dfl_i4)
++            dfl_head_i4(DF, D.d.dh_i4 ? D.d.dh_i4 : head_i4_records(m.head_t.lm_head, m.vn, dhead.ks, R, "G6_DFL_HEAD_I4", st),
++                        dhead.tpc, dhead.ks);
+         dfl_attach(m, DF);              // before the target graphs are captured: they carry the residual taps
+         if (pfctx) { P.dfl_tap = dfl_pf_tap_launch; P2.dfl_tap = dfl_pf_tap_launch; }
+     }
+@@ -1195,7 +1204,8 @@ int main(int argc, char** argv)
+                 " qpctx " + std::to_string(pf_qp ? P.qp_ctx : 0) + " qpmin " + std::to_string(pf_qp ? pf_qp_min() : 0) +
+                 (set_id.empty() ? "" : " set " + set_id) + (qs_mode ? " qasplit " + std::to_string(qs_mode) : "") +
+                 (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "") +
+-                (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "");
++                (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
++                (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "");
+             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
+                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
+             g6s2::ControlLinks links = g6s2::bootstrap(bc);
+diff --git a/engine/runtime/rank.cuh b/engine/runtime/rank.cuh
+index 2b44ae9..bc94535 100644
+--- a/engine/runtime/rank.cuh
++++ b/engine/runtime/rank.cuh
+@@ -1542,28 +1542,35 @@ inline DraftHeadI4 draft_head_i4_env()
+     if (c.tpc * c.ks > 32) die("G6_DRAFT_HEAD_TPC x G6_DRAFT_HEAD_KS must be <= 32 (warps of one CTA)");
+     return c;
+ }
+-// after build_draft, before prepare / any capture of a draft step (head_for binds the records on first use)
+-inline void build_draft_head_i4(Draft& D, const DraftHeadI4& c, cudaStream_t st)
+-{
+-    Model& d = D.d;
+-    if (!c.on) return;
+-    const bind::Tensor& mx = d.head_t.lm_head;
+-    if (!mx.p || mx.nd != 3 || mx.shape[0] * 16 != d.vn || mx.shape[1] != HID / 32 || mx.shape[2] != head_i4::MXGR)
+-        die("G6_DRAFT_HEAD_I4: G.lm_head.mx.gv is not this rank's [vn/16][192][528] MXFP8 slice");
+-    for (int M = 1; M <= MX; ++M)
+-        if (d.head[M].M) die("G6_DRAFT_HEAD_I4: the draft head was bound before its INT4 records were made");
+-    const int tiles = d.vn / 16, ng = HID / 32;
++// INT4 g32 head records [vn/16][192][288] of a rank's MXFP8 lm_head slice mx (G.lm_head.mx.gv), DEC_I4PAIR-repacked for
++// k-part count ks; device memory owned by the caller for the life of the process. Shared by the MTP draft
++// (G6_DRAFT_HEAD_I4) and the DFlash2 drafter (G6_DFL_HEAD_I4, dflash.cuh dfl_head_i4): same slice, same ks, one copy.
++inline const uint8_t* head_i4_records(const bind::Tensor& mx, int vn, int ks, int rank, const char* who, cudaStream_t st)
++{
++    if (!mx.p || mx.nd != 3 || mx.shape[0] * 16 != vn || mx.shape[1] != HID / 32 || mx.shape[2] != head_i4::MXGR)
++        die(std::string(who) + ": G.lm_head.mx.gv is not this rank's [vn/16][192][528] MXFP8 slice");
++    const int tiles = vn / 16, ng = HID / 32;
+     uint8_t* rec = dmalloc<uint8_t>(head_i4::bytes(tiles, ng));
+     head_i4::launch(static_cast<const uint8_t*>(mx.p), rec, tiles, ng, st);
+     G6RT_CK(cudaGetLastError());
+ #if DEC_I4PAIR
+-    launch_i4pair(rec, tiles, ng, c.ks, st);    // the pair records gv_gemv reads for k-part count ks (ng % ks == 0: make_gv keeps it)
++    launch_i4pair(rec, tiles, ng, ks, st);      // the pair records gv_gemv reads for k-part count ks (ng % ks == 0: make_gv keeps it)
+     G6RT_CK(cudaGetLastError());
+ #endif
+     G6RT_CK(cudaStreamSynchronize(st));
+-    d.dh_i4 = rec; d.dh_tpc = c.tpc; d.dh_ks = c.ks;
+-    fprintf(stderr, "# rank %d: G6_DRAFT_HEAD_I4: MTP draft head as INT4 g32, %.1f MB (MXFP8 %.1f MB), tpc %d ks %d\n", d.rank,
+-            head_i4::bytes(tiles, ng) / 1e6, (double)tiles * ng * head_i4::MXGR / 1e6, c.tpc, c.ks);
++    fprintf(stderr, "# rank %d: %s: INT4 g32 head records, %.1f MB (MXFP8 %.1f MB), ks %d\n", rank, who,
++            head_i4::bytes(tiles, ng) / 1e6, (double)tiles * ng * head_i4::MXGR / 1e6, ks);
++    return rec;
++}
++// after build_draft, before prepare / any capture of a draft step (head_for binds the records on first use)
++inline void build_draft_head_i4(Draft& D, const DraftHeadI4& c, cudaStream_t st)
++{
++    Model& d = D.d;
++    if (!c.on) return;
++    for (int M = 1; M <= MX; ++M)
++        if (d.head[M].M) die("G6_DRAFT_HEAD_I4: the draft head was bound before its INT4 records were made");
++    d.dh_i4 = head_i4_records(d.head_t.lm_head, d.vn, c.ks, d.rank, "G6_DRAFT_HEAD_I4", st);
++    d.dh_tpc = c.tpc; d.dh_ks = c.ks;
+ }
+ #ifdef DEC_S2
+ inline const __half* s2_draft_hid(Draft& D, bool chain, cudaStream_t st);

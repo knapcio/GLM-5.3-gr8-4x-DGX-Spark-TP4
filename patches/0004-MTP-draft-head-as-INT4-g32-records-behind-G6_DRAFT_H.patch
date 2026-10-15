@@ -1,0 +1,655 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Thu, 15 Oct 2026 03:03:28 +0200
+Subject: [PATCH 04/13] MTP draft head as INT4 g32 records behind
+ G6_DRAFT_HEAD_I4
+
+G6_DRAFT_HEAD_I4=1 (default 0, needs --mtp): at boot every rank converts its
+MXFP8 lm_head records (G.lm_head.mx.gv) into INT4 g32 GEMV records of the same
+vocab slice on the GPU (kernels/head_i4.cuh, records::int4_quantize on the
+MXFP8 values; DEC_I4PAIR builds repack them for the launch's ks), and the MTP
+draft model's head binds them instead (head_for). 3456 B per vocab row instead
+of 6336: the draft head reads 134 MB instead of 246 MB per step at TP4. The
+target's head and every verify step are unchanged, so the committed tokens
+are the target's; drafts and their log-probabilities can differ from the
+MXFP8 head's and stay identical on every rank (same conversion per slice,
+head merge in rank order). G6_DRAFT_HEAD_KS / G6_DRAFT_HEAD_TPC set the GEMV
+split; all three go into the S2 runtime signature. m4sim reads the same knob.
+
+Offline (E9 held-out roots, 9548 K2 anchors, 288 prompts, qualified layer-78
+reference): first-draft acceptance -0.07 pt [-0.32, +0.17], K2 tokens/round
+-0.0010 [-0.0056, +0.0034] against the MXFP8 head.
+
+dhead_i4_test (c1_tests.sh): the conversion against a host derivation of the
+record layouts, the INT4 head GEMV against a host dot, and --time for the
+MXFP8 vs INT4 head GEMV split table.
+---
+ docs/SETTINGS.md                      |   1 +
+ engine/kernels/head_i4.cuh            |  75 ++++++
+ engine/runtime/g6m4.cu                |   8 +-
+ engine/runtime/m4sim.cu               |   3 +
+ engine/runtime/rank.cuh               |  70 ++++++
+ engine/runtime/tests/dhead_i4_test.cu | 328 ++++++++++++++++++++++++++
+ scripts/c1_tests.sh                   |   7 +-
+ 7 files changed, 490 insertions(+), 2 deletions(-)
+ create mode 100644 engine/kernels/head_i4.cuh
+ create mode 100644 engine/runtime/tests/dhead_i4_test.cu
+
+diff --git a/docs/SETTINGS.md b/docs/SETTINGS.md
+index 346840a..f92ddd2 100644
+--- a/docs/SETTINGS.md
++++ b/docs/SETTINGS.md
+@@ -87,6 +87,7 @@ the short version.
+ | `G6_QA_SPLIT` | 0 | decode: the GEMVs on the layer input, whose weights every rank holds in full, split by 16-output tiles across the ranks, then all-gathered per layer on a fabric of their own (port + 64) before the q_a norm. 1 = q_a, kv_a and the indexer's k and weights; 2 = q_a only, with kv_a and the indexer's GEMVs run in full while the gather is on the wire. Same bits as 0 (an output tile's arithmetic does not depend on which tiles a launch covers). Every rank must set the same value. Main model only (the MTP layer keeps the full GEMVs). `G6_QA_SPLIT_TPC` (1) = tiles per CTA of the split GEMVs, `G6_QA_SPLIT_CPU` (`--proxy-cpu` - 9) = the gather proxy's core |
+ | `G6_IDXQ_SPLIT` | 0 | decode: the indexer's wq_b (idx_q, 4096 outputs, replicated) split by output tiles the same way on the same fabric, on the indexer layers: each rank's tiles are published, q_b runs while the gather is on the wire, then the gather. Same bits as 0. Independent of `G6_QA_SPLIT` |
+ | `G6_MTP_SPLIT` | 0 | MTP draft steps (needs `--mtp`): eh_proj (6144 outputs, 78 MB replicated), then layer 78's q_a / kv_a / indexer k and weights (as `G6_QA_SPLIT=1`) and idx_q (as `G6_IDXQ_SPLIT=1`), split by output tiles and gathered on a draft gather fabric (port + 72). Same bits as 0 |
++| `G6_DRAFT_HEAD_I4` | 0 | MTP draft steps (needs `--mtp`): the draft's lm_head GEMV reads INT4 g32 records of the rank's vocab slice, made at boot on the GPU from its MXFP8 records (134 MB more per rank at TP4), instead of the MXFP8 records: 45% fewer head bytes per draft step. The target's head and the verify steps are unchanged, so the committed tokens are the target's; drafts (and their log-probabilities, which `--spec-adaptive` reads) can differ from the MXFP8 head's (offline, E9 held-out: first-draft acceptance -0.07 pt [-0.32, +0.17]). Same on every rank. `G6_DRAFT_HEAD_KS` (32, 2..32) / `G6_DRAFT_HEAD_TPC` (1) = the GEMV's k parts per tile and tiles per CTA; every rank must set the same values |
+ | `G6_GV_MULTI` | 1 | steps of up to 8 rows run the GEMVs on the layer input (q_a, kv_a, the indexer's k and weights) as one launch; 0 = one launch each (same bits) |
+ | `G6_S2_ADAPT` | 0 | S2: choose each round's MTP draft count (1..k) from the sessions' accept rates and the S2 step costs; 1 adds ~1 GiB of main-step graphs |
+ | `G6_S2_GROW` | 1 | S2: a session below R holds the KV pages it needs now and takes more as its output grows, admitted and grown only while every live session can still reach prompt + `max_tokens` + guard; a session that cannot grow sits out rounds. 0 = every run holds that worst case from admission |
+diff --git a/engine/kernels/head_i4.cuh b/engine/kernels/head_i4.cuh
+new file mode 100644
+index 0000000..c68d0e4
+--- /dev/null
++++ b/engine/kernels/head_i4.cuh
+@@ -0,0 +1,75 @@
++// G6_DRAFT_HEAD_I4: the MTP draft's lm_head as INT4 g32 GEMV records (densev.cuh Int4v, 288 B per 16 rows x 32 inputs),
++// made on the GPU at boot from this rank's MXFP8 records of the same rows (G.lm_head.mx.gv, densev.cuh Mxfp8, 528 B).
++// The target's head keeps the MXFP8 records; only the draft reads these. 3456 B per vocab row instead of 6336: the draft
++// head reads 45% fewer bytes, on the same vocab slice, with the same head kernels (full-vocab argmax and log-probability).
++//
++// Per row and group of 32 inputs (engine/loader-rs records::int4_quantize on the MXFP8 values):
++//   v = e4m3(code) * 2^(e8m0 - 127)   (exact in fp32)
++//   s = fp16(amax(|v|) / 7)            round to nearest even
++//   q = clamp(rint_even(v / s), -8, 7) + 8, q = 8 where s == 0
++// Record layouts (engine/ref/g6ref.py mxfp8_record / rt_record), r = row & 7, hi = row >> 3, lane (r, c):
++//   MXFP8  tile h (k 16h..16h+15) at 256 h, lane at 8 lane: {(r,2c) (r,2c+1) (r+8,2c) (r+8,2c+1) (r,2c+8) (r,2c+9)
++//          (r+8,2c+8) (r+8,2c+9)}; E8M0 scale of row r + 8 hi at 512 + 2 r + hi
++//   INT4   tile h at 128 h, lane at 4 lane: bytes {row r, row r+8} of k (2c, 2c+1), then of k (2c+8, 2c+9); the lower
++//          k in the low nibble; fp16 scale of row r + 8 hi at 256 + 2 (2 r + hi)
++// One thread per (16-row tile, group, row): it writes only its own row's bytes, so the conversion is deterministic.
++#pragma once
++#include <cstdint>
++#include <cuda_fp16.h>
++
++namespace head_i4
++{
++constexpr int MXGR = 528, I4GR = 288;
++
++__device__ __forceinline__ float e4m3_val(uint32_t b)
++{
++    const int e = (b >> 3) & 15, m = b & 7;
++    const float v = e ? ldexpf((float)(8 + m), e - 10) : ldexpf((float)m, -9);
++    return (b & 0x80u) ? -v : v;
++}
++__device__ __forceinline__ float e8m0_val(uint32_t code) { return __uint_as_float(code ? code << 23 : 0x00400000u); }
++
++// mx [tiles][ng][528] -> i4 [tiles][ng][288]; grid ceil(tiles * ng * 16 / 256), block 256
++__global__ void __launch_bounds__(256) k_mx_to_i4(const uint8_t* __restrict__ mx, uint8_t* __restrict__ i4, int tiles, int ng)
++{
++    const long long id = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    if (id >= (long long)tiles * ng * 16) return;
++    const int row = (int)(id & 15);
++    const long long grp = id >> 4;                // tile * ng + group
++    const uint8_t* src = mx + grp * MXGR;
++    uint8_t* dst = i4 + grp * I4GR;
++    const int r = row & 7, hi = row >> 3;
++    const float sc = e8m0_val(src[512 + 2 * r + hi]);
++    float v[32];
++    float amax = 0.f;
++    #pragma unroll
++    for (int kk = 0; kk < 32; ++kk)
++    {
++        const int h = kk >> 4, k = kk & 15, c = (k & 7) >> 1;
++        v[kk] = e4m3_val(src[h * 256 + (r * 4 + c) * 8 + (k >> 3) * 4 + hi * 2 + (k & 1)]) * sc;
++        amax = fmaxf(amax, fabsf(v[kk]));
++    }
++    const __half s16 = __float2half_rn(__fdiv_rn(amax, 7.f));
++    const float s = __half2float(s16);
++    #pragma unroll
++    for (int kk = 0; kk < 32; kk += 2)
++    {
++        const int h = kk >> 4, k = kk & 15, c = (k & 7) >> 1;
++        uint32_t q0 = 8, q1 = 8;
++        if (s != 0.f)
++        {
++            q0 = (uint32_t)(min(max(__float2int_rn(__fdiv_rn(v[kk], s)), -8), 7) + 8);
++            q1 = (uint32_t)(min(max(__float2int_rn(__fdiv_rn(v[kk + 1], s)), -8), 7) + 8);
++        }
++        dst[h * 128 + (r * 4 + c) * 4 + (k >> 3) * 2 + hi] = (uint8_t)(q0 | (q1 << 4));
++    }
++    reinterpret_cast<__half*>(dst + 256)[2 * r + hi] = s16;
++}
++
++inline size_t bytes(long long tiles, int ng) { return (size_t)tiles * ng * I4GR; }
++inline void launch(const uint8_t* mx, uint8_t* i4, int tiles, int ng, cudaStream_t st)
++{
++    const long long n = (long long)tiles * ng * 16;
++    k_mx_to_i4<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(mx, i4, tiles, ng);
++}
++}   // namespace head_i4
+diff --git a/engine/runtime/g6m4.cu b/engine/runtime/g6m4.cu
+index beb3f40..b7c2a48 100644
+--- a/engine/runtime/g6m4.cu
++++ b/engine/runtime/g6m4.cu
+@@ -438,6 +438,10 @@ int main(int argc, char** argv)
+               mtp_split = env_choice("G6_MTP_SPLIT", 1, 0, &qse);
+     if (qs_mode < 0 || iq_split < 0 || mtp_split < 0) die(qse);
+     if (mtp_split && !mtp) die("G6_MTP_SPLIT=1 needs --mtp");
++    // G6_DRAFT_HEAD_I4=1 (rank.cuh build_draft_head_i4; default 0): the MTP draft's head reads INT4 g32 records of the
++    // rank's vocab slice; the target's head is unchanged. In the S2 runtime signature with its split.
++    const DraftHeadI4 dhead = draft_head_i4_env();
++    if (dhead.on && !mtp) die("G6_DRAFT_HEAD_I4=1 needs --mtp");
+     g6::Fabric fabg, fabdg;
+     bool fabg_on = false, fabdg_on = false;
+     auto qs_fabric = [&](g6::Fabric& fb, const Model& mm, int port_off, const char* what) {
+@@ -652,6 +656,7 @@ int main(int argc, char** argv)
+         G6RT_CK(cudaHostAlloc((void**)&out_d, sizeof(StepOut), cudaHostAllocMapped));
+         if (mtp_split) { D.d.qs.mode = 1; D.d.qs.iq = true; D.d.qs.eh = true; }   // G6_MTP_SPLIT: eh_proj, q_a / kv_a / idx, idx_q
+         build_draft(D, m, find, cap, fd, dmalloc<u64>(1), st, MP ? pf_attn_rows(MP) : MX);
++        build_draft_head_i4(D, dhead, st);
+         if (D.d.qs.on())
+         {
+             qs_fabric(fabdg, D.d, 72, "G6_MTP_SPLIT");
+@@ -1189,7 +1194,8 @@ int main(int argc, char** argv)
+                 std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " split 3 own " + std::to_string(pf_own) +
+                 " qpctx " + std::to_string(pf_qp ? P.qp_ctx : 0) + " qpmin " + std::to_string(pf_qp ? pf_qp_min() : 0) +
+                 (set_id.empty() ? "" : " set " + set_id) + (qs_mode ? " qasplit " + std::to_string(qs_mode) : "") +
+-                (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "");
++                (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "") +
++                (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "");
+             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
+                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
+             g6s2::ControlLinks links = g6s2::bootstrap(bc);
+diff --git a/engine/runtime/m4sim.cu b/engine/runtime/m4sim.cu
+index 0a924b1..bfcaa6b 100644
+--- a/engine/runtime/m4sim.cu
++++ b/engine/runtime/m4sim.cu
+@@ -232,6 +232,7 @@ int main(int argc, char** argv)
+ {
+     setvbuf(stdout, nullptr, _IOLBF, 0);
+     pf_env_check();                    // strict G6_PF_* choices (envparse.h): a bad value exits before any work
++    const DraftHeadI4 dhead = draft_head_i4_env();   // G6_DRAFT_HEAD_I4 (rank.cuh), as g6m4: the MTP draft's INT4 head
+     std::string packs, layers_s = "0,3,40,77";
+     V2Src v2src;                        // --v2-dense: every rank's image from the exlr8 release (no packs)
+     std::vector<std::string> prompts;
+@@ -311,6 +312,7 @@ int main(int argc, char** argv)
+     plan.inv_temp = temp > 0.f ? 1.f / temp : 0.f;
+     if (plan.chunk < 1 || plan.chunk > MX) die("--chunk must be 1.." + std::to_string(MX));
+     if (mtp < 0 || mtp > std::min<int>(MX - 1, 7)) die("--mtp must be 1..7 drafts");   // the scheduler caps k at 7 whatever MX is
++    if (dhead.on && !mtp) die("G6_DRAFT_HEAD_I4=1 needs --mtp");
+     if (plan.rs && (s2mode || !mtp)) die("--spec-accept rejection needs --mtp, and not --s2");
+     if ((adapt || !levels_s.empty()) && (s2mode || !mtp || (!levels_s.empty() && !adapt))) die("--spec-adaptive needs --mtp, and not --s2; --spec-levels needs it");
+     SpecLen spec;                       // --spec-adaptive (graphs are captured per row count on first use here)
+@@ -572,6 +574,7 @@ int main(int argc, char** argv)
+             if (s2mode && !s2_below && getenv("G6_S2_POOL")) DR[r].d.s2_pool_pages = atoi(getenv("G6_S2_POOL"));
+ #endif
+             build_draft(DR[r], R[r], rfind(r), cap, fd, stepp_d, st, MP ? pf_attn_rows(MP) : MX);
++            build_draft_head_i4(DR[r], dhead, st);
+             DR[r].d.graph = graph; DR[r].d.in = in_d; DR[r].d.out = out_d + r;
+             loop_d.send[r] = fd.send;
+             if (MP) DQ[r].P.attn_rows = pf_attn_rows(MP);   // DQ is empty without --prefill (was an out-of-bounds write)
+diff --git a/engine/runtime/rank.cuh b/engine/runtime/rank.cuh
+index 053e9d2..2b44ae9 100644
+--- a/engine/runtime/rank.cuh
++++ b/engine/runtime/rank.cuh
+@@ -33,10 +33,12 @@
+ #include "draft_shape.h"
+ #include "serve.h"
+ #include "spec_len.h"
++#include "envparse.h"
+ #include "../h2d.h"
+ #include "host_reclaim.h"
+ #include "../kernels/glue.cuh"
+ #include "../kernels/bind.cuh"
++#include "../kernels/head_i4.cuh"
+ #include "../attn/bind.h"
+ #if defined(G6_CP) && G6_CP
+ #include "../kernels/cpglue.cuh"
+@@ -360,6 +362,10 @@ struct Model
+     bind::Head head[MX + 1];
+     __half *eh_in = nullptr, *eh_out = nullptr;   // MTP draft model only: eh_proj input [MX][12288] and output [MX][6144]
+     int vlo = 0, vn = 0;
++    // G6_DRAFT_HEAD_I4 (MTP draft model only, set before prepare): the head GEMV reads these INT4 g32 records of the same
++    // vocab slice instead of head_t.lm_head (build_draft_head_i4); dh_tpc / dh_ks = its CTA split. nullptr = MXFP8
++    const uint8_t* dh_i4 = nullptr;
++    int dh_tpc = 1, dh_ks = 32;
+     int nc = 0;                       // top_p candidates per rank per row (0 = top_p off); set before the first step
+     unsigned* topp_miss = nullptr;    // device counter: top_p rows whose nucleus went past the candidates
+     void (*dfl_tap)(Model&, int, int, cudaStream_t) = nullptr;   // --dflash: after layer i, copy the residual rows the drafter reads (dflash.cuh)
+@@ -1267,6 +1273,15 @@ inline const bind::Head& head_for(Model& m, int M)
+         io.h = m.x; io.logits = m.hlog;
+         io.eh_in = m.eh_in; io.eh = m.eh_out;
+         if (const char* e = bind::make_head(m.head_t, m.rank, M, m.sc, io, H)) die("rank " + std::to_string(m.rank) + " head: " + e);
++        if (m.dh_i4)                  // G6_DRAFT_HEAD_I4: the same slice's INT4 records, same fragment table and logits
++        {
++            bind::Tensor t;
++            t.p = m.dh_i4; t.nd = 3;
++            t.shape[0] = m.vn / 16; t.shape[1] = HID / 32; t.shape[2] = head_i4::I4GR;
++            if (const char* e = bind::make_gv(t, bind::INT4, m.dh_tpc, m.dh_ks, M, m.sc.xf_head, m.hlog, gv::O_F32, H.lm_head))
++                die("rank " + std::to_string(m.rank) + " INT4 draft head: " + e);
++            if (H.lm_head.O != H.vn || H.lm_head.K != HID) die("INT4 draft head is not this rank's vocab slice");
++        }
+         if (m.qs.eh)                  // G6_MTP_SPLIT: this rank's tiles of eh_proj (same bits per tile, bind::narrow)
+         {
+             const QsGeo& G = m.qs.geo[m.qs.ceh];
+@@ -1495,6 +1510,61 @@ inline void build_draft(Draft& D, const Model& main, const Find& find, int capac
+     D.hprev = dmalloc<__half>(HID);
+     D.main_x = main.x;
+ }
++
++// G6_DRAFT_HEAD_I4=1 (default 0; needs --mtp): the MTP draft's head GEMV reads INT4 g32 records of this rank's vocab slice,
++// made at boot from its MXFP8 records (kernels/head_i4.cuh), instead of the MXFP8 records the target's head reads: 134 MB
++// instead of 246 MB per draft step at TP4. The target's head and every verify step are unchanged, so the committed tokens
++// are the target's at any acceptance; the drafts and their log-probabilities (which spec_len reads) can differ from the
++// MXFP8 head's. They stay the same on every rank: each rank converts its own slice by the same arithmetic, and the
++// head merge runs in rank order. G6_DRAFT_HEAD_KS (32) and G6_DRAFT_HEAD_TPC (1): the GEMV's k parts per tile and tiles
++// per CTA (make_gv), for an A/B of the split; ks sets the summation order, so every rank must run the same values (the S2
++// runtime signature carries all three). DEC_I4PAIR builds repack the records once for that ks (densev.cuh k_i4pair), as
++// the int4 q_a / o_proj records are.
++struct DraftHeadI4
++{
++    int on = 0, tpc = 1, ks = 32;
++};
++inline DraftHeadI4 draft_head_i4_env()
++{
++    DraftHeadI4 c;
++    std::string err;
++    c.on = env_choice("G6_DRAFT_HEAD_I4", 1, 0, &err);
++    if (c.on < 0) die(err);
++    auto pow2 = [](const char* name, int dflt, int lo) {
++        const char* v = getenv(name);
++        if (!v) return dflt;
++        for (int x = lo; x <= 32; x *= 2)
++            if (std::string(v) == std::to_string(x)) return x;
++        die(std::string(name) + "='" + v + "' is not a power of two in " + std::to_string(lo) + "..32");
++    };
++    c.ks = pow2("G6_DRAFT_HEAD_KS", 32, 2);    // >= 2: k_i4pair's shared memory holds one k part (192 / ks groups)
++    c.tpc = pow2("G6_DRAFT_HEAD_TPC", 1, 1);
++    if (c.tpc * c.ks > 32) die("G6_DRAFT_HEAD_TPC x G6_DRAFT_HEAD_KS must be <= 32 (warps of one CTA)");
++    return c;
++}
++// after build_draft, before prepare / any capture of a draft step (head_for binds the records on first use)
++inline void build_draft_head_i4(Draft& D, const DraftHeadI4& c, cudaStream_t st)
++{
++    Model& d = D.d;
++    if (!c.on) return;
++    const bind::Tensor& mx = d.head_t.lm_head;
++    if (!mx.p || mx.nd != 3 || mx.shape[0] * 16 != d.vn || mx.shape[1] != HID / 32 || mx.shape[2] != head_i4::MXGR)
++        die("G6_DRAFT_HEAD_I4: G.lm_head.mx.gv is not this rank's [vn/16][192][528] MXFP8 slice");
++    for (int M = 1; M <= MX; ++M)
++        if (d.head[M].M) die("G6_DRAFT_HEAD_I4: the draft head was bound before its INT4 records were made");
++    const int tiles = d.vn / 16, ng = HID / 32;
++    uint8_t* rec = dmalloc<uint8_t>(head_i4::bytes(tiles, ng));
++    head_i4::launch(static_cast<const uint8_t*>(mx.p), rec, tiles, ng, st);
++    G6RT_CK(cudaGetLastError());
++#if DEC_I4PAIR
++    launch_i4pair(rec, tiles, ng, c.ks, st);    // the pair records gv_gemv reads for k-part count ks (ng % ks == 0: make_gv keeps it)
++    G6RT_CK(cudaGetLastError());
++#endif
++    G6RT_CK(cudaStreamSynchronize(st));
++    d.dh_i4 = rec; d.dh_tpc = c.tpc; d.dh_ks = c.ks;
++    fprintf(stderr, "# rank %d: G6_DRAFT_HEAD_I4: MTP draft head as INT4 g32, %.1f MB (MXFP8 %.1f MB), tpc %d ks %d\n", d.rank,
++            head_i4::bytes(tiles, ng) / 1e6, (double)tiles * ng * head_i4::MXGR / 1e6, c.tpc, c.ks);
++}
+ #ifdef DEC_S2
+ inline const __half* s2_draft_hid(Draft& D, bool chain, cudaStream_t st);
+ inline void s2_draft_keep(Draft& D, cudaStream_t st);
+diff --git a/engine/runtime/tests/dhead_i4_test.cu b/engine/runtime/tests/dhead_i4_test.cu
+new file mode 100644
+index 0000000..ba8854b
+--- /dev/null
++++ b/engine/runtime/tests/dhead_i4_test.cu
+@@ -0,0 +1,328 @@
++// G6_DRAFT_HEAD_I4 unit test: one GB10, synthetic records, no pack.
++//   dhead_i4_test [--time [reps]]
++// 1. kernels/head_i4.cuh k_mx_to_i4 against a host derivation: random MXFP8 head records (the layout of
++//    engine/ref/g6ref.py mxfp8_record) -> decoded values -> INT4 g32 (engine/loader-rs records::int4_quantize) -> the
++//    rt_record layout. Byte equality, every byte of the output written.
++// 2. The INT4 head GEMV on those records (bind::make_gv INT4, O_F32, the draft head's tpc / ks; DEC_I4PAIR builds repack
++//    them first, as build_draft_head_i4 does) against a host fp64 dot of the same INT4 weights and fp16 activations:
++//    tolerance 1e-5 of the row's sum of |terms| (fp32 accumulate), and the same argmax per row unless the host top two
++//    are within that tolerance.
++// --time: the lm_head GEMV of one TP4 vocab slice (38784 x 6144): today's MXFP8 head (tpc 1, ks 32) against the INT4 head
++//    over (tpc, ks), M = 1 and 3, mean of reps launches (CUDA events), and the bytes per launch.
++// Build: scripts/c1_tests.sh <bin_dir> (TEST=dhead_i4_test)      Exit code: 0 all PASS, 1 any FAIL, 2 CUDA error.
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++#include <cuda_runtime.h>
++#include "../../kernels/glue.cuh"
++#include "../../kernels/bind.cuh"
++#include "../../kernels/head_i4.cuh"
++
++#define CK(x)                                                                                                   \
++    do                                                                                                          \
++    {                                                                                                           \
++        const cudaError_t e_ = (x);                                                                             \
++        if (e_ != cudaSuccess)                                                                                  \
++        {                                                                                                       \
++            printf("CUDA error %s at %s:%d: %s\n", #x, __FILE__, __LINE__, cudaGetErrorString(e_));             \
++            exit(2);                                                                                            \
++        }                                                                                                       \
++    } while (0)
++
++static int g_pass = 0, g_fail = 0;
++static void report(bool ok, const std::string& s)
++{
++    printf("%s %s\n", ok ? "PASS" : "FAIL", s.c_str());
++    fflush(stdout);
++    (ok ? g_pass : g_fail)++;
++}
++
++static uint32_t rnd(uint64_t i, uint32_t seed)
++{
++    uint32_t x = (uint32_t)i ^ (((uint32_t)(i >> 32) + seed) * 0x9e3779b9u) ^ (seed * 0x85ebca6bu);
++    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
++    return x;
++}
++static float e4m3_host(uint8_t b)
++{
++    const int e = (b >> 3) & 15, m = b & 7;
++    const float v = e ? std::ldexp((float)(8 + m), e - 10) : std::ldexp((float)m, -9);
++    return (b & 0x80) ? -v : v;
++}
++static float e8m0_host(uint8_t c) { return c ? std::ldexp(1.f, (int)c - 127) : std::ldexp(1.f, -127); }
++
++// canonical codes [n][K] (E4M3), scales [n][K/32] (E8M0) -> MXFP8 GEMV record [n/16][K/32][528] (g6ref.mxfp8_record)
++static std::vector<uint8_t> mx_record(const std::vector<uint8_t>& c, const std::vector<uint8_t>& s, int n, int K)
++{
++    const int ng = K / 32;
++    std::vector<uint8_t> out((size_t)n / 16 * ng * 528);
++    for (int t = 0; t < n / 16; ++t)
++        for (int g = 0; g < ng; ++g)
++        {
++            uint8_t* rec = &out[((size_t)t * ng + g) * 528];
++            for (int h = 0; h < 2; ++h)
++                for (int l = 0; l < 32; ++l)
++                {
++                    const int r = l / 4, cc = l % 4;
++                    const int rows[8] = {r, r, r + 8, r + 8, r, r, r + 8, r + 8};
++                    const int ks[8] = {2 * cc, 2 * cc + 1, 2 * cc, 2 * cc + 1, 2 * cc + 8, 2 * cc + 9, 2 * cc + 8, 2 * cc + 9};
++                    for (int i = 0; i < 8; ++i) rec[h * 256 + l * 8 + i] = c[(size_t)(16 * t + rows[i]) * K + 32 * g + 16 * h + ks[i]];
++                }
++            for (int i = 0; i < 8; ++i)
++            {
++                rec[512 + 2 * i] = s[(size_t)(16 * t + i) * ng + g];
++                rec[512 + 2 * i + 1] = s[(size_t)(16 * t + i + 8) * ng + g];
++            }
++        }
++    return out;
++}
++
++// INT4 g32 of the decoded MXFP8 values: q [n][K] (0..15), fp16 scales [n][K/32]; (records::int4_quantize)
++static void i4_quantize(const std::vector<uint8_t>& c, const std::vector<uint8_t>& s, int n, int K, std::vector<uint8_t>& q,
++                        std::vector<__half>& sc)
++{
++    const int ng = K / 32;
++    q.assign((size_t)n * K, 8);
++    sc.assign((size_t)n * ng, __float2half_rn(0.f));
++    for (int i = 0; i < n; ++i)
++        for (int g = 0; g < ng; ++g)
++        {
++            float v[32], amax = 0.f;
++            for (int j = 0; j < 32; ++j)
++            {
++                v[j] = e4m3_host(c[(size_t)i * K + 32 * g + j]) * e8m0_host(s[(size_t)i * ng + g]);
++                amax = std::max(amax, std::fabs(v[j]));
++            }
++            const __half h = __float2half_rn(amax / 7.f);
++            sc[(size_t)i * ng + g] = h;
++            const float sf = __half2float(h);
++            if (sf == 0.f) continue;
++            for (int j = 0; j < 32; ++j)
++                q[(size_t)i * K + 32 * g + j] = (uint8_t)(std::min(std::max((int)std::nearbyint(v[j] / sf), -8), 7) + 8);
++        }
++}
++
++// q [n][K], scales [n][K/32] -> INT4 GEMV record [n/16][K/32][288] (g6ref.rt_record with rt_tiles)
++static std::vector<uint8_t> i4_record(const std::vector<uint8_t>& q, const std::vector<__half>& sc, int n, int K)
++{
++    const int ng = K / 32;
++    std::vector<uint8_t> out((size_t)n / 16 * ng * 288);
++    auto byte = [&](int row, int k0) { return (uint8_t)(q[(size_t)row * K + k0] | (q[(size_t)row * K + k0 + 1] << 4)); };
++    for (int t = 0; t < n / 16; ++t)
++        for (int g = 0; g < ng; ++g)
++        {
++            uint8_t* rec = &out[((size_t)t * ng + g) * 288];
++            for (int h = 0; h < 2; ++h)
++                for (int l = 0; l < 32; ++l)
++                {
++                    const int r = l / 4, cc = l % 4, k = 32 * g + 16 * h;
++                    rec[h * 128 + l * 4 + 0] = byte(16 * t + r, k + 2 * cc);
++                    rec[h * 128 + l * 4 + 1] = byte(16 * t + r + 8, k + 2 * cc);
++                    rec[h * 128 + l * 4 + 2] = byte(16 * t + r, k + 2 * cc + 8);
++                    rec[h * 128 + l * 4 + 3] = byte(16 * t + r + 8, k + 2 * cc + 8);
++                }
++            for (int i = 0; i < 8; ++i)
++            {
++                memcpy(rec + 256 + 4 * i, &sc[(size_t)(16 * t + i) * ng + g], 2);
++                memcpy(rec + 256 + 4 * i + 2, &sc[(size_t)(16 * t + i + 8) * ng + g], 2);
++            }
++        }
++    return out;
++}
++
++// random head-like MXFP8 rows: no NaN codes, scales 2^-11 .. 2^-6, a few all-zero groups (scale 0 path)
++static void random_mx(int n, int K, uint32_t seed, std::vector<uint8_t>& c, std::vector<uint8_t>& s)
++{
++    c.resize((size_t)n * K);
++    s.resize((size_t)n * K / 32);
++    for (size_t i = 0; i < c.size(); ++i)
++    {
++        uint8_t b = (uint8_t)rnd(i, seed);
++        if ((b & 0x7f) == 0x7f) b &= 0xbf;
++        c[i] = b;
++    }
++    for (size_t i = 0; i < s.size(); ++i) s[i] = (uint8_t)(116 + rnd(i, seed + 1) % 6);
++    for (int i = 0; i < n; i += 37)
++        for (int j = 0; j < 32; ++j) c[(size_t)i * K + j] = 0;
++}
++
++static bind::Tensor mk(const void* p, long long a, long long b, long long c)
++{
++    bind::Tensor t;
++    t.p = p; t.nd = 3; t.shape[0] = a; t.shape[1] = b; t.shape[2] = c;
++    return t;
++}
++
++// y [M][O] f32 = x [M][K] fp16 @ W^T through bind (fragment table + gv launch)
++static void run_head(const void* rec, int codec, int O, int K, int tpc, int ks, int M, const __half* x, u32* xf, float* y)
++{
++    bind::Xfrag f;
++    f.on = 1; f.src = x; f.ld = K; f.K = K; f.M = M; f.f16 = xf;
++    bind::launch(f, nullptr);
++    bind::Gv g;
++    const int GR = codec == bind::INT4 ? 288 : 528;
++    if (const char* e = bind::make_gv(mk(rec, O / 16, K / 32, GR), codec, tpc, ks, M, xf, y, gv::O_F32, g))
++    {
++        printf("make_gv: %s\n", e);
++        exit(2);
++    }
++    bind::launch(g, nullptr);
++}
++
++static void test_convert_and_gemv()
++{
++    const int n = 1024, K = 6144, ng = K / 32;
++    std::vector<uint8_t> c, s, q;
++    std::vector<__half> sc;
++    random_mx(n, K, 11u, c, s);
++    const std::vector<uint8_t> mx = mx_record(c, s, n, K);
++    i4_quantize(c, s, n, K, q, sc);
++    const std::vector<uint8_t> want = i4_record(q, sc, n, K);
++    uint8_t *dmx, *di4;
++    CK(cudaMalloc(&dmx, mx.size()));
++    CK(cudaMalloc(&di4, want.size()));
++    CK(cudaMemcpy(dmx, mx.data(), mx.size(), cudaMemcpyHostToDevice));
++    CK(cudaMemset(di4, 0xa5, want.size()));
++    head_i4::launch(dmx, di4, n / 16, ng, nullptr);
++    CK(cudaDeviceSynchronize());
++    std::vector<uint8_t> got(want.size());
++    CK(cudaMemcpy(got.data(), di4, got.size(), cudaMemcpyDeviceToHost));
++    size_t bad = 0, first = 0;
++    for (size_t i = 0; i < got.size(); ++i)
++        if (got[i] != want[i] && !bad++) first = i;
++    char b[256];
++    snprintf(b, sizeof b, "k_mx_to_i4 %d x %d: %zu of %zu bytes differ from the host derivation%s", n, K, bad, got.size(),
++             bad ? (" (first at " + std::to_string(first) + ")").c_str() : "");
++    report(bad == 0, b);
++
++    // GEMV on the converted records
++    const int MS[2] = {1, 3};
++    const int SPLIT[3][2] = {{1, 32}, {1, 16}, {2, 8}};
++    std::vector<__half> hx((size_t)8 * K);
++    for (size_t i = 0; i < hx.size(); ++i) hx[i] = __float2half_rn(((rnd(i, 99u) >> 8) * (1.f / 16777216.f) * 2.f - 1.f));
++    __half* dx;
++    u32* xf;
++    float* dy;
++    CK(cudaMalloc(&dx, hx.size() * 2));
++    CK(cudaMalloc(&xf, (size_t)K / 16 * 64 * 4 * g6mx::NT));
++    CK(cudaMalloc(&dy, (size_t)8 * n * 4));
++    CK(cudaMemcpy(dx, hx.data(), hx.size() * 2, cudaMemcpyHostToDevice));
++    uint8_t* dp;
++    CK(cudaMalloc(&dp, want.size()));
++    for (const auto& sp : SPLIT)
++    {
++        CK(cudaMemcpy(dp, di4, want.size(), cudaMemcpyDeviceToDevice));
++#if DEC_I4PAIR
++        launch_i4pair(dp, n / 16, ng, sp[1], nullptr);
++#endif
++        for (int M : MS)
++        {
++            run_head(dp, bind::INT4, n, K, sp[0], sp[1], M, dx, xf, dy);
++            CK(cudaDeviceSynchronize());
++            std::vector<float> y((size_t)M * n);
++            CK(cudaMemcpy(y.data(), dy, y.size() * 4, cudaMemcpyDeviceToHost));
++            double worst = 0;
++            int argmax_bad = 0;
++            for (int m = 0; m < M; ++m)
++            {
++                std::vector<double> ref(n), mag(n);
++                for (int o = 0; o < n; ++o)
++                {
++                    double a = 0, am = 0;
++                    for (int k = 0; k < K; ++k)
++                    {
++                        const double w = ((int)q[(size_t)o * K + k] - 8) * (double)__half2float(sc[(size_t)o * ng + k / 32]);
++                        const double t = w * (double)__half2float(hx[(size_t)m * K + k]);
++                        a += t; am += std::fabs(t);
++                    }
++                    ref[o] = a; mag[o] = am;
++                    worst = std::max(worst, std::fabs(a - y[(size_t)m * n + o]) / (am + 1e-30));
++                }
++                int rg = 0, gg = 0;
++                for (int o = 1; o < n; ++o)
++                {
++                    if (ref[o] > ref[rg]) rg = o;
++                    if (y[(size_t)m * n + o] > y[(size_t)m * n + gg]) gg = o;
++                }
++                if (rg != gg && std::fabs(ref[rg] - ref[gg]) > 1e-5 * (mag[rg] + mag[gg])) ++argmax_bad;
++            }
++            snprintf(b, sizeof b, "INT4 head GEMV O=%d K=%d tpc=%d ks=%d M=%d: worst |gpu - host| / sum|terms| %.2e, argmax differs in %d rows",
++                     n, K, sp[0], sp[1], M, worst, argmax_bad);
++            report(worst < 1e-5 && argmax_bad == 0, b);
++        }
++    }
++    cudaFree(dp); cudaFree(dmx); cudaFree(di4); cudaFree(dx); cudaFree(xf); cudaFree(dy);
++}
++
++static void time_heads(int reps)
++{
++    const int O = 38784, K = 6144, ng = K / 32;      // TP4 ranks 0 / 1 vocab slice
++    const size_t mxb = (size_t)O / 16 * ng * 528, i4b = head_i4::bytes(O / 16, ng);
++    std::vector<uint8_t> h(mxb);
++    for (size_t i = 0; i < mxb; ++i)
++    {
++        uint8_t v = (uint8_t)rnd(i, 5u);
++        if (i % 528 >= 512) v = (uint8_t)(116 + v % 6);
++        else if ((v & 0x7f) == 0x7f) v &= 0xbf;
++        h[i] = v;
++    }
++    uint8_t *dmx, *di4, *dp;
++    CK(cudaMalloc(&dmx, mxb));
++    CK(cudaMalloc(&di4, i4b));
++    CK(cudaMalloc(&dp, i4b));
++    CK(cudaMemcpy(dmx, h.data(), mxb, cudaMemcpyHostToDevice));
++    head_i4::launch(dmx, di4, O / 16, ng, nullptr);
++    __half* dx;
++    u32* xf;
++    float* dy;
++    CK(cudaMalloc(&dx, (size_t)8 * K * 2));
++    CK(cudaMemset(dx, 0x31, (size_t)8 * K * 2));
++    CK(cudaMalloc(&xf, (size_t)K / 16 * 64 * 4 * g6mx::NT));
++    CK(cudaMalloc(&dy, (size_t)8 * O * 4));
++    cudaEvent_t e0, e1;
++    CK(cudaEventCreate(&e0));
++    CK(cudaEventCreate(&e1));
++    auto timeit = [&](const void* rec, int codec, int tpc, int ks, int M) {
++        for (int i = 0; i < 10; ++i) run_head(rec, codec, O, K, tpc, ks, M, dx, xf, dy);
++        CK(cudaEventRecord(e0));
++        for (int i = 0; i < reps; ++i) run_head(rec, codec, O, K, tpc, ks, M, dx, xf, dy);
++        CK(cudaEventRecord(e1));
++        CK(cudaEventSynchronize(e1));
++        float ms = 0;
++        CK(cudaEventElapsedTime(&ms, e0, e1));
++        return 1e3 * ms / reps;
++    };
++    for (int M : {1, 3})
++    {
++        const double t = timeit(dmx, bind::MXFP8, 1, 32, M);
++        printf("TIME head MXFP8 O=%d M=%d tpc=1 ks=32: %.1f us, %.1f MB, %.1f GB/s\n", O, M, t, mxb / 1e6, mxb / t / 1e3);
++        for (int ks : {4, 8, 16, 32})
++            for (int tpc : {1, 2, 4})
++            {
++                if (tpc * ks > 32) continue;
++                CK(cudaMemcpy(dp, di4, i4b, cudaMemcpyDeviceToDevice));
++#if DEC_I4PAIR
++                launch_i4pair(dp, O / 16, ng, ks, nullptr);
++#endif
++                const double u = timeit(dp, bind::INT4, tpc, ks, M);
++                printf("TIME head INT4  O=%d M=%d tpc=%d ks=%d: %.1f us, %.1f MB, %.1f GB/s, %.2fx MXFP8\n", O, M, tpc, ks, u, i4b / 1e6,
++                       i4b / u / 1e3, t / u);
++            }
++    }
++    fflush(stdout);
++}
++
++int main(int argc, char** argv)
++{
++    int reps = 0;
++    for (int i = 1; i < argc; ++i)
++        if (!strcmp(argv[i], "--time")) reps = i + 1 < argc ? atoi(argv[++i]) : 200;
++    test_convert_and_gemv();
++    if (reps > 0) time_heads(reps);
++    printf("%d PASS, %d FAIL\n", g_pass, g_fail);
++    return g_fail ? 1 : 0;
++}
+diff --git a/scripts/c1_tests.sh b/scripts/c1_tests.sh
+index 9f842a4..1730ce8 100755
+--- a/scripts/c1_tests.sh
++++ b/scripts/c1_tests.sh
+@@ -4,7 +4,8 @@
+ # needs EXTRA=-DDEC_S2, else it only prints SKIP), dec_heads_test (the decode attention kernels against the ones they
+ # replaced) and kv4_test (the KV latent row: append round trip, and decode / prefill / row-owner attention against a host
+ # reference; EXTRA=-DG6_KV4=1 tests the INT4 row, docs/KV4.md) and weight_check_test (the weight check's GPU sums
+-# against the CPU's, and one changed byte caught in its own chunk).
++# against the CPU's, and one changed byte caught in its own chunk) and dhead_i4_test (G6_DRAFT_HEAD_I4: the MXFP8 -> INT4
++# head records against a host derivation, the INT4 head GEMV against a host dot; --time: MXFP8 vs INT4 head GEMV).
+ #   scripts/c1_tests.sh <bin_dir> [test args]       default bin_dir = ./bin; TEST=row_budget_test|s2_attn_test runs one
+ #   G6_NR=4 scripts/c1_tests.sh bin4                the TP4 build of the test
+ #   EXTRA=-DDEC_S2 scripts/c1_tests.sh bin_s2       the 32-row build: M = 1..32 against chunks of 8 (without it: M <= 8)
+@@ -75,5 +76,9 @@ if [ "$TEST" = all ] || [ "$TEST" = weight_check_test ]; then
+   [ "$TEST" = all ] && ARGS=()
+   build_run weight_check_test || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+ fi
++if [ "$TEST" = all ] || [ "$TEST" = dhead_i4_test ]; then
++  [ "$TEST" = all ] && ARGS=()
++  build_run dhead_i4_test || { r=$?; [ "$rc" = 0 ] && rc=$r; }
++fi
+ if [ "$rc" = 0 ]; then echo "c1_tests: PASS"; else echo "c1_tests: FAIL (exit $rc)"; fi
+ exit "$rc"

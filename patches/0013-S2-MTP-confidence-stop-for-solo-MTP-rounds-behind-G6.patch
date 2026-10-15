@@ -1,0 +1,733 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Thu, 15 Oct 2026 12:53:04 +0200
+Subject: [PATCH 13/13] S2: MTP confidence stop for solo MTP rounds behind
+ G6_MTP_KSTOP, round log G6_MTP_LPLOG
+
+A DFlash2 session's MTP rounds (drafter choice) chain and verify 1..G6_MTP_KSTOP_KMAX (<= 3) drafts chosen from the
+MTP head's log-probabilities, which S2 now returns with the draft steps (Hooks::lp). Mode 1: draft j while
+p_1 * .. * p_j >= G6_MTP_KSTOP_TAU t_j; mode 2: the drafter choice's MTP estimates (SpecLen choose/more). The
+probabilities are the same bytes on every rank, so every rank takes the same k; the policy is in the runtime signature.
+A demoted session's chain is completed to K before its first shared round. Off (default): the planner's steps are
+unchanged. G6_MTP_LPLOG=1 logs each solo round's draft log-probabilities and accept count for offline tuning.
+---
+ docs/SETTINGS.md                             |   2 +
+ engine/runtime/g6m4.cu                       |  52 +++++-
+ engine/runtime/s2/dispatch.h                 |   2 +
+ engine/runtime/s2/driver.h                   |   6 +-
+ engine/runtime/s2/native.cuh                 |  10 +-
+ engine/runtime/s2/service.h                  |   4 +-
+ engine/runtime/s2/tests/batch_kstop_test.cpp | 175 +++++++++++++++++++
+ engine/runtime/s2_batch.h                    | 125 +++++++++++--
+ scripts/host_tests.sh                        |   6 +-
+ 9 files changed, 359 insertions(+), 23 deletions(-)
+ create mode 100644 engine/runtime/s2/tests/batch_kstop_test.cpp
+
+diff --git a/docs/SETTINGS.md b/docs/SETTINGS.md
+index b6c1d5c..5fbc20e 100644
+--- a/docs/SETTINGS.md
++++ b/docs/SETTINGS.md
+@@ -97,6 +97,8 @@ the short version.
+ | `G6_S2_DSEL` | 1 | S2 with DFlash2: a request that decodes alone drafts each round with DFlash2 or MTP, whichever is expected to commit more tokens per ms (prose +4.5% on RigMark, code level); 0 = DFlash2 every round. `G6_S2_DSEL_MARGIN` (0.15), `G6_S2_DSEL_DWELL` (8 rounds) and `G6_S2_DSEL_PROBE` (4) tune it; `G6_S2_DSEL_DCOST` (8.1), `G6_S2_DSEL_MCOST` (5.5) and `G6_S2_DSEL_MEACH` (2.1) override its drafting ms per round (DFlash2; MTP's first form and the drafter's context step; each MTP chain step) |
+ | `G6_S2_DSEL_START` | dflash | S2 drafter choice: `mtp` = a DFlash2 request starts on MTP (the drafter's prompt-tail drafts are its first probe) and moves to DFlash2 when the evidence says so. Every rank must set the same value |
+ | `G6_S2_DSEL_POSCLK` | 0 | S2 drafter choice: 1 = its DFlash2 and MTP estimates decay a draft position only on rounds that observe it, so the DFlash2 rounds (which score MTP's first draft alone) no longer age MTP's later positions toward the seed. Every rank must set the same value |
++| `G6_MTP_KSTOP` | 0 | S2 drafter choice, MTP rounds of a request that decodes alone: 1 = verify draft j while the MTP head's p_1 x .. x p_j >= `G6_MTP_KSTOP_TAU` t_j (default `0,0.2,0.5`; at least one draft) and stop the chain before a draft that could not pass; 2 = choose the count from the drafter choice's MTP estimates (`G6_MTP_KSTOP_SEED3`, 0.55: their prior for a third draft). `G6_MTP_KSTOP_KMAX` (1..3, default `--mtp`) is the most drafts. Drafts only: the target decides every token, but the verify's row count (and so its k1 split class) varies. Every rank must set the same values |
++| `G6_MTP_LPLOG` | 0 | S2: one `# kstop` line per round of a request that decodes alone (rank 0; 2 = every rank): drafter, verified k, drafted count, accepted count, the drafts' log-probabilities, MTP's first draft's log-probability and whether the target took it, and a hash of the decision's inputs. Changes nothing else |
+ | `G6_DEC_EVPROF` | unset | measurement: N = per-stage decode step times from event nodes in the captured main-step graphs, printed every N main steps (rank logs) |
+ | `G6_DEC_PROF` | unset | measurement, plain launches only: the same stages with a synchronize at every mark |
+ | `G6_DFL_PFCTX` | 1 | `--dflash`: 0 = no prompt context from the prefill (measurement); the drafter then starts from the last prompt token |
+diff --git a/engine/runtime/g6m4.cu b/engine/runtime/g6m4.cu
+index 649026c..e72a8fb 100644
+--- a/engine/runtime/g6m4.cu
++++ b/engine/runtime/g6m4.cu
+@@ -269,6 +269,42 @@ int main(int argc, char** argv)
+     }
+     if (s2mode && (!graph || !mtp || !MP || s2port < 1 || s2port > 65535 || s2sess < 1 || s2sess > 8 || !s2epoch))
+         die("serving (--serve) needs --graph, --mtp, --prefill, --s2-port 1..65535, --s2-sessions 1..8 and --s2-epoch > 0");
++    // G6_MTP_KSTOP=1|2 (s2_batch.h KStop; default 0): a solo DFlash2 session's MTP rounds draft and verify 1..
++    // G6_MTP_KSTOP_KMAX (1..3, default --mtp) drafts, chosen from the drafts' log-probabilities: 1 by G6_MTP_KSTOP_TAU=
++    // t1,t2,t3 (draft j while p_1 * .. * p_j >= t_j; default 0,0.2,0.5), 2 by the drafter choice's MTP estimates
++    // (G6_MTP_KSTOP_SEED3: their prior for a third draft). G6_MTP_LPLOG=1 (rank 0; 2: every rank): one "# kstop" line per
++    // solo round, nothing else changes. The policy is in the S2 runtime signature
++    s2::KStop kstop;
++    {
++        std::string ke;
++        kstop.mode = env_choice("G6_MTP_KSTOP", 2, 0, &ke);
++        const int lplog = env_choice("G6_MTP_LPLOG", 2, 0, &ke);
++        if (kstop.mode < 0 || lplog < 0) die(ke);
++        kstop.log = lplog == 2 || (lplog == 1 && cfg.rank == 0);
++        kstop.kmax = getenv("G6_MTP_KSTOP_KMAX") ? atoi(getenv("G6_MTP_KSTOP_KMAX")) : mtp;
++        if (const char* e = getenv("G6_MTP_KSTOP_TAU"))
++        {
++            std::vector<double> t;
++            std::string v = e;
++            for (size_t a = 0; a <= v.size();)
++            {
++                const size_t b = std::min(v.find(',', a), v.size());
++                char* end = nullptr;
++                const std::string f = v.substr(a, b - a);
++                t.push_back(strtod(f.c_str(), &end));
++                if (f.empty() || *end || !std::isfinite(t.back())) die("G6_MTP_KSTOP_TAU=t1[,t2[,t3]]: numbers");
++                a = b + 1;
++            }
++            if (t.size() > 3) die("G6_MTP_KSTOP_TAU: at most 3 thresholds");
++            for (size_t j = 0; j < t.size(); ++j) kstop.tau[j + 1] = t[j];
++        }
++        if (const char* e = getenv("G6_MTP_KSTOP_SEED3")) kstop.seed3 = atof(e);
++        if (kstop.mode && (!s2mode || !dfl || mtp < 2 || kstop.kmax < 1 || kstop.kmax > 3 || !(kstop.seed3 > 0 && kstop.seed3 < 1) ||
++                           kstop.kmax + 1 > std::max(s2sess * (mtp + 1), plan.chunk)))
++            die("G6_MTP_KSTOP needs --serve, --dflash-manifest and --mtp 2+; G6_MTP_KSTOP_KMAX 1..3 (verify rows within a step's), "
++                "G6_MTP_KSTOP_SEED3 in (0, 1)");
++        if (!kstop.mode) kstop.kmax = 0;
++    }
+     // --reuse-prefix: one conversation's caches (prefix_reuse.h), or under S2 every retired session's run (s2/pool.h).
+     // The DFlash2 drafter's prompt-context taps (DF.pf_feat) are written by the prefill rows a hit skips.
+     if (!kv_tiers.empty() && !(s2mode && reuse_prefix)) die("--kv-store needs --serve and --reuse-prefix (it keeps the runs prefix reuse retains)");
+@@ -324,6 +360,11 @@ int main(int argc, char** argv)
+         if (std::find(row_counts.begin(), row_counts.end(), mtp + 1) == row_counts.end()) row_counts.push_back(mtp + 1);
+     }
+     if (dfl && std::find(row_counts.begin(), row_counts.end(), dfl_k + 1) == row_counts.end()) row_counts.push_back(dfl_k + 1);
++    for (int M = 2; M <= kstop.kmax + 1; ++M)   // G6_MTP_KSTOP: solo MTP verifies of 2..kmax + 1 rows, first forms of as many
++    {
++        if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
++        if (std::find(draft_rows.begin(), draft_rows.end(), M) == draft_rows.end()) draft_rows.push_back(M);
++    }
+     for (int k : spec.levels)           // --spec-adaptive: a verify graph per level
+         if (std::find(row_counts.begin(), row_counts.end(), k + 1) == row_counts.end()) row_counts.push_back(k + 1);
+     const int NL = (int)layers.size(), NC = 2 * NL + 1, R = cfg.rank;
+@@ -1179,6 +1220,13 @@ int main(int argc, char** argv)
+                                                     h.dsel.m.draft_each);
+                 if (R == 0 && h.dsel.on && h.dsel.start_mtp) fprintf(stderr, "# s2 drafter choice: requests start on MTP\n");
+                 if (R == 0 && h.dsel.on && h.dsel.posclk) fprintf(stderr, "# s2 drafter choice: per-position clocks\n");
++                h.kstop = kstop;
++                if (R == 0 && kstop.mode)
++                    fprintf(stderr, "# s2 MTP confidence stop: mode %d, solo MTP rounds verify 1..%d drafts (%s)%s\n", kstop.mode, kstop.kmax,
++                            kstop.mode == 1 ? ("tau " + std::to_string(kstop.tau[1]) + "," + std::to_string(kstop.tau[2]) + "," +
++                                               std::to_string(kstop.tau[3])).c_str()
++                                            : ("MTP estimates, seed3 " + std::to_string(kstop.seed3)).c_str(),
++                            h.dsel.on ? "" : "; the drafter choice is off, so no MTP rounds");
+                 // a 1-token prompt has no prefill: the drafter starts from its prompt step (dfl_lo = first, as plain)
+                 h.dispatch.dfl_ok = [&](int q) { return dfl_owner == q || slot_prompt[q] == 1; };
+                 h.dispatch.dfl_start = [&](int q) {    // the offline loop's fill steps: Dfl::pf_feat -> the ring
+@@ -1233,7 +1281,9 @@ int main(int argc, char** argv)
+                 (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "") +
+                 (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
+                 (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
+-                (dsel_start_mtp ? " dselstart mtp" : "") + (dsel_posclk ? " dselposclk 1" : "") + (dfl_alpha != 1.f ? " dflalpha " + std::to_string(dfl_alpha) : "");
++                (dsel_start_mtp ? " dselstart mtp" : "") + (dsel_posclk ? " dselposclk 1" : "") + (dfl_alpha != 1.f ? " dflalpha " + std::to_string(dfl_alpha) : "") +
++                (kstop.mode ? " kstop " + std::to_string(kstop.mode) + " kmax " + std::to_string(kstop.kmax) + " tau " + std::to_string(kstop.tau[1]) + "," +
++                              std::to_string(kstop.tau[2]) + "," + std::to_string(kstop.tau[3]) + " seed3 " + std::to_string(kstop.seed3) : "");
+             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
+                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
+             g6s2::ControlLinks links = g6s2::bootstrap(bc);
+diff --git a/engine/runtime/s2/dispatch.h b/engine/runtime/s2/dispatch.h
+index 41711b5..472816b 100644
+--- a/engine/runtime/s2/dispatch.h
++++ b/engine/runtime/s2/dispatch.h
+@@ -38,6 +38,8 @@ struct DispatchHooks {
+     std::function<bool(int slot)> dfl_ok;
+     std::function<int(int slot)> dfl_start;
+     std::function<s2::DflDrafts(const s2::DflReq&, const Sampling&)> dfl;
++    // optional: row's log-probability in the last draft or chain step (StepOut::lp; s2_batch.h Batch::kstop)
++    std::function<float(int row)> draft_lp;
+ };
+ // the graph key of a step of shape `shape` (s2::Step::key: kind and M) whose largest context bucket is `bucket`
+ inline std::string launch_key(const std::string& shape, int bucket) { return shape + ":b" + std::to_string(bucket); }
+diff --git a/engine/runtime/s2/driver.h b/engine/runtime/s2/driver.h
+index 522b1fb..fcb9aa9 100644
+--- a/engine/runtime/s2/driver.h
++++ b/engine/runtime/s2/driver.h
+@@ -26,6 +26,8 @@ struct DriverHooks {
+     std::function<bool(Key)> dfl_ok;
+     std::function<int(Key)> dfl_start;
+     std::function<s2::DflDrafts(Key, const s2::DflReq&)> dfl;
++    // optional: row r's log-probability in the last draft or chain step (s2::Hooks::lp, G6_MTP_KSTOP / G6_MTP_LPLOG)
++    std::function<float(int)> draft_lp;
+     // One completion notification.
+     std::function<void(Key, const s2::Stats&)> terminal;
+     // optional: before a round, a decoding session's run grows to cover `rows` (round_rows). The run, perhaps the same,
+@@ -69,7 +71,8 @@ class Driver {
+             hooks_.dfl ? std::function<s2::DflDrafts(const s2::DflReq&)>([this](const s2::DflReq& r) {
+                 return hooks_.dfl(scheduler_.slots()[r.sess].key, r);
+             }) : nullptr,
+-            hooks_.dfl_start ? std::function<int(int)>([this](int q) { return hooks_.dfl_start(scheduler_.slots()[q].key); }) : nullptr
++            hooks_.dfl_start ? std::function<int(int)>([this](int q) { return hooks_.dfl_start(scheduler_.slots()[q].key); }) : nullptr,
++            hooks_.draft_lp
+         };
+     }
+     // sessions in Prefill or Decode (Dispatch::synchronize_mode's count: 1 = the solo path)
+@@ -109,6 +112,7 @@ public:
+     // DFlash2 sessions verify up to kv drafts with the --spec-adaptive policy sl (s2_batch.h Batch::dflash)
+     void dflash(int kv, const g6rt::SpecLen& sl) { batch_.dflash(kv, sl); }
+     void dsel(const s2::DSel& d) { batch_.dsel(d); }
++    void kstop(const s2::KStop& k) { batch_.kstop(k); }
+     void fail() { scheduler_.fail(); }
+     void idle_boundary(uint64_t b) { scheduler_.idle_boundary(b); }
+     void pool_digest(uint64_t d) { scheduler_.pool_digest(d); }
+diff --git a/engine/runtime/s2/native.cuh b/engine/runtime/s2/native.cuh
+index 771daa9..b360b61 100644
+--- a/engine/runtime/s2/native.cuh
++++ b/engine/runtime/s2/native.cuh
+@@ -80,6 +80,8 @@ class NativeDispatch {
+     uint64_t prefill_sequence_ = 1, prefill_sequence2_ = 1;
+     g6rt::LpStep lp_{};   // logprobs of the last main step, fetched when a session in it asked (lp_rows_ rows; 0 = none)
+     int lp_rows_ = 0;
++    float dlp_[g6rt::MX] = {};   // the last draft or chain step's StepOut::lp (dlp_rows_ rows; s2_batch.h Batch::kstop)
++    int dlp_rows_ = 0;
+     struct Graphs { cudaGraphExec_t a = nullptr, b = nullptr; };
+     std::map<std::string, Graphs> graphs_;
+     static void destroy(Graphs& g) {
+@@ -180,6 +182,7 @@ class NativeDispatch {
+             if (g.b) G6RT_CK(cudaGraphLaunch(g.b,c_.stream));
+         }
+         fence(); const auto out = *(draft ? c_.draft_output : c_.output);
++        if (draft) { std::copy(out.lp, out.lp + rows, dlp_); dlp_rows_ = rows; }
+         if (!draft) {
+             g6rt::evprof_read(rows,c_.stream,c_.main.rank);
+             lp_rows_ = 0;
+@@ -338,7 +341,7 @@ public:
+                 (double(free0)-double(free1))/(1024.0*1024.0));
+     }
+     DispatchHooks hooks() {
+-        return {
++        DispatchHooks h{
+             [&](bool draft,int ctx){return g6rt::bucket_of(draft?c_.draft.d:c_.main,ctx);},
+             [&](int old,int next){mode(old,next);},
+             [&](const Launch& l){return launch(l);},
+@@ -348,6 +351,11 @@ public:
+                 return g6rt::lp_row(lp_,row,target,k);
+             }
+         };
++        h.draft_lp = [&](int row) {
++            require(row >= 0 && row < dlp_rows_, "draft logprob row outside the last draft step");
++            return dlp_[row];
++        };
++        return h;
+     }
+     void synchronize() { fence(); }
+ };
+diff --git a/engine/runtime/s2/service.h b/engine/runtime/s2/service.h
+index 80df605..49fbce2 100644
+--- a/engine/runtime/s2/service.h
++++ b/engine/runtime/s2/service.h
+@@ -53,6 +53,7 @@ struct NativeHooks {
+     int dfl_kv = 7;
+     g6rt::SpecLen dfl_spec;
+     s2::DSel dsel;                    // drafter choice (G6_S2_DSEL)
++    s2::KStop kstop;                  // solo MTP rounds' draft count (G6_MTP_KSTOP, G6_MTP_LPLOG)
+ };
+ // Only atomic scalar stores/loads on the compute hot path. No request-file
+ // checks, digest, allocation, or lock in an event-free boundary. horizon() is
+@@ -355,9 +356,10 @@ public:
+             h.dfl_ok = [&](Key k) { return dispatch_.dfl_ok(k.slot); };
+             h.dfl_start = [&](Key k) { return dispatch_.dfl_start(k.slot); };
+             h.dfl = [&](Key, const s2::DflReq& r) { return dispatch_.dfl(r); };
++            h.draft_lp = native_.dispatch.draft_lp;
+         }
+         driver_ = std::make_unique<Driver>(c_.scheduler,std::move(h));
+-        if (native_.dispatch.dfl) { driver_->dflash(native_.dfl_kv, native_.dfl_spec); driver_->dsel(native_.dsel); }
++        if (native_.dispatch.dfl) { driver_->dflash(native_.dfl_kv, native_.dfl_spec); driver_->dsel(native_.dsel); driver_->kstop(native_.kstop); }
+         if (reuse()) {
+             require(bool(native_.pool.retain) && bool(native_.pool.take), "prefix reuse needs retain, match and take");
+             dispatch_.track_rows();
+diff --git a/engine/runtime/s2/tests/batch_kstop_test.cpp b/engine/runtime/s2/tests/batch_kstop_test.cpp
+new file mode 100644
+index 0000000..2f4699d
+--- /dev/null
++++ b/engine/runtime/s2/tests/batch_kstop_test.cpp
+@@ -0,0 +1,175 @@
++// MTP confidence stop (s2_batch.h Batch::kstop, G6_MTP_KSTOP): a solo DFlash2 session's MTP rounds chain and verify the
++// drafts the rule allows (mode 1: p_1 * .. * p_j >= tau[j]; mode 2: the drafter choice's MTP estimates), a demoted
++// session's chain is completed to K before its first shared round, every committed token is the target's, and with the
++// stop off the steps are the same with or without the log-probability hook and the log. Host only, a fake engine.
++// Build: g++ -std=c++17 -O2 -I engine/runtime engine/runtime/s2/tests/batch_kstop_test.cpp -o /tmp/batch_kstop_test
++#include "s2_batch.h"
++#include <cmath>
++#include <cstdio>
++#include <tuple>
++using namespace s2;
++
++static int fails = 0;
++#define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
++
++static int target(int pos) { return (pos * 37 + 11) % 997; }    // the token at position pos + 1
++static bool good(int spos) { return (spos * 2654435761u >> 7) % 4 != 0; }   // the MTP draft for sample position spos is right
++
++struct Fake
++{
++    int regime = 0;           // 0: drafts right where good(); 1: always right, confident; 2: always wrong, unsure
++    std::vector<float> lp;    // the last draft or chain step's rows
++    std::vector<std::tuple<int, int, int, long>> trace;   // (kind, M, first row token, round) per step
++    std::vector<int> got;
++    bool right(int sp) const { return regime == 1 || (regime == 0 && good(sp)); }
++    float p(int sp) const { return regime == 1 ? 0.95f : regime == 2 ? 0.05f : !good(sp) ? 0.15f : sp % 4 ? 0.97f : 0.8f; }
++    Hooks hooks(bool with_lp)
++    {
++        Hooks h;
++        h.run = [this](const Step& s) {
++            std::vector<int> out;
++            if (s.kind != Step::MAIN) lp.clear();
++            for (const Row& r : s.r)
++            {
++                if (s.kind == Step::MAIN) out.push_back(target(r.spos - 1));
++                else { out.push_back(right(r.spos) ? target(r.spos - 1) : -2); lp.push_back(std::log(p(r.spos))); }
++            }
++            trace.emplace_back((int)s.kind, s.M(), s.r[0].tok, s.round);
++            return out;
++        };
++        h.dfl_start = [](int) { return 0; };
++        h.dfl = [](const DflReq&) { DflDrafts o{}; for (int i = 1; i < DFL_B; ++i) { o.tok[i] = -1; o.lp[i] = -3.f; } return o; };
++        h.emit = [this](int, const int* t, int k, int) { got.insert(got.end(), t, t + k); return false; };
++        if (with_lp) h.lp = [this](int r) { return lp.at(r); };
++        return h;
++    }
++};
++static DSel dsel()
++{
++    DSel sel;
++    sel.on = true; sel.start_mtp = true;    // DFlash2's drafts are all wrong: the session stays on MTP
++    sel.d.draft_round = 8.1; sel.m.draft_round = 5.5; sel.m.draft_each = 2.1;
++    return sel;
++}
++static Session session(int n_gen)
++{
++    Session s; s.prompt.assign(10, 5); s.first = 9; s.chunk = 8; s.n_gen = n_gen; s.dflash = true;
++    return s;
++}
++static bool exact(const std::vector<int>& got) { bool e = true; for (size_t i = 0; i < got.size(); ++i) e &= got[i] == target(9 + (int)i); return e; }
++
++// mode 1 rule, from the fake's probabilities: drafts chained and verified for a round at base
++static std::pair<int, int> rule(const Fake& f, const KStop& ks, int base)
++{
++    auto P = [&](int j) { double p = 1; for (int i = 1; i <= j; ++i) p *= std::exp((double)std::log(f.p(base + i))); return p; };
++    int nd = 1;
++    for (;;)
++    {
++        if (nd >= ks.kmax) break;
++        bool ok = true;
++        for (int j = 1; j <= nd; ++j) ok &= P(j) >= ks.tau[j];
++        if (!ok || P(nd) < ks.tau[nd + 1]) break;
++        ++nd;
++    }
++    int k = 0;
++    while (k < nd && P(k + 1) >= ks.tau[k + 1]) ++k;
++    return {nd, std::max(k, 1)};
++}
++
++int main()
++{
++    // 1. stop off: the same steps and tokens without the hook, with it, and with the log on
++    {
++        std::vector<std::tuple<int, int, int, long>> ref;
++        for (int arm = 0; arm < 3; ++arm)
++        {
++            Fake f;
++            Batch b(2, 32, f.hooks(arm > 0));
++            b.dflash(7, g6rt::SpecLen());
++            b.dsel(dsel());
++            KStop ks; ks.log = arm == 2;
++            b.kstop(ks);
++            b.admit({0}, {session(4000)});
++            for (int i = 0; i < (arm == 2 ? 6 : 60); ++i) CHECK(b.round({0}));
++            if (arm == 0) ref = f.trace;
++            else CHECK(std::equal(f.trace.begin(), f.trace.end(), ref.begin()));
++            CHECK(exact(f.got));
++        }
++    }
++    // 2. mode 1, kmax 3 (K 2): every MTP verify takes the rule's k, after the rule's chain steps
++    {
++        Fake f;
++        Hooks h = f.hooks(true);
++        auto run = h.run;
++        int nchain = 0, bad = 0, rounds = 0, by[5] = {};
++        KStop ks; ks.mode = 1; ks.kmax = 3; ks.tau[1] = 0; ks.tau[2] = 0.3; ks.tau[3] = 0.8;
++        h.run = [&](const Step& s) {
++            if (s.kind == Step::CHAIN) ++nchain;
++            if (s.kind == Step::MAIN && s.round >= 0 && s.M() <= 4)
++            {
++                const int base = s.r[0].pos;
++                const auto r = rule(f, ks, base);
++                bad += s.M() - 1 != r.second || nchain != r.first - 1;
++                ++rounds; ++by[s.M()];
++            }
++            if (s.kind == Step::MAIN) nchain = 0;
++            return run(s);
++        };
++        Batch b(2, 32, h);
++        b.dflash(7, g6rt::SpecLen());
++        b.dsel(dsel());
++        b.kstop(ks);
++        b.admit({0}, {session(4000)});
++        for (int i = 0; i < 300; ++i) CHECK(b.round({0}));
++        CHECK(rounds > 250 && bad == 0);
++        CHECK(by[2] > 0 && by[3] > 0 && by[4] > 0);   // every draft count is used
++        CHECK(exact(f.got));
++        CHECK(b.stats(0).acc[3] > 0);                  // a third draft accepted
++    }
++    // 3. demote after a one-draft round: the chain is completed to K, and the shared round verifies K + 1 rows each
++    {
++        Fake f;
++        f.regime = 1;
++        Batch b(2, 32, f.hooks(true));
++        b.dflash(7, g6rt::SpecLen());
++        b.dsel(dsel());
++        KStop ks; ks.mode = 1; ks.kmax = 3; ks.tau[2] = 0.95;   // p 0.95: one draft (0.9025 < 0.95)
++        b.kstop(ks);
++        b.admit({0}, {session(4000)});
++        for (int i = 0; i < 5; ++i) CHECK(b.round({0}));
++        int m2 = 0;
++        for (const auto& t : f.trace) m2 += std::get<0>(t) == Step::MAIN && std::get<1>(t) == 2;
++        CHECK(m2 == 5);
++        const std::vector<int> mine = f.got;
++        Session s2 = session(4000); s2.dflash = false;
++        b.admit({1}, {s2});
++        f.trace.clear();
++        CHECK(b.round({0, 1}));                        // demote, then one shared round
++        int i = 0;
++        while (i < (int)f.trace.size() && std::get<0>(f.trace[i]) != Step::MAIN) ++i;
++        CHECK(i >= 1 && std::get<0>(f.trace[i - 1]) == Step::CHAIN);   // the top-up chain step before the shared verify
++        CHECK(i < (int)f.trace.size() && std::get<1>(f.trace[i]) == 2 * 3);
++        for (int r = 0; r < 20; ++r) CHECK(b.round({0, 1}));
++        CHECK(b.stats(0).acc[2] > 0);
++    }
++    // 4. mode 2: confident right drafts go to three, unsure wrong ones to one
++    for (int regime : {1, 2})
++    {
++        Fake f;
++        f.regime = regime;
++        Batch b(2, 32, f.hooks(true));
++        b.dflash(7, g6rt::SpecLen());
++        b.dsel(dsel());
++        KStop ks; ks.mode = 2; ks.kmax = 3;
++        b.kstop(ks);
++        b.admit({0}, {session(4000)});
++        for (int i = 0; i < 100; ++i) CHECK(b.round({0}));
++        int by[9] = {};
++        for (const auto& t : f.trace) if (std::get<0>(t) == Step::MAIN && std::get<3>(t) >= 50) ++by[std::get<1>(t)];
++        if (regime == 1) CHECK(by[4] > 40);
++        else CHECK(by[2] > 40);
++        CHECK(exact(f.got));
++    }
++    std::printf("batch_kstop_test: %s\n", fails ? "FAIL" : "PASS");
++    return fails ? 1 : 0;
++}
+diff --git a/engine/runtime/s2_batch.h b/engine/runtime/s2_batch.h
+index 6632670..ccf8041 100644
+--- a/engine/runtime/s2_batch.h
++++ b/engine/runtime/s2_batch.h
+@@ -27,6 +27,11 @@
+ // needs no catch-up; every DSel::probe-th of them also drafts, and its 7 drafts are scored against the tokens later
+ // rounds commit. On DFlash2 rounds the MTP first-form pass already drafts d[1], which scores MTP's first position. The
+ // estimates start afresh with each request.
++// Confidence stop (Batch::kstop, G6_MTP_KSTOP): a solo DFlash2 session's MTP rounds draft and verify k <= KStop::kmax
++// MTP drafts, chosen from the drafts' log-probabilities under the MTP head (StepOut::lp, Hooks::lp): the chain stops
++// before a draft that could not be verified, and the verify takes the drafts that pass. The log-probabilities are the
++// same bytes on every rank (spec_len.h), so every rank chooses the same k. The verify's row count then varies 2..kmax+1
++// as a DFlash2 round's does. A demoted session's chain is completed to K before its first shared round.
+ // Insert rule (Session::ins, insert_rule.h): the rule's tokens take the place of the reply's after+1-th token, when none
+ // of the first after is `unless`. The verify's tokens after that one are dropped, as rejected drafts are. The inserted
+ // tokens are committed and emitted at once. Their own steps (forced, below) run at the start of the session's next
+@@ -39,6 +44,7 @@
+ #pragma once
+ #include <algorithm>
+ #include <cmath>
++#include <cstdio>
+ #include <functional>
+ #include <stdexcept>
+ #include <string>
+@@ -123,6 +129,8 @@ struct Hooks
+     // (the prefill's taps), returning the lowest position it holds
+     std::function<DflDrafts(const DflReq&)> dfl;
+     std::function<int(int)> dfl_start;
++    // optional: row r's log-probability in the last DRAFT or CHAIN step (StepOut::lp; Batch::kstop)
++    std::function<float(int)> lp;
+ };
+ 
+ // Persistent driver state for the scheduler: stable slots 0..S2N_SLOTS-1, all calls at round boundaries.
+@@ -169,6 +177,22 @@ struct DSel
+     bool posclk = false;              // G6_S2_DSEL_POSCLK=1: d and m keep a clock per position (SpecLen::posclk)
+     g6rt::SpecLen d, m;               // DFlash2 and MTP estimates; draft_round / draft_each hold each round's drafting ms
+ };
++// G6_MTP_KSTOP (every rank, read at boot; Batch::kstop): how many MTP drafts a solo DFlash2 session's MTP round verifies.
++//   0  off: K every round
++//   1  thresholds: draft j is verified while p_1 * .. * p_j >= tau[j] (p = exp(lp)), at least one; the chain stops at
++//      the first draft that could not pass (p_1 * .. * p_j < tau[j + 1])
++//   2  DSel's MTP estimates (DSel::m, levels 1..kmax): more() before each chain step, choose() at the verify
++// kmax (G6_MTP_KSTOP_KMAX, 1..3, default K) may exceed K: the solo path verifies with the plain build's graphs, which
++// cover every row count up to the prompt chunk. log (G6_MTP_LPLOG): one "# kstop" line per solo round (both drafters),
++// the drafts' log-probabilities and the accept count, for tuning tau offline; it changes nothing else.
++struct KStop
++{
++    int mode = 0;
++    int kmax = 0;                     // 0: K
++    double tau[4] = {0, 0, 0.2, 0.5};
++    double seed3 = 0.55;              // mode 2: MTP's prior acceptance of a third draft (SpecLen::seed, 0.70 for DFlash2)
++    bool log = false;
++};
+ class Batch
+ {
+ public:
+@@ -184,7 +208,7 @@ public:
+             if (q < 0 || q >= S2N_SLOTS || st_[q].on) throw std::runtime_error("s2: admit: slot " + std::to_string(q) + " is out of range or in use");
+             if (!prompt(q, ss[k]) || st_[q].force >= 0) continue;
+             if (!st_[q].dfl) live.push_back(q);
+-            else if (st_[q].mtp) chain({q}, {int(Step::TAIL)}, K_);   // DSel::start_mtp: d[2..K] for its first round
++            else if (st_[q].mtp) kchain(q, Step::TAIL);   // DSel::start_mtp: d[2..K] for its first round
+         }
+         std::vector<int> all;
+         for (int q = 0; q < S2N_SLOTS; ++q) if (active(q)) all.push_back(q);
+@@ -207,7 +231,17 @@ public:
+     void adapt(bool on) { adapt_ = on; }
+     // DFlash2 sessions verify up to kv of the 7 drafts; sl: the plain build's --spec-adaptive policy (sl.on = false: kv)
+     void dflash(int kv, const g6rt::SpecLen& sl) { dkv_ = kv; dsl_ = sl; }
+-    void dsel(const DSel& d) { sel_ = d; sel_.d.posclk = sel_.m.posclk = d.posclk; }
++    void dsel(const DSel& d) { sel_ = d; sel_.d.posclk = sel_.m.posclk = d.posclk; kstop(ks_); }
++    // solo MTP rounds' draft count (KStop; mode 2 sets DSel::m's levels and third-position seed, so call it after dsel)
++    void kstop(const KStop& k)
++    {
++        ks_ = k;
++        if (ks_.mode != 2) return;
++        std::vector<int> lv;
++        for (int j = 1; j <= kmax(); ++j) lv.push_back(j);
++        sel_.m.set_levels(lv);
++        sel_.m.seed[3] = ks_.seed3;
++    }
+     // a second session is resident: every DFlash2 session goes to MTP (the K-1 chain steps), before the next round
+     void demote()
+     {
+@@ -215,8 +249,10 @@ public:
+             if (st_[q].dfl && active(q))
+             {
+                 st_[q].dfl = false;
+-                // on MTP already: d[2..K] are drafted. Inserted tokens waiting for their steps: forced() chains them
++                // on MTP already: d[2..K] are drafted (KStop: d[2..k], the rest chained here). Inserted tokens waiting for
++                // their steps: forced() chains them
+                 if (!st_[q].mtp && st_[q].force < 0) chain({q}, {int(Step::ROUND)}, K_);
++                else if (st_[q].k < K_ && st_[q].force < 0) chain({q}, {int(Step::ROUND)}, K_, st_[q].k);
+                 st_[q].mtp = false;
+             }
+     }
+@@ -314,14 +350,15 @@ private:
+ 
+     // one round of solo DFlash2 session q (dflash.cuh dflash_sequence's round): verify k + 1 rows, accept, emit; then the
+     // MTP first-form pass and the drafter step over the a + 1 accepted rows. On MTP (x.mtp, drafter choice) the round
+-    // verifies the K MTP drafts, the drafter step takes the rows as context only, and the K-1 chain steps follow.
++    // verifies the K MTP drafts (KStop: kverify of the x.k drafted), the drafter step takes the rows as context only, and
++    // the K-1 chain steps follow (KStop: kchain).
+     void round_dfl(int q)
+     {
+         St& x = st_[q];
+         const int base = (int)x.tokens.size() - 1;
+         const bool m = x.mtp;
+         double pe = 0;
+-        const int k = m ? x.k : dsl_.on ? dsl_.choose(x.dl, dkv_, dkv_, &pe) : dkv_;
++        const int k = m ? (ks_.mode ? kverify(x, &pe) : x.k) : dsl_.on ? dsl_.choose(x.dl, dkv_, dkv_, &pe) : dkv_;
+         const int* dr = m ? x.d.data() : x.dd;
+         Step v;
+         v.kind = Step::MAIN;
+@@ -330,7 +367,7 @@ private:
+         std::vector<Row> rows;
+         for (int r = 0; r <= k; ++r) rows.push_back(Row{q, r ? dr[r] : x.tokens[base], base + r, base + r + 1, -1});
+         add_rows(v, q, rows, v.event);
+-        v.cls = row_class(m ? K_ + 1 : k + 1);
++        v.cls = row_class(m && !ks_.mode ? K_ + 1 : k + 1);
+         check(v);
+         const std::vector<int> t = h_.run(v);
+         int a = 0;
+@@ -338,7 +375,19 @@ private:
+         int kept;
+         const int c = commit(q, t.data(), a + 1, &kept);
+         if (!m && dsl_.on) dsl_.observe(k, a, x.dl, pe);
+-        if (sel_.on) score(x, k, a, t.data());
++        if (sel_.on) score(x, k, a, t.data(), pe);
++        if (ks_.log)
++        {   // G6_MTP_LPLOG: the verified drafts' log-probabilities (MTP: every drafted one), and MTP's d[1] with whether
++            // the target took it (t[0]); round = G6_S2_ROUNDLOG's round id
++            const int n = m ? x.k : k;
++            const float* lp = m ? x.dlm.data() : x.dl;
++            std::string l;
++            char b[48];
++            for (int j = 1; j <= n; ++j) { snprintf(b, sizeof b, "%s%.6g", j > 1 ? "," : "", lp[j]); l += b; }
++            fprintf(stderr, "# kstop round %ld slot %d n %ld %s base %d k %d nd %d a %d lp %s m1 %.6g m1ok %d pe %.3f hash %08x\n",
++                    cur_round_, q, stats_[q].rounds, m ? "mtp" : "dfl", base, k, n, a, l.c_str(), x.dlm[1], x.d[1] == t[0] ? 1 : 0, pe,
++                    g6rt::SpecLen::hash(lp, n, k));
++        }
+         if (h_.round) h_.round(q, stats_[q].rounds, base, a, k);
+         ++stats_[q].rounds; stats_[q].tokens += a + 1; ++stats_[q].acc[a]; stats_[q].drafted += k;
+         ++x.rounds;
+@@ -352,6 +401,7 @@ private:
+         d.cls = row_class(d.M());
+         check(d);
+         x.d[1] = h_.run(d)[dn - 1];
++        x.dlm[1] = dlp(dn - 1);
+         if (x.force >= 0)                 // the insert cut this round: the drafter takes the rows as context, forced() drafts
+         {
+             drafts(q, DflReq{q, dn, base, 0, x.lo, false});
+@@ -366,7 +416,7 @@ private:
+         drafts(q, DflReq{q, a + 1, base, t[a], x.lo, !nm || probe});
+         if (probe) { x.pb = base + a + 1; std::copy(x.dd, x.dd + DFL_B, x.pd); std::copy(x.dl, x.dl + DFL_B, x.pl); }
+         if (!nm) x.pb = -1;
+-        if (nm) chain({q}, {int(v.event)}, K_);
++        if (nm) kchain(q, v.event);
+     }
+     void drafts(int q, const DflReq& r)
+     {
+@@ -379,6 +429,7 @@ private:
+     {
+         Session s;
+         std::vector<int> tokens, d;
++        std::vector<float> dlm;           // KStop: d[j]'s log-probability under the MTP head (NaN: unknown)
+         int n = 0;
+         bool on = false, done = false;
+         int rounds = 0; // first-step timer: per-session decode rounds; round 1 MAIN = DECODE1
+@@ -395,18 +446,52 @@ private:
+         int dd[DFL_B] = {};               // DFlash2 drafts d1..d7 and their log-probabilities under the drafter
+         float dl[DFL_B] = {};
+     };
++    // the chain of a solo session about to verify MTP drafts: K-1 steps, or with KStop while kmore() allows (x.k drafted)
++    void kchain(int q, int ev)
++    {
++        if (!ks_.mode) { chain({q}, {ev}, K_); return; }
++        St& x = st_[q];
++        int n = 1;
++        while (n < kmax() && kmore(x, n)) { chain({q}, {ev}, n + 1, n); ++n; }
++        x.k = n;
++    }
++    int kmax() const { return ks_.kmax ? ks_.kmax : K_; }
++    // KStop mode 1: the probability that drafts 1..j are all right, as the MTP head sees them (NaN, no lp hook: 1)
++    double kprob(const St& x, int j) const
++    {
++        double p = 1;
++        for (int i = 1; i <= j; ++i) p *= std::isnan(x.dlm[i]) ? 1.0 : std::exp((double)x.dlm[i]);
++        return p;
++    }
++    // KStop: one more chain step after n drafts (mode 1: draft n + 1 could still pass, and drafts 1..n do)
++    bool kmore(const St& x, int n) const
++    {
++        if (ks_.mode == 2) return sel_.m.more(x.dlm.data(), n);
++        for (int j = 1; j <= n; ++j) if (kprob(x, j) < ks_.tau[j]) return false;
++        return kprob(x, n) >= ks_.tau[n + 1];
++    }
++    // KStop: the drafts of x.d[1..x.k] to verify (at least one)
++    int kverify(const St& x, double* pe) const
++    {
++        if (ks_.mode == 2) return sel_.m.choose(x.dlm.data(), x.k, x.k, pe);
++        int k = 0;
++        while (k < x.k && kprob(x, k + 1) >= ks_.tau[k + 1]) ++k;
++        return std::max(k, 1);
++    }
++    float dlp(int row) const { return h_.lp && (ks_.mode || ks_.log) ? h_.lp(row) : NAN; }
+     // drafter choice: teach the estimates what this round's tokens t[0..a] say about each drafter. DFlash2 rounds score
+     // MTP's first draft (x.d[1], drafted for position base + 1 = t[0]); MTP rounds score a probe's DFlash2 drafts on the
+     // positions the round committed
+-    void score(St& x, int k, int a, const int* t)
++    void score(St& x, int k, int a, const int* t, double pe)
+     {
++        const float* ml = ks_.mode ? x.dlm.data() : nullptr;   // KStop: MTP's estimates learn its confidence buckets
+         if (!x.mtp)
+         {
+             sel_.d.observe(k, a, x.dl, 0);
+-            sel_.m.observe(1, x.d[1] == t[0] ? 1 : 0, nullptr, 0);
++            sel_.m.observe(1, x.d[1] == t[0] ? 1 : 0, ml, 0);
+             return;
+         }
+-        sel_.m.observe(k, a, nullptr, 0);
++        sel_.m.observe(k, a, ml, pe);
+         probe_score(x);
+     }
+     // a probe's drafts pd[j] are for positions pb + j; score them once a mismatch or all DFL_B - 1 are committed
+@@ -434,6 +519,7 @@ private:
+     {
+         g6rt::SpecLen f;
+         f.on = o.on; f.levels = o.levels; f.draft_round = o.draft_round; f.draft_each = o.draft_each; f.posclk = o.posclk;
++        std::copy(o.seed, o.seed + g6rt::SpecLen::KX + 1, f.seed);
+         return f;
+     }
+     // the draft count for the next round of sessions qs: the k with the most expected tokens per ms of the round
+@@ -461,6 +547,7 @@ private:
+     int dkv_ = DFL_B - 1;
+     g6rt::SpecLen dsl_;
+     DSel sel_;
++    KStop ks_;
+     S2Cost cost_;
+     std::vector<g6rt::SpecLen> sl_ = std::vector<g6rt::SpecLen>(S2N_SLOTS);
+     long round_no_ = 0, cur_round_ = -1; // G6_S2_ROUNDLOG: id of the round in progress and its active-session count
+@@ -489,12 +576,12 @@ private:
+         for (int r = 0; r < M; ++r) v.push_back(Row{q, next[r], pos0 + r, pos0 + r + 2, -1});
+         return v;
+     }
+-    // chain steps for the sessions in qs (each: base = its tokens.size() - 1; d[1] set; fills d[2..k])
+-    void chain(const std::vector<int>& qs, const std::vector<int>& evs, int k)
++    // chain steps for the sessions in qs (each: base = its tokens.size() - 1; d[1..j0] set; fills d[j0+1..k])
++    void chain(const std::vector<int>& qs, const std::vector<int>& evs, int k, int j0 = 1)
+     {
+         for (int q : qs) st_[q].k = k;
+         // first-step timer: each session's chain carries THAT session's round class (evs, parallel to qs).
+-        for (int j = 1; j < k && !qs.empty(); ++j)
++        for (int j = j0; j < k && !qs.empty(); ++j)
+         {
+             Step s;
+             s.kind = Step::CHAIN;
+@@ -508,7 +595,7 @@ private:
+             s.cls = row_class(s.M());
+             check(s);
+             const std::vector<int> t = h_.run(s);
+-            for (size_t i = 0; i < s.sess.size(); ++i) st_[s.sess[i]].d[j + 1] = t[s.row0[i]];
++            for (size_t i = 0; i < s.sess.size(); ++i) { st_[s.sess[i]].d[j + 1] = t[s.row0[i]]; st_[s.sess[i]].dlm[j + 1] = dlp(s.row0[i]); }
+         }
+     }
+     // the prompt steps of session q as its own steps (rank.cuh mtp_sequence, prompt loop); false = finished by emit
+@@ -519,7 +606,8 @@ private:
+         x.s = p; x.on = true;
+         x.tokens = p.prompt;
+         x.n = (int)p.prompt.size();
+-        x.d.assign(K_ + 1, 0);
++        x.d.assign(std::max(K_, kmax()) + 1, 0);
++        x.dlm.assign(x.d.size(), NAN);
+         sl_[q] = g6rt::SpecLen();
+         stats_[q] = Stats();
+         x.dfl = p.dflash;
+@@ -564,6 +652,7 @@ private:
+             check(d);
+             const std::vector<int> u = h_.run(d);
+             x.d[1] = u[M - 1];
++            x.dlm[1] = dlp(M - 1);
+             const bool query = s == PS - 1 && x.force < 0;
+             if (x.dfl) drafts(q, DflReq{q, M, rows[0].pos, query ? t[M - 1] : 0, x.lo, query});
+             if (x.dfl && x.mtp && query) { x.pb = n; std::copy(x.dd, x.dd + DFL_B, x.pd); std::copy(x.dl, x.dl + DFL_B, x.pl); }
+@@ -624,9 +713,11 @@ private:
+             add_rows(d, q, draft_rows(q, M, p0, &x.tokens[p0 + 1]), ev);
+             check(d);
+             x.d[1] = h_.run(d)[M - 1];
++            x.dlm[1] = dlp(M - 1);
+             if (x.dfl) drafts(q, DflReq{q, M, p0, last ? t[M - 1] : 0, x.lo, last});
+         }
+-        if (!x.dfl || x.mtp) chain({q}, {ev}, K_);
++        if (!x.dfl) chain({q}, {ev}, K_);
++        else if (x.mtp) kchain(q, ev);
+     }
+ };
+ 
+diff --git a/scripts/host_tests.sh b/scripts/host_tests.sh
+index 6b6ff3b..f25647a 100755
+--- a/scripts/host_tests.sh
++++ b/scripts/host_tests.sh
+@@ -1,7 +1,7 @@
+ #!/bin/bash
+ # Host-only tests (g++, no CUDA): the switchless relay's ring and credit accounting, the S2 batch planner
+-# (engine/runtime/s2_batch.h, with a DFlash2 session and the insert rule), the S2 control barrier, the pool's page lists
+-# and prefix reuse (s2/pool.h over the Rust pool in engine/kvman-rs, and pool_diff_test: that pool against the C++ one
++# (engine/runtime/s2_batch.h, with a DFlash2 session, the insert rule and the MTP confidence stop), the S2 control
++# barrier, the pool's page lists and prefix reuse (s2/pool.h over the Rust pool in engine/kvman-rs, and pool_diff_test: that pool against the C++ one
+ # it replaced), runs that grow on demand through Driver::step (driver_grow_test, with insert rules), the scheduler's
+ # prefill choice and its deferral bound (scheduler_fair_test), its notice target's sizing (scheduler_horizon_test),
+ # the pool's block
+@@ -30,6 +30,8 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
+ "$T/batch_dsel_test"
+ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_insert_test.cpp" -o "$T/batch_insert_test"
+ "$T/batch_insert_test"
++g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_kstop_test.cpp" -o "$T/batch_kstop_test"
++"$T/batch_kstop_test"
+ g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/capture_barrier_test.cpp" -o "$T/capture_barrier_test"
+ "$T/capture_barrier_test"
+ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_reuse_test.cpp" "${KVLIB[@]}" -o "$T/pool_reuse_test"

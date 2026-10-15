@@ -1,0 +1,950 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Thu, 15 Oct 2026 16:01:29 +0200
+Subject: [PATCH 12/13] Decode attention round 2: G6_ATTN_SC2_TR=2,
+ G6_ATTN_CTX3, G6_ATTN_SEL2, G6_IDX_GRP (exact, default off); attnk bench vs
+ round 1
+
+scores_sc<S,2> (G6_ATTN_SC2_TR=2): round 1's transpose reduction done eagerly (heads in bit-reversed order, each combine
+as soon as both of its entries exist): the same combines of the same values -> TR=1 bytes, 128 registers instead of 168 at
+S=4. G6_ATTN_SC2=8 builds S=8 with TR=0.
+context_pk3 (G6_ATTN_CTX3=1..4, G6_ATTN_CTX3_HG): context_pk with 32-bit KV row indices, per-batch states from warp ballots
+(skip / plain fmaf with no test / context_pk's select), 32-bit load registers, D = 256 or 512 dims per CTA: per chain the
+same fmaf operands in the same slot order and the same skips -> parts bit-identical. Rows must fit in 32 bits (dispatch).
+rank_selected (G6_ATTN_SEL2=8/16/32/64): the decode selector's final sort as a rank by count over CH CTAs per row (nonzero
+keys are distinct; -1 past nnz) -> the indices of sort_selected<false>/<true>/sort_selected32.
+index_scores_g (G6_IDX_GRP=G): the per-row decode indexer (S2 batched steps) reads each key tile once for up to G rows of
+one session; per row index_scores' wmma tiles and epilogue -> scores and ids bit-identical.
+Flags unset: the same launches as before. SEL2 and IDX_GRP act in run_body only (prefill and CP paths unchanged).
+tests/attnk.cu: timing against BASE = round 1 (SC2=4 TR=1 CTX2=4), bytes against stock (now also the indexer's scores and
+ids and the appended index pages), two sessions on disjoint page tables (ATTNK_SESS=2), index-score ties (ATTNK_TIES=1),
+probability underflow (ATTNK_QSCALE), every changed node timed.
+---
+ engine/attn/attn.cu          |  54 +++++--
+ engine/attn/decode-small.cuh | 171 ++++++++++++++++++---
+ engine/attn/idx31.cuh        |  87 ++++++++++-
+ engine/attn/select.cuh       |  56 +++++++
+ engine/attn/tests/attnk.cu   | 281 +++++++++++++++++++++--------------
+ 5 files changed, 509 insertions(+), 140 deletions(-)
+
+diff --git a/engine/attn/attn.cu b/engine/attn/attn.cu
+index ec33ae8..daa40d5 100644
+--- a/engine/attn/attn.cu
++++ b/engine/attn/attn.cu
+@@ -519,6 +519,23 @@ static int& attn_ctx2(){static int v=[]{
+     const char* e=getenv("G6_ATTN_CTX2");const int x=e?atoi(e):0;return (x>=1&&x<=4)||x==9?x:0;
+ #endif
+     }();return v;}
++// G6_ATTN_CTX3 (default 0 = off; decode-small.cuh context_pk3): replaces context_parts_heads / G6_ATTN_CTX2 on their calls.
++// 1 / 2 = PB 16 / 32 gathered pairs per batch over D = 256 dims per CTA, 3 / 4 = the same over D = 512. G6_ATTN_CTX3_HG =
++// 2 / 4 / 8 forces the head group (default: 4 up to 4 rows, then 8, as context_parts_heads). Bit-identical parts. FP8 KV only.
++// G6_ATTN_SEL2=<CH> (8 / 16 / 32 / 64, default 0 = off; select.cuh rank_selected): the decode selector's final sort as a
++// rank by count over CH CTAs per row. G6_IDX_GRP=<G> (1..64, default 0 = off; idx31.cuh index_scores_g): the decode
++// per-row indexer reads each key tile once for up to G rows of one session. Both bit-identical, decode run_body only.
++// Host-side, read once (before graph capture); tests may assign them.
++static int& attn_ctx3(){static int v=[]{
++#if G6_KV4
++    return 0;
++#else
++    const char* e=getenv("G6_ATTN_CTX3");const int x=e?atoi(e):0;return x>=1&&x<=4?x:0;
++#endif
++    }();return v;}
++static int& attn_ctx3_hg(){static int v=[]{const char* e=getenv("G6_ATTN_CTX3_HG");const int x=e?atoi(e):0;return x==2||x==4||x==8?x:0;}();return v;}
++static int& attn_sel2(){static int v=[]{const char* e=getenv("G6_ATTN_SEL2");const int x=e?atoi(e):0;return x==8||x==16||x==32||x==64?x:0;}();return v;}
++static int& attn_idx_grp(){static int v=[]{const char* e=getenv("G6_IDX_GRP");const int x=e?atoi(e):0;return x>=1&&x<=64?x:0;}();return v;}
+ struct Work {
+     float *q,*rope,*weights,*si,*so,*prob,*parts,*context;
+     half* iq;int *ii,*io,*offsets;uint64_t* selected;SelectionState* selection;int* histogram;void* temp;size_t temp_bytes,total;
+@@ -561,17 +578,31 @@ static void threshold_compact32(const G6Attn& a,Input input,Work& w,int count,cu
+ }
+ #endif
+ static void threshold_compact(const G6Attn& a,Work& w,int count,cudaStream_t stream){threshold_compact(a,a,w,count,stream);}
+-template<class Input>
+-static cudaError_t select_index(const G6Attn& a,Input input,Work& w,int start,int count,cudaStream_t stream){
+-    if(a.context<=TOP){sort_selected<false><<<count,256,0,stream>>>(input,start,w.si,w.selected);return cudaGetLastError();}
++// rank = G6_ATTN_SEL2 (attn_sel2, decode run_body): rank_selected<MODE> with rank CTAs per row in place of the sort
++template<int MODE,class Input>
++static void launch_rank_selected(int rank,Input input,int start,const float* scores,const uint64_t* selected,int count,cudaStream_t st){
++    switch(rank){
++        case 8:rank_selected<MODE,8><<<dim3(8,count),256,0,st>>>(input,start,scores,selected);break;
++        case 32:rank_selected<MODE,32><<<dim3(32,count),256,0,st>>>(input,start,scores,selected);break;
++        case 64:rank_selected<MODE,64><<<dim3(64,count),256,0,st>>>(input,start,scores,selected);break;
++        default:rank_selected<MODE,16><<<dim3(16,count),256,0,st>>>(input,start,scores,selected);break;}
++}
++template<class Input>
++static cudaError_t select_index(const G6Attn& a,Input input,Work& w,int start,int count,cudaStream_t stream,int rank=0){
++    if(a.context<=TOP){
++        if(rank)launch_rank_selected<0>(rank,input,start,w.si,w.selected,count,stream);
++        else sort_selected<false><<<count,256,0,stream>>>(input,start,w.si,w.selected);
++        return cudaGetLastError();}
+     if(a.context<=32768){
+         threshold_compact(a,input,w,count,stream);
+-        sort_selected<true><<<count,256,0,stream>>>(input,start,w.si,w.selected);
++        if(rank)launch_rank_selected<1>(rank,input,start,w.si,w.selected,count,stream);
++        else sort_selected<true><<<count,256,0,stream>>>(input,start,w.si,w.selected);
+         return cudaGetLastError();
+     }
+ #ifdef SEL32
+     threshold_compact32(a,input,w,count,stream);
+-    sort_selected32<<<count,256,0,stream>>>(input,start,w.selected);
++    if(rank)launch_rank_selected<2>(rank,input,start,w.si,w.selected,count,stream);
++    else sort_selected32<<<count,256,0,stream>>>(input,start,w.selected);
+     return cudaGetLastError();
+ #endif
+     cudaError_t e;
+@@ -604,14 +635,16 @@ static void launch_index_scores31(const G6Attn& a,Input input,Work& w,int start,
+     if(idx31_ok(a,n))launch_index_scores_m(a,input,w,start,n,st);else launch_index_scores(a,input,w,start,n,st);
+ }
+ template<class Input>
+-static cudaError_t select_index_dec(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
+-    return idx31_ok(a,n)?select_index31(a,input,w,start,n,st):select_index(a,input,w,start,n,st);
++static cudaError_t select_index_dec(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,int rank=0){
++    return idx31_ok(a,n)?select_index31(a,input,w,start,n,st,rank):select_index(a,input,w,start,n,st,rank);
+ }
++static bool idx_keys_shared(const G6Attn& a,int n){return idx31_ok(a,n);}   // index_scores_m: keys read once per step
+ #define LAUNCH_INDEX_SCORES launch_index_scores31
+ #define SELECT_INDEX select_index_dec
+ #else
+ #define LAUNCH_INDEX_SCORES launch_index_scores
+ #define SELECT_INDEX select_index
++static bool idx_keys_shared(const G6Attn&,int){return false;}
+ #endif
+ template<class Input>
+ static cudaError_t make_index(const G6Attn& a,Input input,Work& w,int start,int count,cudaStream_t stream,float* diagnostic){
+@@ -649,8 +682,11 @@ static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t str
+     cudaError_t e;
+     for(int start=0;start<a.rows;start+=a.query_tile){int n=std::min(a.rows-start,a.query_tile);
+         if(a.reuse_indices){AMARK(1);ga::reuse<<<n,256,0,stream>>>(input,start);}
+-        else{prep_index<<<dim3(n,32),128,0,stream>>>(input,start,w.iq,w.weights);LAUNCH_INDEX_SCORES(a,input,w,start,n,stream);AMARK(1);
+-            e=SELECT_INDEX(a,input,w,start,n,stream);if(e!=cudaSuccess)return e;}
++        else{prep_index<<<dim3(n,32),128,0,stream>>>(input,start,w.iq,w.weights);
++            if(attn_idx_grp()&&!idx_keys_shared(a,n))launch_index_scores_g(a,input,w,start,n,attn_idx_grp(),stream);
++            else LAUNCH_INDEX_SCORES(a,input,w,start,n,stream);
++            AMARK(1);
++            e=SELECT_INDEX(a,input,w,start,n,stream,attn_sel2());if(e!=cudaSuccess)return e;}
+         AMARK(2);
+ #if defined(DEC_AVP) && DEC_AVP
+         if(avp1_on())launch_absorb_m1(a,input,w,start,n,stream);else if(launch_absorb_rows(a,input,w,start,n,stream)){}else
+diff --git a/engine/attn/decode-small.cuh b/engine/attn/decode-small.cuh
+index 6ffacdd..167d636 100644
+--- a/engine/attn/decode-small.cuh
++++ b/engine/attn/decode-small.cuh
+@@ -115,9 +115,15 @@ __global__ void __launch_bounds__(128) context_parts_heads(Input input,int start
+ // and warp-uniform (one id per slot), so every shuffle stays full-warp; a dead slot in a live warp runs on zero operands and
+ // stores -inf. Needs heads % 16 == 0 (dispatch). grid dim3(TOP/(4*S), heads/16, n), block 128: warp w of block x owns slots
+ // (4x + w)*S .. +S-1, lane l < 16 stores head h0 + l of them (one S-wide vector store).
+-template<int S,bool TR,class Input>
++// TR = 2 (G6_ATTN_SC2_TR=2): the same transpose reduction, eager. Every combine of TR = 1 pairs entries i and i + n/2 of the
++// stage, so the head entering it can be computed right before: heads in bit-reversed order (0 8 4 12 2 10 6 14 1 ...), each
++// pair combined at offset 16 at once, two such results at 8, then 4, 2, and the last stage's a += shfl(a, 1). The same
++// combines of the same values (keep / send by the same lane bit) -> TR = 1's bytes, with at most a few partials per slot
++// live instead of 16 (registers). S = 8 (kv alone is 128 registers) is built with TR = 0 only (G6_ATTN_SC2_TR ignored).
++template<int S,int TR,class Input>
+ __global__ void __launch_bounds__(128) scores_sc(Input input,int start,const float* q,const float* rope,float* out){
+- static_assert(S==1||S==2||S==4,"S in {1,2,4}");
++ static_assert(S==1||S==2||S==4||S==8,"S in {1,2,4,8}");
++ static_assert(TR>=0&&TR<=2&&!(S==8&&TR),"TR in {0,1,2}; S = 8 with TR 0");
+  auto a=ga::resolve(input);if(!a.active)return;constexpr int HG=16,WARPS=4;
+  int row=blockIdx.z,r=start+row,h0=blockIdx.y*HG,j0=(blockIdx.x*WARPS+threadIdx.x/32)*S,lane=threadIdx.x&31;FOR_ROW(a,input,r);
+  const uint8_t* v[S];bool any=false;
+@@ -141,6 +147,41 @@ __global__ void __launch_bounds__(128) scores_sc(Input input,int start,const flo
+     for(int k=0;k<16;k++)kv[s][k]=0;
+     rv[s][0]=rv[s][1]=0;}}
+   const float* qh=q+((int64_t)row*a.heads+h0)*512+lane;const float* ph=rope+((int64_t)row*a.heads+h0)*64+lane;
++  if constexpr(TR==2){
++   // head hh's S dot products (the TR = 0 / 1 chains)
++   auto head=[&](int hh,float (&o)[S]){float qv[16],pv[2];
++    #pragma unroll
++    for(int k=0;k<16;k++)qv[k]=__ldg(qh+hh*512+k*32);
++    #pragma unroll
++    for(int k=0;k<2;k++)pv[k]=__ldg(ph+hh*64+k*32);
++    #pragma unroll
++    for(int s=0;s<S;s++){float sum=0;
++     #pragma unroll
++     for(int k=0;k<16;k++)sum=fmaf(qv[k],kv[s][k],sum);
++     #pragma unroll
++     for(int k=0;k<2;k++)sum=fmaf(pv[k],rv[s][k],sum);
++     o[s]=sum;}};
++   // TR = 1's combine of entries x = acc[i] and y = acc[i + n/2] at offset o
++   auto comb=[&](float x,float y,int o){const bool hi=(lane&o)!=0;const float keep=hi?y:x,send=hi?x:y;return keep+__shfl_xor_sync(0xffffffff,send,o);};
++   int src=0;{const int want=lane%HG;int n=HG,o=16,hd=0;while(n>1){const int hf=n/2;if(want>=hd+hf){src|=o;hd+=hf;}n=hf;o>>=1;}}
++   float t2[2][S];   // T2(a2) = comb(T3(a2), T3(a2+2), 4), T3(i) = comb(T4(i), T4(i+4), 8), T4(i) = comb(H(i), H(i+8), 16)
++   #pragma unroll
++   for(int a2=0;a2<2;a2++){float t3[2][S];
++    #pragma unroll
++    for(int a3=0;a3<2;a3++){float t4[2][S];
++     #pragma unroll
++     for(int a4=0;a4<2;a4++){const int i=a2+2*a3+4*a4;float x0[S],x1[S];head(i,x0);head(i+8,x1);
++      #pragma unroll
++      for(int s=0;s<S;s++)t4[a4][s]=comb(x0[s],x1[s],16);}
++     #pragma unroll
++     for(int s=0;s<S;s++)t3[a3][s]=comb(t4[0][s],t4[1][s],8);}
++    #pragma unroll
++    for(int s=0;s<S;s++)t2[a2][s]=comb(t3[0][s],t3[1][s],4);}
++   #pragma unroll
++   for(int s=0;s<S;s++){float f=comb(t2[0][s],t2[1][s],2);f+=__shfl_xor_sync(0xffffffff,f,1);
++    const float got=__shfl_sync(0xffffffff,f,src);
++    if(lane<HG)mine[s]=got*(1.f/16);}}
++  else{
+   float acc[TR?S:1][TR?HG:1];
+   #pragma unroll
+   for(int hh=0;hh<HG;hh++){float qv[16],pv[2];
+@@ -168,11 +209,12 @@ __global__ void __launch_bounds__(128) scores_sc(Input input,int start,const flo
+       n=hf;}
+      else acc[s][0]+=__shfl_xor_sync(0xffffffff,acc[s][0],o);}
+     const float got=__shfl_sync(0xffffffff,acc[s][0],src);
+-    if(lane<HG)mine[s]=got*(1.f/16);}}
++    if(lane<HG)mine[s]=got*(1.f/16);}}}
+   #pragma unroll
+   for(int s=0;s<S;s++)if(!v[s])mine[s]=-INFINITY;}
+  if(lane<HG){float* o=out+((int64_t)row*a.heads+h0+lane)*ga::TOP+j0;
+-  if constexpr(S==4)*(float4*)o=make_float4(mine[0],mine[1],mine[2],mine[3]);
++  if constexpr(S==8){((float4*)o)[0]=make_float4(mine[0],mine[1],mine[2],mine[3]);((float4*)o)[1]=make_float4(mine[4],mine[5],mine[6],mine[7]);}
++  else if constexpr(S==4)*(float4*)o=make_float4(mine[0],mine[1],mine[2],mine[3]);
+   else if constexpr(S==2)*(float2*)o=make_float2(mine[0],mine[1]);
+   else o[0]=mine[0];}
+ }
+@@ -219,6 +261,74 @@ __global__ void __launch_bounds__(128) context_pk(Input input,int start,const fl
+  #pragma unroll
+  for(int hh=0;hh<HG;hh++)if(hh<nh){float* dst=parts+(((int64_t)row*a.heads+h0+hh)*P+part)*512;dst[d]=lo[hh];dst[d+1]=hi[hh];}
+ }
++// G6_ATTN_CTX3=1..4 (attn_ctx3): context_pk with less work per slot. Prologue as context_pk (pm[j] = slot j's HG
++// probabilities, 0 for a slot whose KV row is not read), plus the slot's KV row index (kv_row; a slot that is not read points
++// at row 0, which is loaded and never used), its scales (scl[g][j], g = the CTA's 128-dim groups) and, per batch of PB
++// slots, one state from two warp ballots: 0 = no slot read (skipped), 1 = every slot read with all HG probabilities != 0
++// (plain fmaf: no test), 2 = mixed (context_pk's select lo = p != 0 ? fmaf(p, x*s, lo) : lo; an unread slot has p = 0 for
++// every head). Batches run in slot order up to the last one with a slot read, the next batch's pairs (32-bit registers, one
++// read-only 16-bit load from the row index, no pointer test) loaded before the current batch is used. Per (row, head, dim)
++// chain: the same fmaf operands in the same slot order as context_parts_heads, the same skips of unread slots and of
++// p == 0 (-0 and NaN p as there) -> parts bit-identical. D = dims per CTA: 256 (two CTAs per partition, as
++// context_parts_heads) or 512 (one, the prologue once per partition). grid dim3(PART*512/D, ceil(heads/HG), n), block D/2.
++// Rows are 32-bit: the dispatch (use_ctx3) needs page_count * page_size <= INT_MAX.
++template<int HG,int PB,int D,class Input>
++__global__ void __launch_bounds__(D/2) context_pk3(Input input,int start,const float* probs,float* parts){
++ static_assert((D==256||D==512)&&(PB==16||PB==32)&&(HG==2||HG%4==0),"D 256 / 512, PB 16 / 32, HG 2 or a multiple of 4");
++ auto a=ga::resolve(input);if(!a.active)return;constexpr int THREADS=D/2,GROUPS=D/128,SP=256,NB=SP/PB;
++ const int row=blockIdx.z,r=start+row,h0=blockIdx.y*HG,part=blockIdx.x/(512/D),d0=(blockIdx.x%(512/D))*D,t=threadIdx.x,lane=t&31;FOR_ROW(a,input,r);
++ const int nh=min(HG,a.heads-h0);
++ __shared__ __align__(16) float pm[SP][HG];__shared__ float scl[GROUPS][SP];__shared__ int kv_row[SP];__shared__ uint8_t state[NB];
++ for(int j=t;j<SP;j+=THREADS){const int slot=part*SP+j,id=a.indices[(int64_t)r*ga::TOP+slot];   // j - lane: a multiple of 32
++  const bool idok=id>=0&&id<=a.positions[r];   // dead slots read no probabilities
++  float p[HG];bool live=false,full=true;
++  #pragma unroll
++  for(int hh=0;hh<HG;hh++){p[hh]=idok&&hh<nh?probs[((int64_t)row*a.heads+h0+hh)*ga::TOP+slot]:0.f;live|=p[hh]!=0;full&=hh>=nh||p[hh]!=0;}
++  int kr=-1;if(live){const int pg=ga::page(a,id);if(pg>=0)kr=(int)((int64_t)pg*a.page_size+id%a.page_size);}   // kv_at's row (< 2^31: dispatch)
++  const bool rd=kr>=0;full&=rd;
++  #pragma unroll
++  for(int hh=0;hh<HG;hh++)pm[j][hh]=rd?p[hh]:0.f;
++  kv_row[j]=rd?kr:0;
++  #pragma unroll
++  for(int g=0;g<GROUPS;g++)scl[g][j]=rd?((const float*)((const uint8_t*)a.mla_cache+(int64_t)kr*ga::KV_BYTES+512))[d0/128+g]:0.f;
++  const unsigned br=__ballot_sync(0xffffffffu,rd),bf=__ballot_sync(0xffffffffu,full);
++  if(lane==0){
++   #pragma unroll
++   for(int h2=0;h2<32/PB;h2++){const unsigned m=PB==32?0xffffffffu:0xffffu<<(16*h2);state[j/PB+h2]=(bf&m)==m?1:(br&m)?2:0;}}}
++ __syncthreads();
++ int nb=0;
++ #pragma unroll
++ for(int b=0;b<NB;b++)if(state[b])nb=b+1;
++ float lo[HG],hi[HG];
++ #pragma unroll
++ for(int hh=0;hh<HG;hh++){lo[hh]=0;hi[hh]=0;}
++ const int d=d0+2*t,gs=(2*t)/128;
++ if(nb){const uint8_t* kvd=(const uint8_t*)a.mla_cache+d;const float* sg=scl[gs];uint32_t ra[PB],rb[PB];
++  auto load=[&](uint32_t (&raw)[PB],int b){
++   #pragma unroll
++   for(int u=0;u<PB;u++)raw[u]=__ldg((const unsigned short*)(kvd+(int64_t)kv_row[b*PB+u]*ga::KV_BYTES));};
++  auto probs_of=[&](int j,float (&p)[HG]){
++   if constexpr(HG==2){const float2 q2=*(const float2*)&pm[j][0];p[0]=q2.x;p[1]=q2.y;}
++   else{
++    #pragma unroll
++    for(int i=0;i<HG;i+=4){const float4 q4=*(const float4*)&pm[j][i];p[i]=q4.x;p[i+1]=q4.y;p[i+2]=q4.z;p[i+3]=q4.w;}}};
++  auto use=[&](const uint32_t (&raw)[PB],int b){
++   const int st=state[b];
++   if(st==1){
++    #pragma unroll
++    for(int u=0;u<PB;u++){const int j=b*PB+u;const float2 x=fp8_pair((uint16_t)raw[u]);const float sc=sg[j];float p[HG];probs_of(j,p);
++     #pragma unroll
++     for(int hh=0;hh<HG;hh++){lo[hh]=fmaf(p[hh],x.x*sc,lo[hh]);hi[hh]=fmaf(p[hh],x.y*sc,hi[hh]);}}}
++   else if(st==2){
++    #pragma unroll
++    for(int u=0;u<PB;u++){const int j=b*PB+u;const float2 x=fp8_pair((uint16_t)raw[u]);const float sc=sg[j];float p[HG];probs_of(j,p);
++     #pragma unroll
++     for(int hh=0;hh<HG;hh++){const float fl=fmaf(p[hh],x.x*sc,lo[hh]),fh=fmaf(p[hh],x.y*sc,hi[hh]);lo[hh]=p[hh]!=0?fl:lo[hh];hi[hh]=p[hh]!=0?fh:hi[hh];}}}};
++  load(ra,0);
++  for(int b=0;b<nb;b+=2){if(b+1<nb)load(rb,b+1);use(ra,b);if(b+2<nb)load(ra,b+2);if(b+1<nb)use(rb,b+1);}}
++ #pragma unroll
++ for(int hh=0;hh<HG;hh++)if(hh<nh){float* dst=parts+(((int64_t)row*a.heads+h0+hh)*ga::PART+part)*512;dst[d]=lo[hh];dst[d+1]=hi[hh];}
++}
+ // scores_tr = scores_heads with all HG head dot products held per lane (ILP across
+ // heads), then ONE transpose reduction over xor offsets 16,8,4,2,1: each stage keeps half of the remaining heads, so every
+ // head still gets the warp_sum tree (same operands, same add order per stage; a+b commutes bitwise) -> 16+ shuffles instead
+@@ -342,21 +452,26 @@ static void launch_index_scores(const G6Attn& a,Input input,Work& w,int start,in
+ }
+ // G6_ATTN_HEADS=0 (read at launch / capture): the per-head scores_direct / context_parts kernels (A/B and tests)
+ static bool attn_heads(){static const bool on=!getenv("G6_ATTN_HEADS")||atoi(getenv("G6_ATTN_HEADS"))!=0;return on;}
+-// G6_ATTN_SC2=<S> (default 0 = off): scores_sc<S> (S = 1, 2, 4 slots per warp) for the scores_heads<16> calls;
+-// G6_ATTN_SC2_TR=1 adds scores_tr's transpose reduction. Bit-identical. Host-side, read once (before graph capture).
+-// Tests may assign them.
+-static int& attn_sc2(){static int v=[]{const char* e=getenv("G6_ATTN_SC2");const int x=e?atoi(e):0;return x==1||x==2||x==4?x:0;}();return v;}
+-static int& attn_sc2_tr(){static int v=[]{const char* e=getenv("G6_ATTN_SC2_TR");return e&&atoi(e)?1:0;}();return v;}
++// G6_ATTN_SC2=<S> (default 0 = off): scores_sc<S> (S = 1, 2, 4, 8 slots per warp) for the scores_heads<16> calls;
++// G6_ATTN_SC2_TR=1 adds scores_tr's transpose reduction, =2 the same reduction eager (S = 8: TR 0 only).
++// Bit-identical. Host-side, read once (before graph capture). Tests may assign them.
++static int& attn_sc2(){static int v=[]{const char* e=getenv("G6_ATTN_SC2");const int x=e?atoi(e):0;return x==1||x==2||x==4||x==8?x:0;}();return v;}
++static int& attn_sc2_tr(){static int v=[]{const char* e=getenv("G6_ATTN_SC2_TR");const int x=e?atoi(e):0;return x==1||x==2?x:0;}();return v;}
+ template<class Input>
+ static void launch_scores_sc(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
+- const dim3 b(128),g2(TOP/8,a.heads/16,n),g4(TOP/16,a.heads/16,n),g1(TOP/4,a.heads/16,n);
+- switch(attn_sc2()*2+attn_sc2_tr()){
+-  case 2:small_decode::scores_sc<1,false><<<g1,b,0,st>>>(input,start,w.q,w.rope,w.prob);break;
+-  case 3:small_decode::scores_sc<1,true><<<g1,b,0,st>>>(input,start,w.q,w.rope,w.prob);break;
+-  case 4:small_decode::scores_sc<2,false><<<g2,b,0,st>>>(input,start,w.q,w.rope,w.prob);break;
+-  case 5:small_decode::scores_sc<2,true><<<g2,b,0,st>>>(input,start,w.q,w.rope,w.prob);break;
+-  case 8:small_decode::scores_sc<4,false><<<g4,b,0,st>>>(input,start,w.q,w.rope,w.prob);break;
+-  default:small_decode::scores_sc<4,true><<<g4,b,0,st>>>(input,start,w.q,w.rope,w.prob);break;}
++ const dim3 b(128),g1(TOP/4,a.heads/16,n),g2(TOP/8,a.heads/16,n),g4(TOP/16,a.heads/16,n),g8(TOP/32,a.heads/16,n);
++ const int tr=attn_sc2_tr();
++ switch(attn_sc2()){
++  case 1:if(tr==2)small_decode::scores_sc<1,2><<<g1,b,0,st>>>(input,start,w.q,w.rope,w.prob);
++   else if(tr)small_decode::scores_sc<1,1><<<g1,b,0,st>>>(input,start,w.q,w.rope,w.prob);
++   else small_decode::scores_sc<1,0><<<g1,b,0,st>>>(input,start,w.q,w.rope,w.prob);break;
++  case 2:if(tr==2)small_decode::scores_sc<2,2><<<g2,b,0,st>>>(input,start,w.q,w.rope,w.prob);
++   else if(tr)small_decode::scores_sc<2,1><<<g2,b,0,st>>>(input,start,w.q,w.rope,w.prob);
++   else small_decode::scores_sc<2,0><<<g2,b,0,st>>>(input,start,w.q,w.rope,w.prob);break;
++  case 8:small_decode::scores_sc<8,0><<<g8,b,0,st>>>(input,start,w.q,w.rope,w.prob);break;
++  default:if(tr==2)small_decode::scores_sc<4,2><<<g4,b,0,st>>>(input,start,w.q,w.rope,w.prob);
++   else if(tr)small_decode::scores_sc<4,1><<<g4,b,0,st>>>(input,start,w.q,w.rope,w.prob);
++   else small_decode::scores_sc<4,0><<<g4,b,0,st>>>(input,start,w.q,w.rope,w.prob);break;}
+ }
+ // G6_ATTN_CTX2 (attn.cu attn_ctx2): the context_parts_heads calls (HG 4 up to 4 rows, then 8) under the same head groups
+ template<int HG,class Input>
+@@ -369,6 +484,25 @@ static void launch_ctx2(const G6Attn& a,Input input,Work& w,int start,int n,cuda
+   case 4:small_decode::context_pk<HG,32,256><<<g,128,0,st>>>(input,start,w.prob,w.parts);break;
+   default:small_decode::context_pk<HG,16,TOP/PART_E1><<<dim3(PART_E1*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);break;}
+ }
++// G6_ATTN_CTX3 (attn.cu attn_ctx3): context_pk3 on the context_parts_heads calls; head group G6_ATTN_CTX3_HG, else as there.
++// Only while every KV row index fits in 32 bits (page() bounds a page by the fixed page_count).
++static bool use_ctx3(const G6Attn& a){return attn_ctx3()&&(int64_t)a.page_count*a.page_size<=INT_MAX;}
++template<int HG,class Input>
++static void launch_ctx3_hg(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
++ const int y=(a.heads+HG-1)/HG;
++ switch(attn_ctx3()){
++  case 1:small_decode::context_pk3<HG,16,256><<<dim3(PART*2,y,n),128,0,st>>>(input,start,w.prob,w.parts);break;
++  case 2:small_decode::context_pk3<HG,32,256><<<dim3(PART*2,y,n),128,0,st>>>(input,start,w.prob,w.parts);break;
++  case 3:small_decode::context_pk3<HG,16,512><<<dim3(PART,y,n),256,0,st>>>(input,start,w.prob,w.parts);break;
++  default:small_decode::context_pk3<HG,32,512><<<dim3(PART,y,n),256,0,st>>>(input,start,w.prob,w.parts);break;}
++}
++template<class Input>
++static void launch_ctx3(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
++ switch(attn_ctx3_hg()?attn_ctx3_hg():n>=5?8:4){
++  case 2:launch_ctx3_hg<2>(a,input,w,start,n,st);break;
++  case 8:launch_ctx3_hg<8>(a,input,w,start,n,st);break;
++  default:launch_ctx3_hg<4>(a,input,w,start,n,st);break;}
++}
+ // G6_ATTN_P11 decode tile retune. Host-side, read once (set before graph
+ // capture). G6_ATTN_P11=0 -> the old head-batched path (scores_heads<16>, context_parts_heads HG4/HG8 x D256), unchanged.
+ // Default OFF (G6_ATTN_P11=1 turns it on). Compile switch: -DATTN_P11_OLD=1 forces the old path regardless of the env. Only the attn_heads() branch
+@@ -460,6 +594,7 @@ static void launch_context_parts(const G6Attn& a,Input input,Work& w,int start,i
+  if(attn_heads()&&attn_p11()){launch_context_tile(a,input,w,start,n,st);return;}
+  if(attn_heads()){
+   // head group by rows (dec_heads_test --bench on GB10, contexts 500 and 2048): 4 heads per block up to 4 rows, then 8
++  if(use_ctx3(a)){launch_ctx3(a,input,w,start,n,st);return;}
+   if(attn_ctx2()){if(n>=5)launch_ctx2<8>(a,input,w,start,n,st);else launch_ctx2<4>(a,input,w,start,n,st);return;}
+   if(n>=5){constexpr int HG=8;small_decode::context_parts_heads<HG><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);}
+   else{constexpr int HG=4;small_decode::context_parts_heads<HG><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);}
+@@ -478,7 +613,7 @@ static void launch_context_parts_cpb(const G6Attn& a,Input input,Work& w,int sta
+ }
+ // G6_ATTN_CTX2=9 (E1): launch_context_parts took context_pk over PART_E1 partitions exactly when this holds
+ static bool ctx_e1(const G6Attn& a,int n){   // attn_ctx2() is 0 under G6_KV4
+- return attn_ctx2()==9&&!use_attn_flip(a,n)&&attn_heads()&&!attn_p11();
++ return attn_ctx2()==9&&!use_ctx3(a)&&!use_attn_flip(a,n)&&attn_heads()&&!attn_p11();
+ }
+ template<class Input>
+ static void launch_merge_parts(const G6Attn& a,Input input,const float* parts,float* out,int n,cudaStream_t st){
+diff --git a/engine/attn/idx31.cuh b/engine/attn/idx31.cuh
+index 595c17e..93578af 100644
+--- a/engine/attn/idx31.cuh
++++ b/engine/attn/idx31.cuh
+@@ -53,6 +53,86 @@ template<class Input>
+ static void launch_index_scores_m(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
+     index_scores_m<<<(a.context+31)/32,128,0,st>>>(input,start,n,w.iq,w.weights,w.si);
+ }
++// G6_IDX_GRP=<G> (attn_idx_grp; decode run_body, the per-row indexer calls, i.e. S2 batched steps): index_scores with the
++// key tile read once for a group of rows of ONE session (rows bound to the same G6AttnRow bounds and table; step rows of a
++// session are contiguous), at most G rows: the groups are the session runs cut at rows that are multiples of G, and the CTA
++// of a group's first row runs the group (the others return). Tile load as index_scores<1> (16 B loads when page_size >= 32
++// and the tile is this CP rank's; else index_scores' scalar loop: the same fp16 key values and scales; the same ik_at
++// errors, which depend on the tile's page only), skipped when the tile is past every row of the group. Then warp w runs
++// rows w, w + 4, ... of the group: per row index_scores' four 16x16 wmma tiles (the same fragments, k order and
++// accumulator chain per tile; one warp computes all four), stored to the warp's own products, and index_scores' epilogue
++// (the same head-order ReLU-weighted sum, scale, masks, error 4, score and id stores). A row the tile is past writes
++// index_scores' early-return values. Per row bit-identical to index_scores (and small_decode::index_scores).
++#ifdef DEC_S2
++__device__ __forceinline__ bool same_session(const G6Attn&,int,int){return true;}
++__device__ __forceinline__ bool same_session(const ReplayInput& in,int r1,int r2){
++    const G6AttnRow* rows=in.cell->rows;if(!rows)return true;
++    const G6AttnRow x=rows[r1],y=rows[r2];
++    return x.table==y.table&&x.context==y.context&&x.page_count==y.page_count&&x.table_size==y.table_size&&x.ibase==y.ibase;
++}
++#else
++template<class Input> __device__ __forceinline__ bool same_session(const Input&,int,int){return true;}
++#endif
++template<class Input>
++__global__ void __launch_bounds__(128) index_scores_g(Input input,int start,int n,int G,const half* q,const float* weights,float* scores,int* ids){
++    auto a=resolve(input);if(!a.active)return;
++    using namespace nvcuda;
++    const int t0=blockIdx.x*32,row0=blockIdx.y,r0=start+row0,t=threadIdx.x,warp=t/32,lane=t&31;
++    if(row0%G&&same_session(input,r0-1,r0))return;   // not the first row of its group
++    int g=1;while(row0+g<n&&(row0+g)%G&&same_session(input,r0,r0+g))g++;
++    FOR_ROW(a,input,r0);   // the group's bounds and table
++    __shared__ __align__(32) half key[32*128];
++    __shared__ __align__(32) float products[4][32*32];
++    __shared__ float scales[32];
++    int pmax=-1;for(int k=0;k<g;k++)pmax=max(pmax,a.positions[r0+k]);
++    if(t0<=pmax){
++        if(a.page_size>=32&&CP_MINE(a,t0)){
++            const int live=min(32,a.live_context-t0);float scale=0;const uint8_t* src=live>0?ik_at(a,t0,scale):nullptr;
++            if(t<32)scales[t]=src&&t<live?((const float*)(src-(t0%a.page_size)*128+a.page_size*128))[t0%a.page_size+t]:0.f;
++            #pragma unroll
++            for(int u=0;u<2;u++){const int i=t+u*128,col=i/8;   // 256 x 16 B
++                uint4 v=src&&col<live?((const uint4*)src)[i]:make_uint4(0,0,0,0);const uint16_t* c=(const uint16_t*)&v;
++                __half2* dst=(__half2*)key+i*8;
++                #pragma unroll
++                for(int k=0;k<8;k++)dst[k]=__half2(__nv_cvt_fp8x2_to_halfraw2(c[k],__NV_E4M3));}
++        }else
++        for(int i=t;i<32*128;i+=128){int col=i/128,dim=i%128,pos=t0+col;float scale=0;const uint8_t* src=pos<a.live_context&&CP_MINE(a,pos)?ik_at(a,pos,scale):nullptr;
++            key[i]=__float2half_rn(src?e4(src[dim]):0);if(dim==0)scales[col]=scale;}
++    }
++    __syncthreads();
++    float* prod=products[warp];
++    for(int k=warp;k<g;k+=4){
++        const int row=row0+k,r=start+row;
++        if(t0>a.positions[r]){if(t0+lane<a.context){scores[(int64_t)row*a.context+t0+lane]=-INFINITY;ids[(int64_t)row*a.context+t0+lane]=t0+lane;}continue;}
++        wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> A[2];
++        wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> B[2];
++        wmma::fragment<wmma::accumulator,16,16,16,float> C[2][2];
++        #pragma unroll
++        for(int x=0;x<2;x++)
++            #pragma unroll
++            for(int y=0;y<2;y++)wmma::fill_fragment(C[x][y],0.f);
++        for(int kk=0;kk<128;kk+=16){
++            #pragma unroll
++            for(int x=0;x<2;x++){wmma::load_matrix_sync(A[x],q+((int64_t)row*32+x*16)*128+kk,128);wmma::load_matrix_sync(B[x],key+x*16*128+kk,128);}
++            #pragma unroll
++            for(int x=0;x<2;x++)
++                #pragma unroll
++                for(int y=0;y<2;y++)wmma::mma_sync(C[x][y],A[x],B[y],C[x][y]);}
++        #pragma unroll
++        for(int x=0;x<2;x++)
++            #pragma unroll
++            for(int y=0;y<2;y++)wmma::store_matrix_sync(prod+x*16*32+y*16,C[x][y],32,wmma::mem_row_major);
++        __syncwarp();
++        if(t0+lane<a.context){float score=0;for(int h=0;h<32;h++)score+=fmaxf(prod[h*32+lane],0.f)*weights[row*32+h];score*=scales[lane];
++            int pos=t0+lane;if(pos>a.positions[r]||!CP_MINE(a,pos))score=-INFINITY;else if(!isfinite(score)){error(a,4);score=-INFINITY;}
++            scores[(int64_t)row*a.context+pos]=score;ids[(int64_t)row*a.context+pos]=pos;}
++        __syncwarp();
++    }
++}
++template<class Input>
++static void launch_index_scores_g(const G6Attn& a,Input input,Work& w,int start,int n,int G,cudaStream_t st){
++    index_scores_g<<<dim3((a.context+31)/32,n),128,0,st>>>(input,start,n,G,w.iq,w.weights,w.si,w.ii);
++}
+ #ifdef SEL32
+ template<class Input>
+ __global__ void radix_histogram32_live(Input input,const float* scores,SelectionState* state,int* bins,int pass){
+@@ -132,10 +212,11 @@ static void threshold_compact32_live(const G6Attn& a,Input input,Work& w,int cou
+ }
+ // the DEC_IDX31 select: as select_index, with the live-context chunk bound past 32768
+ template<class Input>
+-static cudaError_t select_index31(const G6Attn& a,Input input,Work& w,int start,int count,cudaStream_t stream){
+-    if(a.context<=32768)return select_index(a,input,w,start,count,stream);
++static cudaError_t select_index31(const G6Attn& a,Input input,Work& w,int start,int count,cudaStream_t stream,int rank=0){
++    if(a.context<=32768)return select_index(a,input,w,start,count,stream,rank);
+     threshold_compact32_live(a,input,w,count,stream);
+-    sort_selected32<<<count,256,0,stream>>>(input,start,w.selected);
++    if(rank)launch_rank_selected<2>(rank,input,start,w.si,w.selected,count,stream);
++    else sort_selected32<<<count,256,0,stream>>>(input,start,w.selected);
+     return cudaGetLastError();
+ }
+ #endif
+diff --git a/engine/attn/select.cuh b/engine/attn/select.cuh
+index 0c0e410..f64f395 100644
+--- a/engine/attn/select.cuh
++++ b/engine/attn/select.cuh
+@@ -93,6 +93,62 @@ __global__ void sort_selected(Input input,int start,const float* scores,const ui
+     #pragma unroll
+     for(int j=0;j<ITEMS;j++)a.indices[(int64_t)(start+row)*TOP+t*ITEMS+j]=keys[j]?int(0xffffu-uint32_t(keys[j]&0xffffu)):-1;
+ }
++// G6_ATTN_SEL2=<CH> (attn_sel2; decode run_body): the selector's final sort (sort_selected<false> / <true>, sort_selected32)
++// as a rank by count over CH CTAs per row. The nonzero keys of a row are distinct (their low bits hold the token id), so a
++// nonzero key's place in the descending sort is the number of larger keys of the row, and the nonzero keys fill places
++// 0 .. nnz - 1; zero keys (nonfinite / past the context / unfilled) sort below them and all map to -1. Every CTA stages the
++// row's TOP keys in shared memory and counts for its KC = TOP/CH own keys, each over NP = 256/KC shares of the row (summed),
++// then writes the own key's id at its rank and -1 at its own places >= nnz: every place written once, the bytes of the sort.
++// MODE 0 (<false>): the key of place j is ordered_score << 16 | (0xffff - j), so key_j > key_i <=> s_j > s_i, or s_j == s_i
++// and j < i: counted in 32 bits as s_j > (j < i ? s_i - 1 : s_i) (s_i >= 1 for a nonzero key; a zero key counts nothing
++// and writes nothing); a warp's own keys are 32 consecutive places, so outside the warp's own block of 32 the threshold is
++// warp-uniform. MODE 1 (<true>, 48-bit keys) / 2 (sort_selected32, 64-bit): the keys compared. grid dim3(CH, count), 256.
++template<int MODE,int CH,class Input>
++__global__ void __launch_bounds__(256) rank_selected(Input input,int start,const float* scores,const uint64_t* selected){
++    auto a=resolve(input);if(!a.active)return;
++    static_assert(CH==8||CH==16||CH==32||CH==64,"CH in {8,16,32,64}");
++    constexpr int KC=TOP/CH,NP=256/KC,SH=TOP/NP;   // own keys per CTA, shares per key, comparands per share
++    const int row=blockIdx.y,c=blockIdx.x,t=threadIdx.x,lane=t&31,warp=t>>5;
++    __shared__ __align__(16) uint32_t s32[MODE==0?TOP:4];
++    __shared__ __align__(16) uint64_t k64[MODE==0?2:TOP];
++    __shared__ int cnt[256],nzw[8];
++    int nz=0;
++    #pragma unroll
++    for(int u=0;u<TOP/256;u++){const int j=u*256+t;
++        if constexpr(MODE==0){const uint32_t s=j<a.context?ordered_score(scores[(int64_t)row*a.context+j]):0u;s32[j]=s;nz+=s!=0;}
++        else{const uint64_t k=selected[(int64_t)row*TOP+j];k64[j]=k;nz+=k!=0;}}
++    nz=__reduce_add_sync(0xffffffffu,nz);if(lane==0)nzw[warp]=nz;
++    __syncthreads();
++    int nnz=0;
++    #pragma unroll
++    for(int w=0;w<8;w++)nnz+=nzw[w];
++    const int k=t%KC,i=c*KC+k,j0=(t/KC)*SH;   // own key i, comparands j0 .. j0 + SH - 1
++    int n0=0,n1=0,n2=0,n3=0;   // four independent counts (one serial add chain each)
++    if constexpr(MODE==0){
++        const uint32_t si=s32[i],ib=i&~31;
++        for(int jb=j0;jb<j0+SH;jb+=32){
++            if(jb==ib){
++                #pragma unroll
++                for(int e=0;e<32;e+=4){const uint4 v=*(const uint4*)&s32[jb+e];
++                    n0+=v.x>(jb+e<i?si-1:si);n1+=v.y>(jb+e+1<i?si-1:si);n2+=v.z>(jb+e+2<i?si-1:si);n3+=v.w>(jb+e+3<i?si-1:si);}}
++            else{const uint32_t th=jb<ib?si-1:si;
++                #pragma unroll
++                for(int e=0;e<32;e+=4){const uint4 v=*(const uint4*)&s32[jb+e];n0+=v.x>th;n1+=v.y>th;n2+=v.z>th;n3+=v.w>th;}}}}
++    else{const uint64_t ki=k64[i];
++        #pragma unroll 4
++        for(int j=j0;j<j0+SH;j+=4){const ulonglong2 v=*(const ulonglong2*)&k64[j],w=*(const ulonglong2*)&k64[j+2];
++            n0+=v.x>ki;n1+=v.y>ki;n2+=w.x>ki;n3+=w.y>ki;}}
++    cnt[t]=n0+n1+n2+n3;
++    __syncthreads();
++    if(t<KC){int rk=0;
++        #pragma unroll
++        for(int p=0;p<NP;p++)rk+=cnt[p*KC+t];
++        int* out=a.indices+(int64_t)(start+row)*TOP;
++        if constexpr(MODE==0){if(s32[i])out[rk]=i;}
++        else if constexpr(MODE==1){const uint64_t ki=k64[i];if(ki)out[rk]=int(0xffffu-uint32_t(ki&0xffffu));}
++        else{const uint64_t ki=k64[i];if(ki)out[rk]=int(0xffffffffu-uint32_t(ki));}
++        if(i>=nnz)out[i]=-1;}
++}
+ #ifdef SEL32
+ // SEL32: the same exact selector past context 32768, so no context size runs
+ // the full CUB sort. 64-bit key = ordered_score (CUB's float order, both zeros equal as CUB treats them) in the high
+diff --git a/engine/attn/tests/attnk.cu b/engine/attn/tests/attnk.cu
+index 0081d23..cdf613c 100644
+--- a/engine/attn/tests/attnk.cu
++++ b/engine/attn/tests/attnk.cu
+@@ -1,27 +1,43 @@
+-// attnk: G6_ATTN_SC2 (scores_sc) and G6_ATTN_CTX2 (context_parts_heads PB / context_pk) against the stock decode attention
+-// chain of one layer, as the engine replays it (g6_attn_replay_run captured in a CUDA graph). Harness = an earlier
+-// attention-chain bench (attnmk) without the MK chain kernel.
++// attnk: exact decode attention kernel arms against the stock decode attention chain of one layer, as the engine replays it
++// (g6_attn_replay_run captured in a CUDA graph). Harness = an earlier attention-chain bench (attnmk) without the MK
++// chain kernel. Flags under test (each a host-side static the bench assigns): G6_ATTN_SC2 / _SC2_TR (scores_sc), G6_ATTN_CTX2
++// (context_parts_heads PB / context_pk), G6_ATTN_CTX3 / _CTX3_HG (context_pk3), G6_ATTN_SEL2 (rank_selected), G6_IDX_GRP
++// (index_scores_g).
+ // Layers: a full-index layer (its own indexer + select) then a shared layer reusing its indices, M rows at live context L in
+ // capture bucket T, S2 batched cell with per-row tables (s2=1, as served). One call's GPU time inside a graph of K calls,
+ // median of TR alternating trials; "cold" = a 96 MB L2 flush before every call, flush subtracted (served case: the experts
+ // stream ~90 MB per rank between two layers' attention); "hot" = no flush.
+-//   REF     the stock chain (every arm flag 0): outputs of both layers, indices, appended KV rows, per layer the raw scores
+-//           (chain prefix through the scores node) and the context parts (prefix through the context node), the shared
+-//           layer's normalized probabilities and merged context. Captured once, before any arm is touched.
+-//   CHAIN   stock per-kernel table: in-chain cost of every node = T(prefix k) - T(prefix k-1), hot / cold / dead, DRAM floor.
+-//   ARM     one (G6_ATTN_SC2, G6_ATTN_SC2_TR, G6_ATTN_CTX2) setting:
+-//           EXACT  bytes differing vs REF over chk poisoned launches (raw scores, parts, probs, context, outputs, indices, kv);
+-//                  ctx2=9 is E1: parts have another layout (not compared), outputs / context report max |diff|, the rest
+-//                  must still be identical.
+-//           NODE   the changed nodes' in-chain cost (prefix deltas) stock -> arm, hot / cold, per layer.
+-//           TIME   whole call stock vs arm alternating, hot / cold, per layer, and the per-step projection over the main
++// ATTNK_SESS=2: the M rows are two sessions (S2 batched step as served at c > 1): rows 0 .. M-M/2-1 at live context L on
++// the identity page table, rows M-M/2 .. M-1 at live context L/2 on the reversed table (other physical pages, unequal
++// lengths, a group boundary inside the step); each session on its own physical pages (pool of 2x the bucket's pages).
++// Fixtures for the edge paths (exactness; timing as any cell): ATTNK_TIES=1 makes the indexer scores repeat every 7
++// positions (exact ties: the selector's id tie-break), ATTNK_QSCALE=<s> scales the query (s = 400: most probabilities
++// underflow to exactly 0, so the p == 0 skips and context_pk3's mixed batches run).
++//   REF     the stock chain (every flag 0): outputs of both layers, indices, the indexer's scores and ids, the appended KV
++//           rows and index pages, per layer the raw scores (chain prefix through the scores node) and the context parts
++//           (prefix through the context node), the shared layer's normalized probabilities and merged context. Captured
++//           once, before any arm is touched.
++//   BASE    the round-1 kernels (default SC2=4,TR=1,CTX2=4, the round-1 best combo; ATTNK_BASE overrides, "stock" = all 0):
++//           every arm's timing is against BASE, so a gain is on top of round 1. BASE itself is the first arm (against stock).
++//   CHAIN   per-kernel table of BASE (what bit 1) and of stock (bit 4): in-chain cost of every node = T(prefix k) -
++//           T(prefix k-1), hot / cold / dead, DRAM floor.
++//   ARM     one flag setting (BASE + changes):
++//           EXACT  bytes differing vs REF over chk poisoned launches (raw scores, parts, probs, context, outputs, indices,
++//                  index scores / ids, kv); ctx2=9 is E1: parts have another layout (not compared), outputs / context report
++//                  max |diff|, the rest must still be identical.
++//           NODE   per layer, every node whose kernel or grid differs from BASE: its in-chain cost (prefix delta) BASE -> arm,
++//                  hot / cold.
++//           TIME   whole call BASE vs arm alternating, hot / cold, per layer, and the per-step projection over the main
+ //                  verify pass: 21 full-index + 57 shared layers (cold), ms/step.
+-//   Decision (written before running): adopt an arm if it is IDENTICAL (E1: separate KL gate) and saves >= 0.5 ms/step cold at
+-//   T=2048 L=1000 M=3, or >= 2 ms/step at M=12. Kill otherwise, or on any byte difference.
++//   Decision (written before running): adopt an arm if it is IDENTICAL and saves >= 0.3 ms/step cold over BASE at T=2048
++//   L=1000 M=3, or >= 1 ms/step at M=12, or >= 1 ms/step at T=32768 (index / select arms: the long-context levers). Kill
++//   otherwise, or on any byte difference.
+ // build (from engine/attn/tests), with the engine's flags (scripts/build.sh K1H2_FLAGS, -DG6_NR=4 -DDEC_S2 -DPF_F12):
+ //   nvcc -O3 -std=c++17 -gencode=arch=compute_121a,code=sm_121a $FLAGS -o attnk attnk.cu ../bind.cu -lcublas
+ // run: attnk T L M [what=3] [s2=1] [reps=10] [K=16] [TR=7] [chk=5] [bw=250]
+-//   what: 1 stock CHAIN table, 2 the arms. Arms: env ATTNK_ARMS="S.TR.CTX ..." (default below).
++//   what: 1 CHAIN of BASE, 2 the arms, 4 CHAIN of stock. Arms: env ATTNK_ARMS="arm arm ..." with an arm = comma-separated
++//   KEY=VALUE changes over BASE (keys SC2 TR CTX2 CTX3 HG SEL2 IDX; "base" = BASE alone, compared against stock), default
++//   below. ATTNK_BASE="SC2=4,TR=1,CTX2=4" (the same syntax over stock).
+ //   sweep: for M in 1 3 8 12; do ./attnk 2048 1000 $M; ./attnk 8192 8000 $M; ./attnk 32768 32000 $M; done
+ // Exit 3 on any byte difference of an exact arm, 1 on a CUDA / validation error.
+ #include "../attn.cu"
+@@ -53,10 +69,12 @@ __global__ void fill_kv(uint8_t* c,size_t rows,uint64_t seed){   // latent rows
+ #endif
+         if(t<64)((__nv_bfloat16*)(v+g6kv::ROPE_OFF))[t]=__float2bfloat16(0.5f*unif(seed+9,r*64+t));}
+ }
+-__global__ void fill_idx(uint8_t* c,size_t pages,int ps,uint64_t seed){
++// ties: the key and scale of row r depend on r % 7 only, so the indexer scores of a row repeat every 7 positions (exact ties,
++// broken by id in the selector)
++__global__ void fill_idx(uint8_t* c,size_t pages,int ps,uint64_t seed,int ties){
+     for(size_t p=blockIdx.x;p<pages;p+=gridDim.x){uint8_t* b=c+p*ps*g6kv::IDX_ROW;
+-        for(int i=threadIdx.x;i<ps*128;i+=blockDim.x)b[i]=fin8(hsh(seed+p*100000+i));
+-        for(int i=threadIdx.x;i<ps;i+=blockDim.x)((float*)(b+ps*128))[i]=ldexpf(1.f,-6-(int)(hsh(seed+3+p*64+i)%3));}
++        for(int i=threadIdx.x;i<ps*128;i+=blockDim.x)b[i]=fin8(ties?hsh(seed+((p*ps+i/128)%7)*1000+i%128):hsh(seed+p*100000+i));
++        for(int i=threadIdx.x;i<ps;i+=blockDim.x)((float*)(b+ps*128))[i]=ldexpf(1.f,-6-(int)(hsh(seed+3+(ties?(p*ps+i)%7:p*64+i))%3));}
+ }
+ __global__ void l2_flush(const float4* p,size_t n,float* sink){
+     float acc=0;for(size_t i=blockIdx.x*(size_t)blockDim.x+threadIdx.x;i<n;i+=(size_t)gridDim.x*blockDim.x){float4 v=p[i];acc+=v.x+v.y+v.z+v.w;}
+@@ -66,6 +84,7 @@ __global__ void l2_flush(const float4* p,size_t n,float* sink){
+ template<class T> static T* dalloc(size_t n){T* p;CK(cudaMalloc(&p,n*sizeof(T)));CK(cudaMemset(p,0,n*sizeof(T)));return p;}
+ template<class T> static std::vector<T> host(const T* d,size_t n){std::vector<T> h(n);CK(cudaMemcpy(h.data(),d,n*sizeof(T),cudaMemcpyDeviceToHost));return h;}
+ static size_t ndiff(const void* x,const void* y,size_t bytes){size_t k=0;for(size_t i=0;i<bytes;i++)k+=((const uint8_t*)x)[i]!=((const uint8_t*)y)[i];return k;}
++template<class T> static size_t vdiff(const std::vector<T>& x,const std::vector<T>& y){return x.size()!=y.size()?~size_t(0):ndiff(x.data(),y.data(),x.size()*sizeof(T));}
+ static float med(std::vector<float> v){std::sort(v.begin(),v.end());return v[v.size()/2];}
+ 
+ // ---- graphs
+@@ -113,12 +132,15 @@ static void relaunch(const Node& n,cudaStream_t st){
+     cudaLaunchConfig_t c{};c.gridDim=n.p.gridDim;c.blockDim=n.p.blockDim;c.dynamicSmemBytes=n.p.sharedMemBytes;c.stream=st;
+     CK(cudaLaunchKernelExC(&c,n.p.func,n.p.kernelParams));
+ }
+-// the attention scores node (not the indexer's) / the context node / the merge node of a chain; -1 if absent
++static bool same_node(const Node& x,const Node& y){
++    return x.p.func==y.p.func&&x.p.gridDim.x==y.p.gridDim.x&&x.p.gridDim.y==y.p.gridDim.y&&x.p.gridDim.z==y.p.gridDim.z&&x.p.blockDim.x==y.p.blockDim.x;}
++// arms that differ only in a kernel argument (index_scores_g's group size G6_IDX_GRP): the node counts as changed
++static bool arg_differs(const Node& x,int idx_a,int idx_b){return idx_a!=idx_b&&x.name.find("index_scores_g")!=std::string::npos;}
++// the attention scores node (not the indexer's) / the context node of a chain; -1 if absent
+ static int node_of(const std::vector<Node>& c,const char* what){
+     for(int i=0;i<(int)c.size();i++){const std::string& s=c[i].name;
+         if(!strcmp(what,"scores")&&s.find("scores")!=std::string::npos&&s.find("index_scores")==std::string::npos)return i;
+-        if(!strcmp(what,"context")&&s.find("context")!=std::string::npos)return i;
+-        if(!strcmp(what,"merge")&&s.find("merge_parts")!=std::string::npos)return i;}
++        if(!strcmp(what,"context")&&s.find("context")!=std::string::npos)return i;}
+     return -1;
+ }
+ // DRAM floor of a node: the compulsory bytes it is the first to read
+@@ -130,8 +152,20 @@ static double floor_bytes(const std::string& s,int H,int L){
+     if(s.find("scores")!=std::string::npos)return kv;
+     return 0;
+ }
+-struct Arm{int sc,tr,ctx;};
+-static void set_arm(const Arm& x){ga::attn_sc2()=x.sc;ga::attn_sc2_tr()=x.tr;ga::attn_ctx2()=x.ctx;}
++struct Arm{int sc,tr,ctx2,ctx3,hg,sel,idx;bool vs_stock;};
++static void set_arm(const Arm& x){ga::attn_sc2()=x.sc;ga::attn_sc2_tr()=x.tr;ga::attn_ctx2()=x.ctx2;ga::attn_ctx3()=x.ctx3;ga::attn_ctx3_hg()=x.hg;
++    ga::attn_sel2()=x.sel;ga::attn_idx_grp()=x.idx;}
++static const Arm STOCK{0,0,0,0,0,0,0,false};
++static std::string tag_of(const Arm& x){char b[96];snprintf(b,sizeof b,"SC2=%d TR=%d CTX2=%d CTX3=%d HG=%d SEL2=%d IDX=%d",x.sc,x.tr,x.ctx2,x.ctx3,x.hg,x.sel,x.idx);return b;}
++// "KEY=V,KEY=V" over `on`; false on an unknown key
++static bool parse_arm(const std::string& s,Arm& x){
++    if(s=="base"||s=="stock")return true;
++    size_t i=0;while(i<s.size()){size_t e=s.find(',',i);if(e==std::string::npos)e=s.size();const std::string kv=s.substr(i,e-i);i=e+1;
++        const size_t q=kv.find('=');if(q==std::string::npos)return false;const std::string k=kv.substr(0,q);const int v=atoi(kv.c_str()+q+1);
++        if(k=="SC2")x.sc=v;else if(k=="TR")x.tr=v;else if(k=="CTX2")x.ctx2=v;else if(k=="CTX3")x.ctx3=v;else if(k=="HG")x.hg=v;
++        else if(k=="SEL2")x.sel=v;else if(k=="IDX")x.idx=v;else return false;}
++    return true;
++}
+ 
+ int main(int argc,char** argv){
+     if(argc<4){fprintf(stderr,"usage: attnk T L M [what=3] [s2=1] [reps=10] [K=16] [TR=7] [chk=5] [bw=250]\n");return 2;}
+@@ -139,6 +173,7 @@ int main(int argc,char** argv){
+         REPS=argc>6?atoi(argv[6]):10,K=argc>7?atoi(argv[7]):16,TR=argc>8?atoi(argv[8]):7,CHK=argc>9?atoi(argv[9]):5;
+     const double BW=argc>10?atof(argv[10]):250.;
+     if(L>T||M<1||M>G6_MX||M>L){fprintf(stderr,"bad sizes (M <= %d, M <= L <= T)\n",G6_MX);return 2;}
++    if(CHK<1||TR<1||K<1||REPS<1){fprintf(stderr,"chk, TR, K, reps >= 1\n");return 2;}
+ #ifdef DEC_S2
+ #else
+     if(S2){fprintf(stderr,"s2 needs -DDEC_S2\n");return 2;}
+@@ -146,35 +181,52 @@ int main(int argc,char** argv){
+ #if G6_KV4
+     fprintf(stderr,"attnk: FP8 KV build only (the flags are inert under G6_KV4)\n");return 2;
+ #endif
+-    std::vector<Arm> arms={{1,0,0},{1,1,0},{2,0,0},{2,1,0},{4,0,0},{4,1,0},{0,0,1},{0,0,2},{0,0,3},{0,0,4},{0,0,9},{2,1,3},{4,1,4}};
+-    if(const char* e=getenv("ATTNK_ARMS")){arms.clear();const char* p=e;
+-        while(*p){while(*p==' '||*p==',')p++;if(!*p)break;Arm x{};if(sscanf(p,"%d.%d.%d",&x.sc,&x.tr,&x.ctx)!=3){fprintf(stderr,"ATTNK_ARMS: S.TR.CTX\n");return 2;}
+-            arms.push_back(x);while(*p&&*p!=' '&&*p!=',')p++;}}
+-    const int H=g6nr::HMAX,pages=(T+63)/64;
++    const int NSESS=getenv("ATTNK_SESS")&&atoi(getenv("ATTNK_SESS"))==2&&S2&&M>=2?2:1;
++    const int TIES=getenv("ATTNK_TIES")&&atoi(getenv("ATTNK_TIES"))?1:0;
++    const float QS=getenv("ATTNK_QSCALE")?(float)atof(getenv("ATTNK_QSCALE")):1.f;
++    // BASE and the arms
++    Arm base{4,1,4,0,0,0,0,false};
++    if(const char* e=getenv("ATTNK_BASE")){base=STOCK;if(!parse_arm(e,base)){fprintf(stderr,"ATTNK_BASE: KEY=V,...\n");return 2;}}
++    std::vector<std::string> specs={"base","TR=2","SC2=8,TR=0","SC2=2,TR=2","CTX3=1","CTX3=2","CTX3=3","CTX3=4","CTX3=1,HG=2","CTX3=2,HG=2",
++        "CTX3=3,HG=2","CTX3=1,HG=8","SEL2=8","SEL2=16","SEL2=32","SEL2=64","IDX=4","IDX=16","TR=2,CTX3=2,SEL2=16,IDX=16"};
++    if(const char* e=getenv("ATTNK_ARMS")){specs.clear();std::string s=e;size_t i=0;
++        while(i<s.size()){while(i<s.size()&&s[i]==' ')i++;size_t e2=s.find(' ',i);if(e2==std::string::npos)e2=s.size();if(e2>i)specs.push_back(s.substr(i,e2-i));i=e2;}}
++    std::vector<Arm> arms;
++    for(auto& sp:specs){Arm x=base;x.vs_stock=sp=="base";if(!parse_arm(sp,x)){fprintf(stderr,"ATTNK_ARMS: bad arm %s\n",sp.c_str());return 2;}arms.push_back(x);}
++    const int H=g6nr::HMAX,pages=(T+63)/64,pool=NSESS*pages;   // session s: physical pages [s*pages, (s+1)*pages)
+     cudaStream_t st;CK(cudaStreamCreate(&st));
+     {int dev=0,sms=0,clk=0,l2=0;CK(cudaGetDevice(&dev));cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,dev);
+      cudaDeviceGetAttribute(&clk,cudaDevAttrClockRate,dev);cudaDeviceGetAttribute(&l2,cudaDevAttrL2CacheSize,dev);
+-     printf("GPU %d SMs, attr clock %d MHz, L2 %.1f MB | T=%d L=%d M=%d H=%d s2=%d K=%d reps=%d TR=%d chk=%d bw=%.0f GB/s\n",sms,clk/1000,l2/1048576.,T,L,M,H,S2,K,REPS,TR,CHK,BW);}
++     printf("GPU %d SMs, attr clock %d MHz, L2 %.1f MB | T=%d L=%d M=%d H=%d s2=%d sessions=%d ties=%d qscale=%g K=%d reps=%d TR=%d chk=%d bw=%.0f GB/s | BASE %s\n",
++        sms,clk/1000,l2/1048576.,T,L,M,H,S2,NSESS,TIES,QS,K,REPS,TR,CHK,BW,tag_of(base).c_str());}
+     CKI(g6_attn_rope_init(T,st));   // as a served boot: the decode RoPE table (absorb / append skip the FP64 sincos)
+     // weights, per-layer caches (layer 0 full index, layer 1 shared), step inputs
+     __nv_bfloat16 *uk=dalloc<__nv_bfloat16>((size_t)H*512*192),*uv=dalloc<__nv_bfloat16>((size_t)H*256*512),
+         *kvn=dalloc<__nv_bfloat16>(512),*inw=dalloc<__nv_bfloat16>(128),*inb=dalloc<__nv_bfloat16>(128);
+     fill_bf16<<<512,256,0,st>>>(uk,(size_t)H*512*192,1,0.05f,0);fill_bf16<<<512,256,0,st>>>(uv,(size_t)H*256*512,2,0.05f,0);
+     fill_bf16<<<2,256,0,st>>>(kvn,512,3,0.2f,1);fill_bf16<<<1,128,0,st>>>(inw,128,4,0.2f,1);fill_bf16<<<1,128,0,st>>>(inb,128,5,0.1f,0);
+-    uint8_t *mla[2],*ixc=dalloc<uint8_t>((size_t)pages*64*g6kv::IDX_ROW);
+-    for(int l=0;l<2;l++){mla[l]=dalloc<uint8_t>((size_t)pages*64*g6kv::ROW);fill_kv<<<1024,256,0,st>>>(mla[l],(size_t)pages*64,100+l);}
+-    fill_idx<<<512,256,0,st>>>(ixc,pages,64,200);
++    uint8_t *mla[2],*ixc=dalloc<uint8_t>((size_t)pool*64*g6kv::IDX_ROW);
++    for(int l=0;l<2;l++){mla[l]=dalloc<uint8_t>((size_t)pool*64*g6kv::ROW);fill_kv<<<1024,256,0,st>>>(mla[l],(size_t)pool*64,100+l);}
++    fill_idx<<<512,256,0,st>>>(ixc,pool,64,200,TIES);
+     __half *qb=dalloc<__half>((size_t)M*H*256),*kva=dalloc<__half>((size_t)M*576),*iq=dalloc<__half>((size_t)M*32*128),
+         *ik=dalloc<__half>((size_t)M*128),*iw=dalloc<__half>((size_t)M*32);
+-    fill_half<<<64,256,0,st>>>(qb,(size_t)M*H*256,6,1.f);fill_half<<<8,256,0,st>>>(kva,(size_t)M*576,7,1.f);
++    fill_half<<<64,256,0,st>>>(qb,(size_t)M*H*256,6,QS);fill_half<<<8,256,0,st>>>(kva,(size_t)M*576,7,1.f);
+     fill_half<<<64,256,0,st>>>(iq,(size_t)M*32*128,8,1.f);fill_half<<<1,256,0,st>>>(ik,(size_t)M*128,9,1.f);fill_half<<<1,256,0,st>>>(iw,(size_t)M*32,10,0.1f);
+-    std::vector<int> pos(M),table(pages);for(int i=0;i<M;i++)pos[i]=L-M+i;for(int i=0;i<pages;i++)table[i]=i;
+-    int *dpos=dalloc<int>(M),*dtab=dalloc<int>(pages),*ind[2]={dalloc<int>((size_t)M*ga::TOP),dalloc<int>((size_t)M*ga::TOP)};
++    // sessions: rows [0, M0) at L on the identity table (pages [0, pages)); rows [M0, M) at L1 = L/2 on the reversed table
++    // of pages [pages, 2 pages)
++    const int M1=NSESS==2?M/2:0,M0=M-M1,L1=std::max(L/2,M1);
++    std::vector<int> pos(M),table(pages),tableB(pages),rsess(M);
++    for(int i=0;i<pages;i++){table[i]=i;tableB[i]=pool-1-i;}
++    for(int i=0;i<M;i++){rsess[i]=i<M0?0:1;pos[i]=i<M0?L-M0+i:L1-M1+(i-M0);}
++    int *dpos=dalloc<int>(M),*dtab=dalloc<int>(pages),*dtabB=dalloc<int>(pages),*ind[2]={dalloc<int>((size_t)M*ga::TOP),dalloc<int>((size_t)M*ga::TOP)};
+     CK(cudaMemcpy(dpos,pos.data(),M*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(dtab,table.data(),pages*4,cudaMemcpyHostToDevice));
++    CK(cudaMemcpy(dtabB,tableB.data(),pages*4,cudaMemcpyHostToDevice));
++    // physical row of each step row's appended KV / index key
++    std::vector<size_t> prow(M);for(int i=0;i<M;i++)prow[i]=(size_t)(rsess[i]?tableB:table)[pos[i]/64]*64+pos[i]%64;
+     __half* out[2]={dalloc<__half>((size_t)M*H*256),dalloc<__half>((size_t)M*H*256)};
+     unsigned* err[2]={dalloc<unsigned>(1),dalloc<unsigned>(1)};
+     G6Attn a[2]{};
+-    for(int l=0;l<2;l++){G6Attn& x=a[l];x.rows=M;x.heads=H;x.context=T;x.page_size=64;x.page_count=x.table_size=pages;x.query_tile=std::max(M,32);
++    for(int l=0;l<2;l++){G6Attn& x=a[l];x.rows=M;x.heads=H;x.context=T;x.page_size=64;x.page_count=pool;x.table_size=pages;x.query_tile=std::max(M,32);
+         x.q_b=qb;x.kv_a=kva;x.kv_norm=kvn;x.uk=uk;x.uv=uv;x.positions=dpos;x.block_table=dtab;x.mla_cache=mla[l];
+         x.indices=ind[l];x.output=out[l];x.error=err[l];
+ #ifdef DEC_S2
+@@ -187,10 +239,11 @@ int main(int argc,char** argv){
+     G6AttnStepCell *dcell[2],*dead[2];
+ #ifdef DEC_S2
+     G6AttnRow* drows=nullptr;
+-    if(S2){std::vector<G6AttnRow> rr(M);for(auto& x:rr){x.table=dtab;x.context=L;x.page_count=pages;x.table_size=pages;x.ibase=0;x.sess=0;}
++    if(S2){std::vector<G6AttnRow> rr(M);
++        for(int i=0;i<M;i++){G6AttnRow& x=rr[i];x.table=rsess[i]?dtabB:dtab;x.context=rsess[i]?L1:L;x.page_count=pool;x.table_size=pages;x.ibase=0;x.sess=rsess[i];}
+         drows=dalloc<G6AttnRow>(M);CK(cudaMemcpy(drows,rr.data(),M*sizeof(G6AttnRow),cudaMemcpyHostToDevice));}
+ #endif
+-    for(int l=0;l<2;l++){G6AttnStepCell c{};c.context=L;c.page_count=pages;c.table_size=pages;c.reuse_rows=l?M:0;
++    for(int l=0;l<2;l++){G6AttnStepCell c{};c.context=L;c.page_count=pool;c.table_size=pages;c.reuse_rows=l?M:0;
+ #ifdef DEC_S2
+         c.rows=drows;
+ #endif
+@@ -204,22 +257,27 @@ int main(int argc,char** argv){
+     auto flushk=[&]{l2_flush<<<48*6,256,0,st>>>(fb,fl/16,sink);};
+     CK(cudaStreamSynchronize(st));
+     const char* kind[2]={"full-index","shared"};
+-    set_arm({0,0,0});
++    set_arm(STOCK);
+ 
+-    // ---- reference (stock): outputs, the shared layer's scratch, per layer raw scores and parts (chain prefixes)
+-    const size_t no=(size_t)M*H*256,ni=(size_t)M*ga::TOP,nc=(size_t)M*H*512,np=(size_t)M*H*ga::TOP,npa=(size_t)M*H*ga::PART*512;
+-    struct Snap{std::vector<__half> o0,o1;std::vector<int> i0;std::vector<float> cx,pr,pa,sc[2],pl[2];std::vector<uint8_t> kv0,kv1;unsigned e0,e1,v0,v1;};
++    // ---- reference (stock): outputs, the shared layer's scratch, the indexer's scratch, per layer raw scores and parts
++    const size_t no=(size_t)M*H*256,ni=(size_t)M*ga::TOP,nc=(size_t)M*H*512,np=(size_t)M*H*ga::TOP,npa=(size_t)M*H*ga::PART*512,nsi=(size_t)M*T;
++    const size_t ipb=(size_t)64*g6kv::IDX_ROW;   // one index-cache page
++    struct Snap{std::vector<__half> o0,o1;std::vector<int> i0,ii;std::vector<float> cx,pr,pa,si,sc[2],pl[2];std::vector<uint8_t> kv,ix;unsigned e0,e1,v0,v1;};
+     auto call=[&](int l){CKI(g6_attn_replay_run(&rp[l],st));};
+     auto both=[&]{call(0);call(1);};
+-    auto poison_w=[&](const ga::Work& W){CK(cudaMemsetAsync(W.context,0xab,nc*4,st));CK(cudaMemsetAsync(W.prob,0xab,np*4,st));CK(cudaMemsetAsync(W.parts,0xab,npa*4,st));};
++    auto poison_w=[&](const ga::Work& W){CK(cudaMemsetAsync(W.context,0xab,nc*4,st));CK(cudaMemsetAsync(W.prob,0xab,np*4,st));CK(cudaMemsetAsync(W.parts,0xab,npa*4,st));
++        CK(cudaMemsetAsync(W.si,0xab,nsi*4,st));CK(cudaMemsetAsync(W.ii,0xab,nsi*4,st));};
+     auto poison=[&](const ga::Work& W){for(int l=0;l<2;l++){CK(cudaMemsetAsync(out[l],0xff,no*2,st));CK(cudaMemsetAsync(ind[l],0x5a,ni*4,st));}poison_w(W);};
+     // the full call into s (both layers), then per layer the chain prefixes through the scores and the context node
+     auto take=[&](Snap& s,bool e1){
+-        const ga::Work W=ga::workspace(a[1],scr);
++        const ga::Work W=ga::workspace(a[1],scr);   // the layers share the scratch (the same layout: rows, heads, context)
+         {cudaGraphExec_t g=inst(st,both);poison(W);CK(cudaGraphLaunch(g,st));CK(cudaStreamSynchronize(st));cudaGraphExecDestroy(g);}
+         s.o0=host(out[0],no);s.o1=host(out[1],no);s.i0=host(ind[0],ni);s.cx=host(W.context,nc);s.pr=host(W.prob,np);
++        s.si=host(W.si,nsi);s.ii=host(W.ii,nsi);   // written by the full layer's indexer only (the shared layer reuses)
+         s.pa=e1?std::vector<float>():host(W.parts,npa);
+-        const size_t r0=(size_t)(L-M);s.kv0=host(mla[0]+r0*g6kv::ROW,(size_t)M*g6kv::ROW);s.kv1=host(mla[1]+r0*g6kv::ROW,(size_t)M*g6kv::ROW);
++        s.kv.clear();s.ix.clear();
++        for(int i=0;i<M;i++){for(int l=0;l<2;l++){auto v=host(mla[l]+prow[i]*g6kv::ROW,(size_t)g6kv::ROW);s.kv.insert(s.kv.end(),v.begin(),v.end());}
++            auto v=host(ixc+(prow[i]/64)*ipb,ipb);s.ix.insert(s.ix.end(),v.begin(),v.end());}
+         s.e0=host(err[0],1)[0];s.e1=host(err[1],1)[0];s.v0=host(dcell[0],1)[0].valid;s.v1=host(dcell[1],1)[0].valid;
+         for(int l=0;l<2;l++){cudaGraph_t g=capture(st,[&]{call(l);});auto c=chain_of(g);const int ks=node_of(c,"scores"),kc=node_of(c,"context");
+             if(ks<0||kc<0){fprintf(stderr,"no scores / context node\n");exit(1);}
+@@ -240,92 +298,95 @@ int main(int argc,char** argv){
+     auto measure=[&](std::vector<Timed>& g){for(int t=0;t<TR;t++)for(auto& x:g)x.v.push_back(run_us(x.x,st,REPS)/K-(x.cold?tflush:0));
+         for(auto& x:g)cudaGraphExecDestroy(x.x);};
+     auto value=[](const Timed& x){return med(x.v);};
++    auto once=[&](auto body,bool cold){Timed tg=timed_graph(body,cold);const float u=run_us(tg.x,st,REPS)/K-(cold?tflush:0);cudaGraphExecDestroy(tg.x);return u;};
+     printf("flush %.1f us per call (subtracted from cold)\n",tflush);
+ 
+-    // ---- CHAIN (stock): per-kernel prefix costs, live and dead, totals
+-    if(WHAT&1)for(int l=0;l<2;l++){
+-        cudaGraph_t gl=capture(st,[&]{call(l);}),gd=capture(st,[&]{CKI(g6_attn_replay_run(&rd[l],st));});
+-        std::vector<Node> nl=chain_of(gl),nd=chain_of(gd);
+-        if(nl.size()!=nd.size()){fprintf(stderr,"live / dead chains differ in length\n");exit(1);}
+-        const int n=(int)nl.size();std::vector<Timed> g;
+-        for(int k=1;k<=n;k++){g.push_back(timed_graph([&]{for(int j=0;j<k;j++)relaunch(nl[j],st);},false));
+-            g.push_back(timed_graph([&]{for(int j=0;j<k;j++)relaunch(nl[j],st);},true));
+-            g.push_back(timed_graph([&]{for(int j=0;j<k;j++)relaunch(nd[j],st);},false));}
+-        g.push_back(timed_graph([&]{call(l);},false));g.push_back(timed_graph([&]{call(l);},true));
+-        measure(g);
+-        printf("CHAIN stock %s layer T=%d L=%d M=%d: %d kernel nodes\n",kind[l],T,L,M,n);
+-        printf("  %-3s %-34s %13s %9s %9s %9s %8s\n","#","kernel","grid x block","hot","cold","dead","floor");
+-        float ph=0,pc=0,pd=0;double fsum=0;
+-        for(int k=0;k<n;k++){const float h=value(g[3*k]),c=value(g[3*k+1]),d=value(g[3*k+2]);
+-            const double fbb=floor_bytes(nl[k].name,H,L);fsum+=fbb;
+-            char gb[48];snprintf(gb,sizeof gb,"%ux%ux%u x %u",nl[k].p.gridDim.x,nl[k].p.gridDim.y,nl[k].p.gridDim.z,nl[k].p.blockDim.x);
+-            printf("  %-3d %-34.34s %13s %9.2f %9.2f %9.2f %8.2f\n",k,nl[k].name.c_str(),gb,h-ph,c-pc,d-pd,fbb/BW/1e3);
+-            ph=h;pc=c;pd=d;}
+-        printf("  total hot %.1f cold %.1f us | dead %.1f us | DRAM floor %.1f us\n",value(g[3*n]),value(g[3*n+1]),pd,fsum/BW/1e3);
+-        cudaGraphDestroy(gl);cudaGraphDestroy(gd);
++    // ---- CHAIN: per-kernel prefix costs, live and dead, totals (BASE: what bit 1, stock: bit 4)
++    for(int which=0;which<2;which++){
++        if(!(WHAT&(which?4:1)))continue;
++        const Arm cfg=which?STOCK:base;set_arm(cfg);
++        for(int l=0;l<2;l++){
++            cudaGraph_t gl=capture(st,[&]{call(l);}),gd=capture(st,[&]{CKI(g6_attn_replay_run(&rd[l],st));});
++            std::vector<Node> nl=chain_of(gl),nd=chain_of(gd);
++            if(nl.size()!=nd.size()){fprintf(stderr,"live / dead chains differ in length\n");exit(1);}
++            const int n=(int)nl.size();std::vector<Timed> g;
++            for(int k=1;k<=n;k++){g.push_back(timed_graph([&]{for(int j=0;j<k;j++)relaunch(nl[j],st);},false));
++                g.push_back(timed_graph([&]{for(int j=0;j<k;j++)relaunch(nl[j],st);},true));
++                g.push_back(timed_graph([&]{for(int j=0;j<k;j++)relaunch(nd[j],st);},false));}
++            g.push_back(timed_graph([&]{call(l);},false));g.push_back(timed_graph([&]{call(l);},true));
++            measure(g);
++            printf("CHAIN %s (%s) %s layer T=%d L=%d M=%d: %d kernel nodes\n",which?"stock":"BASE",tag_of(cfg).c_str(),kind[l],T,L,M,n);
++            printf("  %-3s %-34s %13s %9s %9s %9s %8s\n","#","kernel","grid x block","hot","cold","dead","floor");
++            float ph=0,pc=0,pd=0;double fsum=0;
++            for(int k=0;k<n;k++){const float h=value(g[3*k]),c=value(g[3*k+1]),d=value(g[3*k+2]);
++                const double fbb=floor_bytes(nl[k].name,H,L);fsum+=fbb;
++                char gb[48];snprintf(gb,sizeof gb,"%ux%ux%u x %u",nl[k].p.gridDim.x,nl[k].p.gridDim.y,nl[k].p.gridDim.z,nl[k].p.blockDim.x);
++                printf("  %-3d %-34.34s %13s %9.2f %9.2f %9.2f %8.2f\n",k,nl[k].name.c_str(),gb,h-ph,c-pc,d-pd,fbb/BW/1e3);
++                ph=h;pc=c;pd=d;}
++            printf("  total hot %.1f cold %.1f us | dead %.1f us | DRAM floor %.1f us\n",value(g[3*n]),value(g[3*n+1]),pd,fsum/BW/1e3);
++            cudaGraphDestroy(gl);cudaGraphDestroy(gd);}
+     }
++    set_arm(STOCK);
+ 
+     // ---- arms
+     int bad=0;
+     if(WHAT&2)for(const Arm& x:arms){
+-        char tag[48];snprintf(tag,sizeof tag,"SC2=%d TR=%d CTX2=%d",x.sc,x.tr,x.ctx);
+-        const bool e1=x.ctx==9;
++        const Arm ref_arm=x.vs_stock?STOCK:base;   // timing reference
++        const std::string tag=tag_of(x),rtag=x.vs_stock?"stock":"BASE";
++        const bool e1=x.ctx2==9&&!x.ctx3;
++        // the arm must reach this call's dispatch: some node of some layer differs from its timing reference
++        {bool differs=false;
++         for(int l=0;l<2&&!differs;l++){set_arm(ref_arm);cudaGraph_t g0=capture(st,[&]{call(l);});auto c0=chain_of(g0);
++            set_arm(x);cudaGraph_t g1=capture(st,[&]{call(l);});auto c1=chain_of(g1);
++            differs=c0.size()!=c1.size();for(size_t i=0;!differs&&i<c0.size();i++)differs=!same_node(c0[i],c1[i])||arg_differs(c1[i],ref_arm.idx,x.idx);
++            cudaGraphDestroy(g0);cudaGraphDestroy(g1);}
++         if(!differs){printf("ARM %s not taken by this call's dispatch (same chain as %s)\n",tag.c_str(),rtag.c_str());continue;}}
+         set_arm(x);
+-        // the arm must reach this call's dispatch: some node differs from stock
+-        {set_arm({0,0,0});cudaGraph_t g0=capture(st,[&]{call(1);});auto c0=chain_of(g0);set_arm(x);cudaGraph_t g1=capture(st,[&]{call(1);});auto c1=chain_of(g1);
+-         bool differs=c0.size()!=c1.size();for(size_t i=0;!differs&&i<c0.size();i++)differs=c0[i].p.func!=c1[i].p.func||c0[i].p.gridDim.x!=c1[i].p.gridDim.x;
+-         cudaGraphDestroy(g0);cudaGraphDestroy(g1);
+-         if(!differs){printf("ARM %s not taken by this call's dispatch\n",tag);continue;}}
+-        // EXACT
+-        size_t w[12]={0};bool ok=true;double dout=0,dcx=0,mout=0,mcx=0;
++        // EXACT (against stock)
++        size_t w[14]={0};bool ok=true;double dout=0,dcx=0,mout=0,mcx=0;
+         for(int it=0;it<CHK;it++){Snap s;take(s,e1);
+-            size_t d[12]={ndiff(ref.o0.data(),s.o0.data(),no*2),ndiff(ref.o1.data(),s.o1.data(),no*2),ndiff(ref.i0.data(),s.i0.data(),ni*4),
+-                ndiff(ref.pr.data(),s.pr.data(),np*4),e1?0:ndiff(ref.pa.data(),s.pa.data(),npa*4),ndiff(ref.cx.data(),s.cx.data(),nc*4),
+-                ndiff(ref.kv0.data(),s.kv0.data(),s.kv0.size())+ndiff(ref.kv1.data(),s.kv1.data(),s.kv1.size()),
+-                ndiff(ref.sc[0].data(),s.sc[0].data(),np*4),ndiff(ref.sc[1].data(),s.sc[1].data(),np*4),
+-                e1?0:ndiff(ref.pl[0].data(),s.pl[0].data(),npa*4),e1?0:ndiff(ref.pl[1].data(),s.pl[1].data(),npa*4),0};
+-            for(int q=0;q<11;q++)w[q]=std::max(w[q],d[q]);ok&=!s.e0&&!s.e1&&s.v0&&s.v1;
++            size_t d[14]={vdiff(ref.o0,s.o0),vdiff(ref.o1,s.o1),vdiff(ref.i0,s.i0),vdiff(ref.pr,s.pr),e1?0:vdiff(ref.pa,s.pa),vdiff(ref.cx,s.cx),
++                vdiff(ref.kv,s.kv)+vdiff(ref.ix,s.ix),vdiff(ref.sc[0],s.sc[0]),vdiff(ref.sc[1],s.sc[1]),
++                e1?0:vdiff(ref.pl[0],s.pl[0]),e1?0:vdiff(ref.pl[1],s.pl[1]),vdiff(ref.si,s.si),vdiff(ref.ii,s.ii),0};
++            for(int q=0;q<13;q++)w[q]=std::max(w[q],d[q]);ok&=!s.e0&&!s.e1&&s.v0&&s.v1;
+             for(size_t i=0;i<no;i++){const double r0=__half2float(ref.o0[i]),r1=__half2float(ref.o1[i]);
+                 dout=std::max({dout,fabs(r0-__half2float(s.o0[i])),fabs(r1-__half2float(s.o1[i]))});mout=std::max({mout,fabs(r0),fabs(r1)});}
+             for(size_t i=0;i<nc;i++){dcx=std::max(dcx,(double)fabs(ref.cx[i]-s.cx[i]));mcx=std::max(mcx,(double)fabs(ref.cx[i]));}}
+-        bool exact=ok;for(int q=0;q<11;q++)exact&=!w[q];
+-        printf("EXACT %s T=%d L=%d M=%d x%d | bytes differing: scores full %zu shared %zu, parts full %zu shared %zu, probs %zu, parts(call) %zu, "
+-               "context %zu, out full %zu shared %zu, indices %zu, kv %zu | err/valid %s | %s\n",tag,T,L,M,CHK,w[7],w[8],w[9],w[10],w[3],w[4],w[5],w[0],w[1],w[2],w[6],
+-               ok?"ok":"BAD",exact?"IDENTICAL":e1?"DIFFER (E1)":"DIFFER");
++        bool exact=ok;for(int q=0;q<13;q++)exact&=!w[q];
++        printf("EXACT %s T=%d L=%d M=%d x%d | bytes differing vs stock: index scores %zu ids %zu, indices %zu, scores full %zu shared %zu, "
++               "parts full %zu shared %zu, probs %zu, parts(call) %zu, context %zu, out full %zu shared %zu, kv+index cache %zu | err/valid %s | %s\n",
++               tag.c_str(),T,L,M,CHK,w[11],w[12],w[2],w[7],w[8],w[9],w[10],w[3],w[4],w[5],w[0],w[1],w[6],ok?"ok":"BAD",exact?"IDENTICAL":e1?"DIFFER (E1)":"DIFFER");
+         if(e1)printf("  E1 max |diff|: out %.3g (max |out| %.3g), context %.3g (max |context| %.3g)%s\n",dout,mout,dcx,mcx,
+-            w[2]||w[3]||w[6]||w[7]||w[8]||!ok?" | indices / probs / scores / kv / err NOT identical: BAD":"");
++            w[2]||w[3]||w[6]||w[7]||w[8]||w[11]||w[12]||!ok?" | indices / probs / scores / kv / err NOT identical: BAD":"");
+         if(!exact&&!e1){bad++;continue;}
+-        if(e1&&(w[2]||w[3]||w[6]||w[7]||w[8]||!ok)){bad++;continue;}
+-        // NODE: the changed nodes' prefix deltas, stock vs arm, per layer
++        if(e1&&(w[2]||w[3]||w[6]||w[7]||w[8]||w[11]||w[12]||!ok)){bad++;continue;}
++        // NODE: per layer, the nodes that differ from the timing reference: prefix deltas, reference vs arm
+         for(int l=0;l<2;l++){
+             std::vector<Node> nn[2];cudaGraph_t gg[2];
+-            for(int arm=0;arm<2;arm++){set_arm(arm?x:Arm{0,0,0});gg[arm]=capture(st,[&]{call(l);});nn[arm]=chain_of(gg[arm]);}
++            for(int arm=0;arm<2;arm++){set_arm(arm?x:ref_arm);gg[arm]=capture(st,[&]{call(l);});nn[arm]=chain_of(gg[arm]);}
+             set_arm(x);
+-            const int ks=node_of(nn[0],"scores"),kc=node_of(nn[0],"context"),km=node_of(nn[0],"merge");
+-            const int ends[6]={ks-1,ks,kc-1,kc,km-1,km};   // prefixes of length end+1
+-            std::vector<Timed> g;
+-            for(int t=0;t<TR;t++)for(int arm=0;arm<2;arm++)for(int e=0;e<6;e++)for(int cold=0;cold<2;cold++){
+-                Timed tg=timed_graph([&]{for(int j=0;j<=ends[e];j++)relaunch(nn[arm][j],st);},cold);
+-                tg.v.push_back(run_us(tg.x,st,REPS)/K-(cold?tflush:0));cudaGraphExecDestroy(tg.x);g.push_back(tg);}
+-            auto at=[&](int arm,int e,int cold){std::vector<float> v;for(int t=0;t<TR;t++)v.push_back(g[((t*2+arm)*6+e)*2+cold].v[0]);return med(v);};
+-            auto dl=[&](int arm,int k,int cold){return at(arm,2*k+1,cold)-at(arm,2*k,cold);};
+-            printf("NODE %s %s layer | scores %s -> %s: hot %.2f -> %.2f cold %.2f -> %.2f | context %s -> %s: hot %.2f -> %.2f cold %.2f -> %.2f | "
+-                   "merge hot %.2f -> %.2f cold %.2f -> %.2f us\n",tag,kind[l],nn[0][ks].name.c_str(),nn[1][ks].name.c_str(),dl(0,0,0),dl(1,0,0),dl(0,0,1),dl(1,0,1),
+-                   nn[0][kc].name.c_str(),nn[1][kc].name.c_str(),dl(0,1,0),dl(1,1,0),dl(0,1,1),dl(1,1,1),dl(0,2,0),dl(1,2,0),dl(0,2,1),dl(1,2,1));
++            if(nn[0].size()!=nn[1].size()){printf("NODE %s %s layer: chains differ in length (%zu vs %zu): not compared per node\n",tag.c_str(),kind[l],nn[0].size(),nn[1].size());}
++            else for(size_t k=0;k<nn[0].size();k++){if(same_node(nn[0][k],nn[1][k])&&!arg_differs(nn[1][k],ref_arm.idx,x.idx))continue;
++                float v[2][2][2];std::vector<float> acc[2][2][2];   // [arm][end k-1 / k][cold]
++                for(int t=0;t<TR;t++)for(int arm=0;arm<2;arm++)for(int e=0;e<2;e++)for(int cold=0;cold<2;cold++){
++                    const int end=(int)k-1+e;acc[arm][e][cold].push_back(once([&]{for(int j=0;j<=end;j++)relaunch(nn[arm][j],st);},cold));}
++                for(int arm=0;arm<2;arm++)for(int e=0;e<2;e++)for(int cold=0;cold<2;cold++)v[arm][e][cold]=med(acc[arm][e][cold]);
++                char gb[2][48];for(int arm=0;arm<2;arm++)snprintf(gb[arm],48,"%ux%ux%u x %u",nn[arm][k].p.gridDim.x,nn[arm][k].p.gridDim.y,nn[arm][k].p.gridDim.z,nn[arm][k].p.blockDim.x);
++                printf("NODE %s %s layer #%zu | %s [%s] -> %s [%s] | hot %.2f -> %.2f cold %.2f -> %.2f us\n",tag.c_str(),kind[l],k,
++                    nn[0][k].name.c_str(),gb[0],nn[1][k].name.c_str(),gb[1],v[0][1][0]-v[0][0][0],v[1][1][0]-v[1][0][0],v[0][1][1]-v[0][0][1],v[1][1][1]-v[1][0][1]);}
+             cudaGraphDestroy(gg[0]);cudaGraphDestroy(gg[1]);}
+-        // TIME: whole call, stock vs arm alternating
++        // TIME: whole call, reference vs arm alternating
+         std::vector<float> v[8];
+-        for(int t=0;t<TR;t++)for(int arm=0;arm<2;arm++){set_arm(arm?x:Arm{0,0,0});
+-            for(int l=0;l<2;l++){std::vector<Timed> g;g.push_back(timed_graph([&]{call(l);},false));g.push_back(timed_graph([&]{call(l);},true));
+-                for(auto& y:g){y.v.push_back(run_us(y.x,st,REPS)/K-(y.cold?tflush:0));cudaGraphExecDestroy(y.x);}
+-                v[arm*4+l*2].push_back(g[0].v[0]);v[arm*4+l*2+1].push_back(g[1].v[0]);}}
++        for(int t=0;t<TR;t++)for(int arm=0;arm<2;arm++){set_arm(arm?x:ref_arm);
++            for(int l=0;l<2;l++){v[arm*4+l*2].push_back(once([&]{call(l);},false));v[arm*4+l*2+1].push_back(once([&]{call(l);},true));}}
+         float o[8];for(int q=0;q<8;q++)o[q]=med(v[q]);
+         const double step_cold=(21*(o[1]-o[5])+57*(o[3]-o[7]))/1000.,step_hot=(21*(o[0]-o[4])+57*(o[2]-o[6]))/1000.;
+-        printf("TIME %s T=%d L=%d M=%d | hot full %.1f -> %.1f, shared %.1f -> %.1f | cold full %.1f -> %.1f, shared %.1f -> %.1f us | "
+-               "saved per step (21 full + 57 shared): cold %.3f ms, hot %.3f ms | gate %s\n",tag,T,L,M,o[0],o[4],o[2],o[6],o[1],o[5],o[3],o[7],
+-               step_cold,step_hot,(M>=12?step_cold>=2.0:step_cold>=0.5)?(e1?"PASS (E1: needs KL)":"PASS"):"below");
++        const double gate=x.vs_stock?0.5:M>=12||T>=32768?1.0:0.3;
++        printf("TIME %s vs %s T=%d L=%d M=%d | hot full %.1f -> %.1f, shared %.1f -> %.1f | cold full %.1f -> %.1f, shared %.1f -> %.1f us | "
++               "saved per step (21 full + 57 shared): cold %.3f ms, hot %.3f ms | gate %.1f %s\n",tag.c_str(),rtag.c_str(),T,L,M,o[0],o[4],o[2],o[6],o[1],o[5],o[3],o[7],
++               step_cold,step_hot,gate,step_cold>=gate?(e1?"PASS (E1: needs KL)":"PASS"):"below");
+     }
+-    set_arm({0,0,0});
++    set_arm(STOCK);
+     if(bad)return 3;
+     return 0;
+ }

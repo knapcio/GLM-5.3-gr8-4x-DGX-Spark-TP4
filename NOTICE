@@ -1,0 +1,25 @@
+GLM-5.3 with gr8 on four DGX Sparks (TP4)
+
+Repository-authored patches, scripts, configuration and documentation: MIT, see LICENSE.
+
+patches/ modifies kindlingai/gr8 (https://github.com/kindlingai/gr8) at
+6448a16661abd81e9540bc073b3cfa92d7234565. gr8 is MIT, Copyright (c) 2026 gr8 engine
+contributors; its licence is retained in LICENSES/MIT-gr8.txt and applies to the
+upstream code the patches touch. The patches do not remove or alter any upstream
+copyright or licence notice.
+
+The Dockerfile builds from upstream gr8 sources fetched at build time and uses the
+upstream image ghcr.io/kindlingai/gr8, pinned by digest, as its base. No container
+image is distributed here; the referenced images keep their own terms, including
+NVIDIA's CUDA base images.
+
+No model weights are distributed, and the MIT licence above does not cover any.
+kindlingai/glm-5.3-exlr8-k2-k3-k4 is under the GLM-5.3 licence (Z.ai,
+https://huggingface.co/zai-org/GLM-5.3/blob/main/LICENSE) plus CC BY 4.0 for the
+quantization additions (see its model card). incoai/GLM-5.3-DFlash2 is
+CC BY-NC-ND 4.0 (noncommercial): it is not included, modified or redistributed;
+each user downloads it and upstream gr8 converts it locally, which does not lift
+the noncommercial restriction.
+
+RigMark (alexellis/rigmark) is credited as the benchmark; none of its code is
+included. See CREDITS.md.
