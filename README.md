@@ -11,84 +11,72 @@ fork, no weights and no images: the engine comes from upstream at `6448a16`, the
 image from upstream's registry. Every patch except the fabric MTU fix (0001, always on) is behind a flag that defaults
 to off, so the patched engine behaves as upstream until `G6ENV_X` turns the levers on.
 
-Release **v0.2**, 2026-10-15: v0.1 plus patch 0014, DFlash2 after prefix reuse (`G6_DFL_REUSE=2`). The v0.1 rows below
-are the v0.1 measurements of 2026-10-15; see [CHANGELOG.md](CHANGELOG.md).
+Release **v0.2**, 2026-10-15. The tables below are this release's measurements. What changed in each release, and by
+how much, is in [CHANGELOG.md](CHANGELOG.md); A/B measurements against earlier releases and the upstream baseline are
+in [docs/history.md](docs/history.md).
 
-## Results
+## Decode by prompt type and concurrency — thinking on, effort low
 
-[RigMark](https://github.com/alexellis/rigmark) 1.0.0, thinking on, `reasoning_effort: low`, decode tok/s; settings in
-[Reproducing](#reproducing). The baseline is upstream gr8 `d9188e3` plus the MTU fix only (the engine without this
-recipe's speed patches), measured on the same machines. The recipe runs on upstream `6448a16`, so the rows compare
-complete stacks; see [Known limits](#known-limits). RigMark sends single-turn requests; the multi-turn case that patch
-0014 targets is measured separately in [Multi-turn](#multi-turn-prefix-cache-hits).
+Measured 2026-10-15 on the v0.2 configuration, one boot.
 
-| c1 decode | prose | code | structured |
+Decode, aggregate tok/s **[per-stream tok/s]**, RigMark's prose, code and structured prompts, 256 output tokens,
+temperature 0, `reasoning_effort: low` (the model's chat template has no thinking-off mode), medians of three rounds per
+cell; c identical requests sent at once. Measured with [`bench/conc.py`](bench/conc.py).
+
+At c ≥ 2 the sessions share verify steps and draft with MTP (the DFlash2 drafter serves a session that is alone), so
+structured and code, where DFlash2 drafts long blocks, gain less from concurrency than prose; structured c2 aggregate
+is below c1.
+
+| Prompt type | c1 | c2 | c4 |
 |---|---:|---:|---:|
-| **v0.2**, full run | **35.5** | **54.8** | **66.6** |
-| v0.1, full run | 35.4 | 54.9 | 66.7 |
-| v0.1, decode screens (two runs) | 35.76 / 35.74 | 52.51 / 52.56 | 67.51 / 67.36 |
-| baseline (`d9188e3` + MTU fix), full run | 29.0 | 48.1 | 60.6 |
+| prose | 34.9 [35.8] | 48.9 [25.9] | 62.8 [17.6] |
+| code | 43.4 [44.3] | 58.8 [31.2] | 74.8 [21.3] |
+| structured | 69.5 [72.0] | 65.2 [35.4] | 84.3 [24.8] |
 
-| Concurrency, aggregate decode tok/s | C1 | C2 | C4 |
+## RigMark — thinking on, effort low
+
+[RigMark](https://github.com/alexellis/rigmark) 1.0.0, thinking on, `reasoning_effort: low`, one full run; settings in
+[Reproducing](#reproducing). Each cell is RigMark's median for that workload.
+
+| Workload | c1 decode tok/s |
+|---|---:|
+| prose | 35.5 |
+| code | 54.8 |
+| structured | 66.6 |
+
+Concurrency, aggregate tok/s **[per-stream decode tok/s]**.
+
+| Concurrency | C1 | C2 | C4 |
 |---|---:|---:|---:|
-| **v0.2** | **38.8** | **54.3** | **67.6** |
-| v0.1 | 39.4 | 55.7 | 67.5 |
-| baseline (`d9188e3` + MTU fix) | 34.7 | 50.0 | 63.7 |
+| aggregate [per-stream] | 38.8 [42.5] | 54.3 [31.0] | 67.6 [20.9] |
 
-| Prefill, cold, tok/s | 8K | 32K | 64K | 128K |
+| Prefill, cold | 8K | 32K | 64K | 128K |
 |---|---:|---:|---:|---:|
-| **v0.2** | 1369 | 1370 | 1312 | 1157 |
-| v0.1 | 1367 | 1373 | 1311 | 1181 |
-| baseline (`d9188e3` + MTU fix) | 1361 | 1375 | 1307 | 1188 |
+| tok/s | 1369 | 1370 | 1312 | 1157 |
 
-Prefill (v0.1) is within 1 % of the baseline: the levers act on decode. A 96K-token needle prompt returns the same
-answer as the baseline. v0.2: prefill within 3 % of the baseline (128K: 1157 vs 1188), same 96K needle answer.
+### Multi-turn conversations
 
-### Multi-turn (prefix-cache hits)
-
-Upstream runs a request on MTP only for its whole life when its prompt hit the prefix cache inside the DFlash2
-drafter's 2,048-position window, or when it was not alone at its prompt tail (upstream KNOWN-ISSUES #1). A later turn
-of a conversation whose new tokens are fewer than 2,048 is in the first case. Patch 0014 lets those turns draft with
-DFlash2. The test is a small multi-turn script: three conversations (A, B, C; A3 is conversation A's third turn),
-code-heavy, with turns sized to hit the prefix cache; T=0, c1, decode tok/s, one run each, v0.1 vs v0.2 on the same
-machines.
-
-| Turn | Case | v0.1 (MTP only) | v0.2 (DFlash2) | v0.2 / v0.1 |
-|---|---|---:|---:|---:|
-| A2 | prefix hit inside the window | 45.51 | 57.69 | ×1.27 |
-| A3 | prefix hit | 45.34 | 50.49 | ×1.11 |
-| B2 | prefix hit | 47.30 | 68.34 | ×1.44 |
-| A4 | prefix hit; another conversation had taken over the drafter's context ring | 43.88 | 45.06 | ×1.03 |
-| C1 | fresh, not alone at its prompt tail at the start | 44.92 | 57.40 | ×1.28 |
-
-Mean of the per-turn ratios (`bench/multiturn.py compare`): prefix-hit turns (A2, A3, B2, A4) ×1.20 decode, fresh turns ×1.09 (driven by C1; A1 and B1 are ×1.01), replayed turn ×1.01. Single run: no variance is established.
-
-- This is one run of a small script ([`bench/multiturn.py`](bench/multiturn.py), stdlib Python against the local API), not a
-  benchmark; all rows come from the same pair of runs.
-- The turns are code-heavy. We expect prose turns to gain less, because DSel picks MTP for prose anyway; this was not
-  measured.
-- A turn whose conversation no longer owns the drafter's context ring (A4) warms the drafter up over a few MTP rounds
-  instead of continuing it, and gains little.
-- 0014 is a drafting lever: T=0 text on these turns differs between v0.1 and v0.2 (see the exactness classes below).
+RigMark sends single-turn requests. In a multi-turn conversation, turns whose prompt hits the prefix cache draft with
+DFlash2 (patch 0014, `G6_DFL_REUSE=2`) instead of staying on MTP for their whole life as in upstream. The measured A/B
+is in [docs/history.md](docs/history.md#multi-turn-prefix-cache-hits).
 
 ## Levers
 
-Measured contribution is RigMark c1 decode on short screens, each step on top of the levers above it, so the steps use
-different control runs and do not add up exactly to the totals above.
+| Patch | What it does | Flags (serving) | Exactness | Credit |
+|---|---|---|---|---|
+| 0001 | Negotiate the RDMA queue-pair MTU from both ports' active MTU instead of assuming one; logs the chosen MTU per QP. Needed to boot on a switched fabric | always on | bit-exact | knapcio |
+| 0002, 0003 | Split the replicated GEMVs every rank holds in full (layer input q_a / kv_a / indexer k and weights; the indexer's wq_b; the MTP draft layer's eh_proj, q_a, kv_a, indexer) by 16-output tiles across the four ranks, then all-gather the columns per layer on a fabric of their own | `G6_QA_SPLIT=1` `G6_IDXQ_SPLIT=1` `G6_MTP_SPLIT=1` | bit-exact | knapcio |
+| 0004, 0005 | MTP draft head and DFlash2 drafter head on INT4 g32 records made at boot from the target's MXFP8 head (45 % fewer head bytes per draft step); the target head and verify are unchanged | `G6_DRAFT_HEAD_I4=1` `G6_DFL_HEAD_I4=1` | drafting | knapcio; DFlash2 by incoai |
+| — | DSel probe interval (upstream knob, no patch): while a request drafts with MTP, DFlash2 drafts a scoring probe every 32nd round instead of every 4th | `G6_S2_DSEL_PROBE=32` | drafting | DSel by kindlingai; setting by knapcio |
+| 0006–0008 | DSel experiments: start DFlash2 requests on MTP, a selector-walk correction coefficient, per-position observation clocks | off | — | knapcio |
+| 0009 | Overrides for DSel's drafting-cost constants (ms per round); serving lowers the MTP first-step cost from 5.5 to 2.9 | `G6_S2_DSEL_MCOST=2.9` | drafting | knapcio; DSel by kindlingai |
+| 0010 | MoE: run the trellis shared expert on a forked stream during the router GEMV and plan kernel, so its weight reads fill idle DRAM time | `G6_ROUTE_OVL=1` | bit-exact | knapcio |
+| 0011 | Decode attention, round 1: a scores kernel with several KV slots per warp and a transpose reduction; a packed, branch-free context kernel | `G6_ATTN_SC2=4` `G6_ATTN_CTX2=4` | bit-exact | knapcio |
+| 0012 | Decode attention, round 2: the transpose reduction done eagerly (fewer registers), a context kernel with 32-bit row indices and warp-ballot batch states, the selector's final sort as a rank by count, and an indexer that reads each key tile once for a session's rows | `G6_ATTN_SC2_TR=2` `G6_ATTN_CTX3=2` `G6_ATTN_SEL2=16` `G6_IDX_GRP=16` | bit-exact | knapcio |
+| 0013 | MTP confidence stop: a request's solo MTP rounds verify 1–3 drafts, stopping the chain where the MTP head's cumulative probability falls below a per-position threshold | `G6_MTP_KSTOP=1` `G6_MTP_KSTOP_KMAX=3` `G6_MTP_KSTOP_TAU=0,0.5,0.75` | drafting | knapcio |
+| 0014 | DFlash2 after prefix reuse. Upstream runs a request on MTP only for its whole life when its prompt hit the prefix cache inside the drafter's 2,048-position window or it was not alone at its prompt tail (upstream KNOWN-ISSUES #1). Mode 1 lets prefix-hit turns keep DFlash2, by continuing the drafter's context ring from the previous turn of the same conversation or by warming it up over a few MTP rounds; mode 2 also promotes a session that is alone on MTP | `G6_DFL_REUSE=2` | drafting | knapcio; DFlash2 by incoai |
 
-| Patch | What it does | Flags (serving) | Exactness | Measured | Credit |
-|---|---|---|---|---|---|
-| 0001 | Negotiate the RDMA queue-pair MTU from both ports' active MTU instead of assuming one; logs the chosen MTU per QP | always on | bit-exact | needed to boot on a switched fabric; no speed effect | knapcio |
-| 0002, 0003 | Split the replicated GEMVs every rank holds in full (layer input q_a / kv_a / indexer k and weights; the indexer's wq_b; the MTP draft layer's eh_proj, q_a, kv_a, indexer) by 16-output tiles across the four ranks, then all-gather the columns per layer on a fabric of their own | `G6_QA_SPLIT=1` `G6_IDXQ_SPLIT=1` `G6_MTP_SPLIT=1` | bit-exact | prose +6.5 % | knapcio |
-| 0004, 0005 | MTP draft head and DFlash2 drafter head on INT4 g32 records made at boot from the target's MXFP8 head (45 % fewer head bytes per draft step); the target head and verify are unchanged | `G6_DRAFT_HEAD_I4=1` `G6_DFL_HEAD_I4=1` | drafting | prose +0.6 %, code +1.5 % | knapcio; DFlash2 by incoai |
-| — | DSel probe interval (upstream knob, no patch): while a request drafts with MTP, DFlash2 drafts a scoring probe every 32nd round instead of every 4th | `G6_S2_DSEL_PROBE=32` | drafting | prose +3 % | DSel by kindlingai; setting by knapcio |
-| 0006–0008 | DSel experiments: start DFlash2 requests on MTP, a selector-walk correction coefficient, per-position observation clocks | off | — | not used | knapcio |
-| 0009 | Overrides for DSel's drafting-cost constants (ms per round); serving lowers the MTP first-step cost from 5.5 to 2.9 | `G6_S2_DSEL_MCOST=2.9` | drafting | prose +2.2 %, code −1.9 % | knapcio; DSel by kindlingai |
-| 0010 | MoE: run the trellis shared expert on a forked stream during the router GEMV and plan kernel, so its weight reads fill idle DRAM time | `G6_ROUTE_OVL=1` | bit-exact | prose +1.7 % | knapcio |
-| 0011 | Decode attention, round 1: a scores kernel with several KV slots per warp and a transpose reduction; a packed, branch-free context kernel | `G6_ATTN_SC2=4` `G6_ATTN_CTX2=4` | bit-exact | prose +3.4–4.7 %, code / structured +4–7 %; −8.6 ms/step at c4 (12 rows) | knapcio |
-| 0012 | Decode attention, round 2: the transpose reduction done eagerly (fewer registers), a context kernel with 32-bit row indices and warp-ballot batch states, the selector's final sort as a rank by count, and an indexer that reads each key tile once for a session's rows | `G6_ATTN_SC2_TR=2` `G6_ATTN_CTX3=2` `G6_ATTN_SEL2=16` `G6_IDX_GRP=16` | bit-exact | prose +0.7 % at 1K context; at 32K context up to −3.1 ms/step at c1, −10.3 ms/step at c4 | knapcio |
-| 0013 | MTP confidence stop: a request's solo MTP rounds verify 1–3 drafts, stopping the chain where the MTP head's cumulative probability falls below a per-position threshold | `G6_MTP_KSTOP=1` `G6_MTP_KSTOP_KMAX=3` `G6_MTP_KSTOP_TAU=0,0.5,0.75` | drafting | prose +1.2 %, code −2.1 % | knapcio |
-| 0014 | DFlash2 after prefix reuse. Upstream runs a request on MTP only for its whole life when its prompt hit the prefix cache inside the drafter's 2,048-position window or it was not alone at its prompt tail (upstream KNOWN-ISSUES #1). Mode 1 lets prefix-hit turns keep DFlash2, by continuing the drafter's context ring from the previous turn of the same conversation or by warming it up over a few MTP rounds; mode 2 also promotes a session that is alone on MTP | `G6_DFL_REUSE=2` | drafting | multi-turn script: prefix-hit turns ×1.20, fresh ×1.09 (see [Multi-turn](#multi-turn-prefix-cache-hits)); RigMark single-turn rows similar to v0.1 in these single full runs (it sends fresh prompts); variance not established | knapcio; DFlash2 by incoai |
+The measured contribution of each lever is in [docs/history.md](docs/history.md#per-lever-contributions).
 
 **Exactness classes.** *Bit-exact*: the patched path produces the same bytes as upstream's for the same inputs, with
 the serving flags above. Evidence: the MTU fix changes transport setup only; the GEMV split was byte-compared with
@@ -109,28 +97,31 @@ not guaranteed byte-identical to upstream over long generations.
 
 | Check | Result |
 |---|---|
+| Sampled qeval | 578/600 (T=1.0, top_p 0.95, 8 seeds × 75 tasks) |
+| T=0 qeval | 71/75, single run |
+| Needle | a 96K-token needle prompt returns the correct answer |
 | GEMV split exactness, m4sim | every combination of `G6_QA_SPLIT` / `G6_IDXQ_SPLIT` / `G6_MTP_SPLIT` byte-identical to flags off on the plain, graph, MTP, S2 and CP paths: 30/30 |
 | Attention exactness, attnk bench (rounds 1 and 2, serving flags) | byte-identical to stock at T 2K / 8K / 32K × M 1 / 3 / 8 / 12 |
-| T=0 identity, v0.1 configuration | top-20 logprobs on the 75 qeval prompts (up to 512 tokens) bit-identical to the previous configuration (GEMV split + INT4 heads + probe 32): 75/75 prompts, 7,551 positions. For scale, the same configuration run at concurrency 1 vs 4 differs with mean KL 5e-3 |
-| T=0 identity / KL, v0.2 | top-20 logprobs on the 75 qeval prompts vs the previous configuration, second (prefix-cached) pass: 34/75 identical, mean KL 2.7e-3 on the common prefix; for scale, the same configuration at concurrency 1 vs 4: 30/75 identical, mean KL 5.0e-3. Text differs at T=0 because a cached prompt now drafts with DFlash2 (drafting class) |
-| Sampled qeval, v0.2 | 578/600 (T=1.0, top_p 0.95, 8 seeds × 75 tasks), identical per seed to the previous configurations. Single T=0 run: 71/75, the same four misses as v0.1 |
-| Sampled qeval, v0.1 configuration | 578/600 (T=1.0, top_p 0.95, 8 seeds × 75 tasks), identical per seed to the previous configuration. Single T=0 run: 71/75 (baseline 73/75); the extra misses are a character count off by one and one arithmetic answer, borderline tasks that flip between runs |
+| Route overlap exactness | identical T=0 output on the four-box cluster; byte-compared by `engine/kernels/tests/k1_ovl_test.cu` |
 
 qeval is the 75-task quality screen from the earlier
 [GLM-5.3 recipe](https://github.com/knapcio/GLM-5.3-4x-DGX-Spark-TP4) (`bench/qeval.py`). The m4sim exactness runs used
-a development harness that runs the split gathers on a loopback; it is not included in this patch series.
+a development harness that runs the split gathers on a loopback; it is not included in this patch series. T=0 identity
+and KL checks against earlier configurations are in [docs/history.md](docs/history.md#quality-checks-against-earlier-configurations).
 
 ## Reproducing
 
-- **Engine flags** (serving, v0.2): `G6ENV_X` in [docker/env.example](docker/env.example), the same line on every box:
+- **Engine flags** (serving): `G6ENV_X` in [docker/env.example](docker/env.example), the same line on every box:
 
   ```bash
   G6ENV_X="G6_QA_SPLIT=1 G6_IDXQ_SPLIT=1 G6_MTP_SPLIT=1 G6_DRAFT_HEAD_I4=1 G6_DFL_HEAD_I4=1 G6_S2_DSEL_PROBE=32 G6_ROUTE_OVL=1 G6_S2_DSEL_MCOST=2.9 G6_ATTN_SC2=4 G6_ATTN_SC2_TR=2 G6_ATTN_CTX2=4 G6_ATTN_CTX3=2 G6_ATTN_SEL2=16 G6_IDX_GRP=16 G6_MTP_KSTOP=1 G6_MTP_KSTOP_KMAX=3 G6_MTP_KSTOP_TAU=0,0.5,0.75 G6_DFL_REUSE=2"
   ```
 
-  v0.1 was measured with the same line without `G6_DFL_REUSE=2`.
-- **Benchmark**: RigMark 1.0.0 ([github.com/alexellis/rigmark](https://github.com/alexellis/rigmark)) against the
-  head's API. Full runs:
+- **Decode table**: `python3 bench/conc.py --prompts <rigmark>/prompts.json` against the head's API (rounds 3,
+  256 output tokens).
+
+- **RigMark** 1.0.0 ([github.com/alexellis/rigmark](https://github.com/alexellis/rigmark)) against the head's API. Full
+  runs:
 
   ```bash
   rigmark run --base-url http://127.0.0.1:8100 --model glm-5.3 \
@@ -140,8 +131,9 @@ a development harness that runs the split gathers on a loopback; it is not inclu
 
   Decode screens: the same command with `--skip-prefill --skip-concurrency`. Each cell is RigMark's median decode
   tok/s for that workload.
-- **Hardware**: the four boxes at the stock GPU clock cap, no clock changes. Baseline and recipe ran on the same
-  machines.
+- **Multi-turn**: [`bench/multiturn.py`](bench/multiturn.py), stdlib Python against the local API; usage in its
+  docstring.
+- **Hardware**: the four boxes at the stock GPU clock cap, no clock changes.
 - **Attention exactness** (patches 0011–0012): the attnk bench in the patched tree compares every arm byte for byte
   against the stock chain and exits 3 on any difference. On an idle Spark (not while serving), with CUDA 13:
 
@@ -167,9 +159,6 @@ a development harness that runs the split gathers on a loopback; it is not inclu
 - **Verify numerics are not row-count invariant in upstream gr8.** A step that verifies 3 rows and one that verifies 8
   can sum in a different order. T=0 output in upstream also depends on prefix-cache state (a cold prompt and a cached
   one can differ). Compare T=0 runs only under the same cache state.
-- **The baseline is upstream `d9188e3`, the recipe pins `6448a16`.** The upstream changes in between are engine-side
-  (fabric relay back-pressure, giving host heap back after load, S2 prefill and notice scheduling); the front end,
-  launcher and loader are identical. The gains above are of the complete stack, not of the patches alone.
 - **Only the TP=4 engine with the FP8 KV latent (`bin/g6m4`) is rebuilt.** TP=3, TP=6 and `--kv-format int4` keep
   upstream's binaries and were not tested with these flags.
 - **Same flags on every box.** `G6ENV_X` is a cluster-wide launcher option, so use one `docker/.env` everywhere. The
