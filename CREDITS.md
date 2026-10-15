@@ -19,11 +19,11 @@
   (noncommercial). Not redistributed, modified or converted here; each box fetches and converts its own copy with
   upstream gr8's tooling, which does not lift the noncommercial restriction.
 - **Alex Ellis (alexellis) and RigMark contributors**: [RigMark](https://github.com/alexellis/rigmark), the decode,
-  concurrency and prefill benchmark behind every speed number in the README. Measurements only; no RigMark code is
-  included.
+  concurrency and prefill benchmark behind the RigMark results in the README. Measurements only; no RigMark code is
+  included. The multi-turn numbers come from this repository's own `bench/multiturn.py`.
 - **NVIDIA**: the CUDA images and toolchain the image is built from.
-- **knapcio**: the thirteen patches (fabric MTU negotiation, replicated-GEMV splits, INT4 draft heads, DSel
+- **knapcio**: the fourteen patches (fabric MTU negotiation, replicated-GEMV splits, INT4 draft heads, DSel
   experiments and cost overrides, the shared-expert stream overlap, two rounds of decode attention kernels, the MTP
-  confidence stop), the serving configuration, the measurements and the quality checks (m4sim and attnk exactness
-  runs, T=0 identity, qeval). qeval comes from the earlier
+  confidence stop, DFlash2 after prefix reuse), the serving configuration, the measurements and the quality checks
+  (m4sim and attnk exactness runs, T=0 identity, qeval). qeval comes from the earlier
   [GLM-5.3 recipe](https://github.com/knapcio/GLM-5.3-4x-DGX-Spark-TP4).

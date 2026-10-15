@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Thu, 15 Oct 2026 08:16:14 +0200
-Subject: [PATCH 09/13] DSel: drafting-cost overrides G6_S2_DSEL_DCOST / _MCOST
+Subject: [PATCH 09/14] DSel: drafting-cost overrides G6_S2_DSEL_DCOST / _MCOST
  / _MEACH
 
 Unset keeps 5.6 + 2.5, 2.5 + 3.0 and 2.1 ms; the rank-0 drafter-choice line

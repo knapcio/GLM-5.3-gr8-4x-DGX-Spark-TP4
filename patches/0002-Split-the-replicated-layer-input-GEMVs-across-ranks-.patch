@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Wed, 14 Oct 2026 23:19:13 +0200
-Subject: [PATCH 02/13] Split the replicated layer-input GEMVs across ranks
+Subject: [PATCH 02/14] Split the replicated layer-input GEMVs across ranks
  behind G6_QA_SPLIT
 
 G6_QA_SPLIT=1 runs each rank's 16-output tiles of q_a, kv_a, idx.wk and
