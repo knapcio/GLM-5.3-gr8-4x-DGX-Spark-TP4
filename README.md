@@ -33,28 +33,18 @@ is below c1.
 | code | 43.4 [44.3] | 58.8 [31.2] | 74.8 [21.3] |
 | structured | 69.5 [72.0] | 65.2 [35.4] | 84.3 [24.8] |
 
-## RigMark — thinking on, effort low
+## Prefill
 
-[RigMark](https://github.com/alexellis/rigmark) 1.0.0, thinking on, `reasoning_effort: low`, one full run; settings in
-[Reproducing](#reproducing). Each cell is RigMark's median for that workload.
+Cold prefill, input tok/s, measured with [RigMark](https://github.com/alexellis/rigmark) 1.0.0 (unique prompts, no
+prefix reuse). A 96K-token needle prompt returns the correct answer.
 
-| Workload | c1 decode tok/s |
-|---|---:|
-| prose | 35.5 |
-| code | 54.8 |
-| structured | 66.6 |
-
-Concurrency, aggregate tok/s **[per-stream decode tok/s]**.
-
-| Concurrency | C1 | C2 | C4 |
-|---|---:|---:|---:|
-| aggregate [per-stream] | 38.8 [42.5] | 54.3 [31.0] | 67.6 [20.9] |
-
-| Prefill, cold | 8K | 32K | 64K | 128K |
+| Prompt length | 8K | 32K | 64K | 128K |
 |---|---:|---:|---:|---:|
-| tok/s | 1369 | 1370 | 1312 | 1157 |
+| cold prefill tok/s | 1369 | 1370 | 1312 | 1157 |
 
-### Multi-turn conversations
+RigMark decode results (used to measure each lever) are in [docs/history.md](docs/history.md).
+
+## Multi-turn conversations
 
 RigMark sends single-turn requests. In a multi-turn conversation, turns whose prompt hits the prefix cache draft with
 DFlash2 (patch 0014, `G6_DFL_REUSE=2`) instead of staying on MTP for their whole life as in upstream. The measured A/B

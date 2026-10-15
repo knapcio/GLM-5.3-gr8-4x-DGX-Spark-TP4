@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.2 — 2026-10-15
+
+Documentation only: the README keeps one decode table (by prompt type and concurrency) and one prefill table; the
+RigMark decode tables moved to [docs/history.md](docs/history.md).
+
 ## v0.2.1 — 2026-10-15
 
 Documentation only; no patch or flag changed. README shows the current release only, with a decode table by prompt

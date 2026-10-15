@@ -96,3 +96,24 @@ Mean of the per-turn ratios (`bench/multiturn.py compare`): prefix-hit turns (A2
 | T=0 identity / KL, v0.2 | top-20 logprobs on the 75 qeval prompts vs an earlier configuration (GEMV split + INT4 draft heads + DSel probe 32), second (prefix-cached) pass: 34/75 identical, mean KL 2.7e-3 on the common prefix; for scale, the same configuration at concurrency 1 vs 4: 30/75 identical, mean KL 5.0e-3. Text differs at T=0 because a cached prompt now drafts with DFlash2 (drafting class) |
 | Sampled qeval, v0.2 | 578/600 (T=1.0, top_p 0.95, 8 seeds × 75 tasks), identical per seed to the previous configurations. Single T=0 run: 71/75, the same four misses as v0.1 |
 | Sampled qeval, v0.1 configuration | 578/600 (T=1.0, top_p 0.95, 8 seeds × 75 tasks), identical per seed to the previous configuration. Single T=0 run: 71/75 (baseline 73/75); the extra misses are a character count off by one and one arithmetic answer, borderline tasks that flip between runs |
+
+## RigMark, current release (v0.2, one full run)
+
+[RigMark](https://github.com/alexellis/rigmark) 1.0.0, thinking on, `reasoning_effort: low`, one full run; settings in
+[Reproducing](../README.md#reproducing). Each cell is RigMark's median for that workload.
+
+| Workload | c1 decode tok/s |
+|---|---:|
+| prose | 35.5 |
+| code | 54.8 |
+| structured | 66.6 |
+
+Concurrency, aggregate tok/s **[per-stream decode tok/s]**.
+
+| Concurrency | C1 | C2 | C4 |
+|---|---:|---:|---:|
+| aggregate [per-stream] | 38.8 [42.5] | 54.3 [31.0] | 67.6 [20.9] |
+
+| Prefill, cold | 8K | 32K | 64K | 128K |
+|---|---:|---:|---:|---:|
+| tok/s | 1369 | 1370 | 1312 | 1157 |
