@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.3 — 2026-10-16
+
+v0.2 plus seven patches, twenty-one in all (0021 only corrects the table tool's usage text). Upstream base (`6448a16`) unchanged. Of patches 0001–0014 only 0011 and 0012
+changed, in one comment line of the attnk bench; their code is unchanged.
+
+- Decode attention round 3 (0015): the scores kernel reads a head's query lane-transposed with 5 vector loads instead
+  of 18 (`G6_ATTN_QT=1`), and the step's front kernels (KV append, index append and preparation) run in one launch
+  (`G6_ATTN_FRONT=1`). Also in the patch and off: `G6_ATTN_ABS2`, `G6_ATTN_VP2`, `G6_ATTN_CTX4`. Bit-exact.
+- Parallel DFlash2 drafter step (0016), `G6_DRAFT_PAR=1`: in a solo DFlash2 round the drafter step runs on its own
+  stream under MTP's first form. Bit-exact.
+- Decode step timeline (0017), `G6_S2_TIMELINE=N`: GPU span, host time and GPU idle per step kind. Diagnostics only,
+  off in serving.
+- DSel cost model (0018, 0020), `G6_S2_DSEL_MODEL=1` with the frozen cost table `G6_S2_DSEL_TABLE`: the drafter choice
+  prices both drafters from measured milliseconds, prices MTP rounds as the confidence stop runs them, and (table key
+  `r`, 0020) prices DFlash2 from its rounds as they ran. `tools/s2_dsel_table.py` (0018, 0019) writes the table from a
+  timeline boot. The table was measured on these four machines; other hardware should measure its own. Drafting.
+- `G6ENV_X` in `docker/env.example` gains `G6_ATTN_QT=1 G6_ATTN_FRONT=1 G6_DRAFT_PAR=1 G6_S2_DSEL_MODEL=1
+  G6_S2_DSEL_TABLE=…` and drops `G6_S2_DSEL_MCOST=2.9` (unused with the model on); image tag `gr8-glm53-recipe:v0.3`.
+
+Measured contributions, RigMark c1 decode (detail in [docs/history.md](docs/history.md#per-lever-contributions)):
+
+- Attention round 3 (`QT` + `FRONT`): prose +0.6 %, code +0.7 %, structured +1.2 %.
+- `G6_DRAFT_PAR=1`: prose +0.4 %, code +1.1 %, structured +0.8 %.
+- DSel model with the table (`r:0.95`) vs `G6_S2_DSEL_MCOST=2.9`: prose +1.8 %, code +3.0 %, structured −3.6 % (two
+  runs each).
+
+Measured against v0.2 on the same machines:
+
+v0.3 vs v0.2: RigMark c1 decode screens (two runs each) prose +3.5 %, code +4.6 %, structured -2.5 %; RigMark full run
+prose 36.2 / code 56.2 / structured 65.8 (v0.2 35.5 / 54.8 / 66.6), C1/C2/C4 aggregate 43.1 / 55.6 / 68.6 (v0.2 38.8 / 54.3 /
+67.6). Decode table (bench/conc.py, aggregate): prose 36.2 / 49.2 / 63.3 (v0.2 34.9 / 48.9 / 62.8), code 46.3 / 59.2 / 75.5
+(v0.2 43.4 / 58.8 / 74.8), structured 70.6 / 65.7 / 85.0 (v0.2 69.5 / 65.2 / 84.3) for c1 / c2 / c4. Cold prefill
+1367 / 1380 / 1311 / 1174 tok/s (8K-128K, unchanged). T=0 logprobs: mean KL 2.7e-3 vs an earlier configuration (noise scale
+5.0e-3); sampled qeval 578/600 (unchanged); T=0 qeval 72/75; 96K needle correct.
+
 ## v0.2.2 — 2026-10-15
 
 Documentation only: the README keeps one decode table (by prompt type and concurrency) and one prefill table; the

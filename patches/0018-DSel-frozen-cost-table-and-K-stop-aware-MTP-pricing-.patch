@@ -1,0 +1,1003 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Thu, 15 Oct 2026 19:51:48 +0200
+Subject: [PATCH 18/21] DSel: frozen cost table and K-stop-aware MTP pricing
+ behind G6_S2_DSEL_MODEL=1|2
+
+G6_S2_DSEL_TABLE (inline key:value list or a file; the same on every
+rank, its canonical form in the S2 runtime signature) gives the verify
+ms by rows 1..8, the drafting ms of a DFlash2 round (d), of an MTP round
+(m) and of an MTP chain step (e), a probe's extra (p), and optionally
+the MTP rounds' prior under the confidence stop (g, k, n) and the
+estimates' prior weight (w). With the model on the drafter choice uses
+it in place of DCOST/MCOST/MEACH and spec_len.h's verify table, and
+prices an MTP round from its first-position rate, the drafts accepted
+after the first and the mean table cost of the request's MTP rounds as
+G6_MTP_KSTOP ran them (plus p / probe), not as K drafts. 2: the DFlash2
+rounds' own draft count uses the table too. fresh() now keeps the
+verify table, decays and prior weight. Off: the steps of before
+(checked against the header before this change on 24 configurations).
+
+G6_S2_TIMELINE also prints the mean span per step kind and row count;
+tools/s2_dsel_table.py turns a boot's timeline and kstop lines into the
+table. Host test batch_dselmodel_test.
+---
+ docs/SETTINGS.md                              |   1 +
+ engine/runtime/g6m4.cu                        |  33 ++-
+ engine/runtime/s2/native.cuh                  |  11 +-
+ .../runtime/s2/tests/batch_dselmodel_test.cpp | 267 ++++++++++++++++++
+ engine/runtime/s2_batch.h                     | 193 ++++++++++++-
+ frontend/README.md                            |   2 +-
+ scripts/host_tests.sh                         |   7 +-
+ tools/s2_dsel_table.py                        | 248 ++++++++++++++++
+ 8 files changed, 747 insertions(+), 15 deletions(-)
+ create mode 100644 engine/runtime/s2/tests/batch_dselmodel_test.cpp
+ create mode 100755 tools/s2_dsel_table.py
+
+diff --git a/docs/SETTINGS.md b/docs/SETTINGS.md
+index 5fbc20e..5535db0 100644
+--- a/docs/SETTINGS.md
++++ b/docs/SETTINGS.md
+@@ -95,6 +95,7 @@ the short version.
+ | `G6_S2_ADAPT` | 0 | S2: choose each round's MTP draft count (1..k) from the sessions' accept rates and the S2 step costs; 1 adds ~1 GiB of main-step graphs |
+ | `G6_S2_GROW` | 1 | S2: a session below R holds the KV pages it needs now and takes more as its output grows, admitted and grown only while every live session can still reach prompt + `max_tokens` + guard; a session that cannot grow sits out rounds. 0 = every run holds that worst case from admission |
+ | `G6_S2_DSEL` | 1 | S2 with DFlash2: a request that decodes alone drafts each round with DFlash2 or MTP, whichever is expected to commit more tokens per ms (prose +4.5% on RigMark, code level); 0 = DFlash2 every round. `G6_S2_DSEL_MARGIN` (0.15), `G6_S2_DSEL_DWELL` (8 rounds) and `G6_S2_DSEL_PROBE` (4) tune it; `G6_S2_DSEL_DCOST` (8.1), `G6_S2_DSEL_MCOST` (5.5) and `G6_S2_DSEL_MEACH` (2.1) override its drafting ms per round (DFlash2; MTP's first form and the drafter's context step; each MTP chain step) |
++| `G6_S2_DSEL_MODEL` | 0 | S2 drafter choice: 1 = price both drafters from one frozen cost table, `G6_S2_DSEL_TABLE` (a `key:value` list or the path of a file holding one: verify ms by rows `v1`..`v8`, drafting ms `d` (DFlash2 round), `m` (MTP round), `e` (MTP chain step), `p` (a probe's extra), and optionally the MTP rounds' prior under `G6_MTP_KSTOP`: `g` drafts accepted after the first, `k` verified, `n` drafted, and `w` the estimates' prior weight), in place of `G6_S2_DSEL_DCOST`/`_MCOST`/`_MEACH` and the built-in verify table, and price MTP rounds as the confidence stop runs them (their mean table cost and accepted drafts in the request) instead of as `--mtp` drafts; 2 = the DFlash2 rounds' own draft count (`--spec-adaptive`) uses the table too. `tools/s2_dsel_table.py` writes the table from a `G6_S2_TIMELINE` + `G6_MTP_LPLOG` boot. The table is in the S2 runtime signature: every rank must read the same one |
+ | `G6_S2_DSEL_START` | dflash | S2 drafter choice: `mtp` = a DFlash2 request starts on MTP (the drafter's prompt-tail drafts are its first probe) and moves to DFlash2 when the evidence says so. Every rank must set the same value |
+ | `G6_S2_DSEL_POSCLK` | 0 | S2 drafter choice: 1 = its DFlash2 and MTP estimates decay a draft position only on rounds that observe it, so the DFlash2 rounds (which score MTP's first draft alone) no longer age MTP's later positions toward the seed. Every rank must set the same value |
+ | `G6_MTP_KSTOP` | 0 | S2 drafter choice, MTP rounds of a request that decodes alone: 1 = verify draft j while the MTP head's p_1 x .. x p_j >= `G6_MTP_KSTOP_TAU` t_j (default `0,0.2,0.5`; at least one draft) and stop the chain before a draft that could not pass; 2 = choose the count from the drafter choice's MTP estimates (`G6_MTP_KSTOP_SEED3`, 0.55: their prior for a third draft). `G6_MTP_KSTOP_KMAX` (1..3, default `--mtp`) is the most drafts. Drafts only: the target decides every token, but the verify's row count (and so its k1 split class) varies. Every rank must set the same values |
+diff --git a/engine/runtime/g6m4.cu b/engine/runtime/g6m4.cu
+index 50d2310..20b5058 100644
+--- a/engine/runtime/g6m4.cu
++++ b/engine/runtime/g6m4.cu
+@@ -92,6 +92,8 @@
+ #include "s2/kv_tier.cuh"
+ #include "host_reclaim.h"
+ #include <filesystem>
++#include <fstream>
++#include <iterator>
+ #include <unistd.h>
+ 
+ using namespace g6rt;
+@@ -499,6 +501,25 @@ int main(int argc, char** argv)
+     std::string pce;
+     const int dsel_posclk = env_choice("G6_S2_DSEL_POSCLK", 1, 0, &pce);
+     if (dsel_posclk < 0) die(pce);
++    // G6_S2_DSEL_MODEL=1|2 + G6_S2_DSEL_TABLE=<key:value list | file> (s2_batch.h DSelTable; default 0): the drafter
++    // choice prices both drafters from one frozen cost table and MTP rounds under the confidence stop. Every rank reads
++    // the same table; its canonical form is in the S2 runtime signature
++    const int dsel_model = env_choice("G6_S2_DSEL_MODEL", 2, 0, &pce);
++    if (dsel_model < 0) die(pce);
++    s2::DSelTable dsel_tab;
++    if (dsel_model)
++    {
++        const char* e = getenv("G6_S2_DSEL_TABLE");
++        if (!e || !*e || !dfl || !s2mode) die("G6_S2_DSEL_MODEL needs G6_S2_DSEL_TABLE, --serve and --dflash-manifest");
++        std::string text = e, err;
++        if (text.find(':') == std::string::npos)    // no key:value: the path of a file holding the table
++        {
++            std::ifstream f(text);
++            if (!f) die("G6_S2_DSEL_TABLE: cannot read " + text);
++            text.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
++        }
++        if (!dsel_tab.parse(text, &err)) die(err);
++    }
+     // G6_DFL_SEL_ALPHA=<a> (dflash.cuh k_walk; default 1): the DFlash2 selector walk scores logit + a * correction. Drafts
+     // only: the verify is unchanged. In the S2 runtime signature
+     const float dfl_alpha = getenv("G6_DFL_SEL_ALPHA") ? (float)atof(getenv("G6_DFL_SEL_ALPHA")) : 1.f;
+@@ -1259,6 +1280,15 @@ int main(int argc, char** argv)
+                 if (const char* e = getenv("G6_S2_DSEL_DCOST")) h.dsel.d.draft_round = atof(e);
+                 if (const char* e = getenv("G6_S2_DSEL_MCOST")) h.dsel.m.draft_round = atof(e);
+                 if (const char* e = getenv("G6_S2_DSEL_MEACH")) h.dsel.m.draft_each = atof(e);
++                h.dsel.model = dsel_model;    // the table replaces the drafting ms above (Batch::dsel)
++                h.dsel.tab = dsel_tab;
++                if (R == 0 && dsel_model)
++                {
++                    fprintf(stderr, "# s2 drafter choice cost model %d: table %s%s\n", dsel_model, dsel_tab.str().c_str(),
++                            dsel_model > 1 ? " (also the DFlash2 draft count)" : "");
++                    for (const char* o : {"G6_S2_DSEL_DCOST", "G6_S2_DSEL_MCOST", "G6_S2_DSEL_MEACH"})
++                        if (getenv(o)) fprintf(stderr, "# warning: %s is ignored under G6_S2_DSEL_MODEL (the table's d, m, e)\n", o);
++                }
+                 if (R == 0 && h.dsel.on) fprintf(stderr, "# s2 drafter choice on: DFlash2 or MTP per round (dwell %d, margin %.2f, probe %d, "
+                                                     "drafting ms: DFlash2 %.2f, MTP %.2f + %.2f per chain step)\n",
+                                                     h.dsel.dwell, h.dsel.margin, h.dsel.probe, h.dsel.d.draft_round, h.dsel.m.draft_round,
+@@ -1356,7 +1386,8 @@ int main(int argc, char** argv)
+                 (kstop.mode ? " kstop " + std::to_string(kstop.mode) + " kmax " + std::to_string(kstop.kmax) + " tau " + std::to_string(kstop.tau[1]) + "," +
+                               std::to_string(kstop.tau[2]) + "," + std::to_string(kstop.tau[3]) + " seed3 " + std::to_string(kstop.seed3) : "") +
+                 (dfl_reuse ? " dflreuse " + std::to_string(dfl_reuse) + "/" + std::to_string(dfl_reuse_min) : "") +
+-                (draft_par ? " draftpar " + std::to_string(draft_par) : "");
++                (draft_par ? " draftpar " + std::to_string(draft_par) : "") +
++                (dsel_model ? " dselmodel " + std::to_string(dsel_model) + " " + dsel_tab.str() : "");
+             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
+                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
+             g6s2::ControlLinks links = g6s2::bootstrap(bc);
+diff --git a/engine/runtime/s2/native.cuh b/engine/runtime/s2/native.cuh
+index 9d9804a..d8906cc 100644
+--- a/engine/runtime/s2/native.cuh
++++ b/engine/runtime/s2/native.cuh
+@@ -22,7 +22,8 @@ inline long long s2_wall_ms() {
+ // kind's totals (GPU span = event to event; host input prep, launch call, fence wait) and the transition from the step
+ // before to that pair's totals (GPU idle = the previous step's end event to this step's start event; host = the previous
+ // fence to this launch's entry: accept, emit, drafter choice, step planning). Prints them every N main steps. The idle
+-// time is what launching the next step from the GPU could remove; the spans stay. Unset: no events, no stamps.
++// time is what launching the next step from the GPU could remove; the spans stay. Also the mean span per kind and row
++// count (tools/s2_dsel_table.py turns them into the drafter choice's cost table). Unset: no events, no stamps.
+ // G6_DRAFT_PAR: a solo DFlash2 round's drafter step (launched before the first form on its own stream, waited for after
+ // the first form and the chain) counts as dfl_ctx_par / dfl_query_par through par_*, with its own event pair: span = its
+ // GPU start to end on its stream (under the first form and chain, so it overlaps their spans), prep and launch as above,
+@@ -41,6 +42,9 @@ struct S2Timeline {
+     clk::time_point p_enter, p_pre, p_post, p_wait;
+     long n[NK] = {}, rows[NK] = {}, tn[NK][NK] = {}, mains = 0, breaks = 0;
+     double span[NK] = {}, prep[NK] = {}, call[NK] = {}, wait[NK] = {}, idle[NK][NK] = {}, host[NK][NK] = {};
++    static constexpr int MR = 16;       // per row count too, rows 1..MR (the drafter choice's cost table, s2_dsel_table.py)
++    long nm[NK][MR + 1] = {};
++    double sm[NK][MR + 1] = {};
+     static const char* name(int k) { static const char* s[NK] = {"main", "draft", "chain", "dfl_ctx", "dfl_query", "dfl_ctx_par", "dfl_query_par"}; return s[k]; }
+     static double ms(clk::time_point a, clk::time_point b) { return std::chrono::duration<double,std::milli>(b - a).count(); }
+     S2Timeline() {
+@@ -63,6 +67,7 @@ struct S2Timeline {
+         const auto t = clk::now();
+         float s = 0; G6RT_CK(cudaEventElapsedTime(&s, evp[0], evp[1]));
+         ++n[kind]; rows[kind] += M; span[kind] += s; prep[kind] += ms(p_enter, p_pre); call[kind] += ms(p_pre, p_post); wait[kind] += ms(p_wait, t);
++        if (M >= 1 && M <= MR) { ++nm[kind][M]; sm[kind][M] += s; }
+     }
+     // not a decode transition: a prefill quantum, a mode switch, the drafter's prompt fill
+     void cut() { have_prev = false; }
+@@ -72,6 +77,7 @@ struct S2Timeline {
+         const auto t = clk::now();
+         float s = 0; G6RT_CK(cudaEventElapsedTime(&s, ev[cur][0], ev[cur][1]));
+         ++n[kind]; rows[kind] += M; span[kind] += s; prep[kind] += ms(t_enter, t_pre); call[kind] += ms(t_pre, t_post); wait[kind] += ms(t_post, t);
++        if (M >= 1 && M <= MR) { ++nm[kind][M]; sm[kind][M] += s; }
+         if (have_prev) {
+             float g = 0; G6RT_CK(cudaEventElapsedTime(&g, ev[cur ^ 1][1], ev[cur][0]));
+             if (g > 20.f) ++breaks;      // an event fence or an idle engine in between, not a round's transition
+@@ -91,6 +97,9 @@ struct S2Timeline {
+             if (n[k])
+                 fprintf(stderr, "# s2_tl rank %d step %s n %ld rows %.2f span %.3f prep %.3f launch %.3f wait %.3f ms\n", rank, name(k), n[k],
+                         double(rows[k]) / n[k], span[k] / n[k], prep[k] / n[k], call[k] / n[k], wait[k] / n[k]);
++        for (int k = 0; k < NK; ++k)
++            for (int M = 1; M <= MR; ++M)
++                if (nm[k][M]) fprintf(stderr, "# s2_tl rank %d rows %s M %d n %ld span %.3f ms\n", rank, name(k), M, nm[k][M], sm[k][M] / nm[k][M]);
+         for (int a = 0; a < NK; ++a)
+             for (int b = 0; b < NK; ++b)
+                 if (tn[a][b])
+diff --git a/engine/runtime/s2/tests/batch_dselmodel_test.cpp b/engine/runtime/s2/tests/batch_dselmodel_test.cpp
+new file mode 100644
+index 0000000..7d315fb
+--- /dev/null
++++ b/engine/runtime/s2/tests/batch_dselmodel_test.cpp
+@@ -0,0 +1,267 @@
++// Drafter choice cost model (s2_batch.h DSelTable, DSel::model, G6_S2_DSEL_MODEL): the table parses to one canonical
++// form whatever its spelling, survives each request's fresh estimates, prices MTP rounds as the confidence stop runs
++// them (so a K-stop MTP that verifies three confident drafts wins where the fixed-K pricing keeps DFlash2, and one that
++// verifies one draft loses to a better DFlash2), ranks reading the same table make the same choices bit for bit, and
++// with the model off the steps are the ones without it. Host only, a fake engine.
++// Build: g++ -std=c++17 -O2 -I engine/runtime engine/runtime/s2/tests/batch_dselmodel_test.cpp -o /tmp/batch_dselmodel_test
++#include "s2_batch.h"
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <iterator>
++#include <tuple>
++using namespace s2;
++
++static int fails = 0;
++#define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
++
++static int target(int pos) { return (pos * 37 + 11) % 997; }    // the token at position pos + 1
++
++// MTP drafts right while mtp_ok(position in the round), with probability p_ok / p_bad; DFlash2's first dright drafts right
++struct Fake
++{
++    int dright = 3;
++    float p_ok = 0.95f, p_bad = 0.6f;
++    int mtp_depth = 99;       // MTP drafts d[1..mtp_depth] right, the later ones wrong
++    int idx = 0;              // the draft index of the last DRAFT (1) or CHAIN (2, 3) step
++    std::vector<float> lp;
++    std::vector<std::tuple<int, int, long>> trace;   // (kind, M, round) per step
++    std::vector<int> got;
++    Hooks hooks()
++    {
++        Hooks h;
++        h.run = [this](const Step& s) {
++            std::vector<int> out;
++            if (s.kind != Step::MAIN) { lp.clear(); idx = s.kind == Step::DRAFT ? 1 : idx + 1; }
++            for (const Row& r : s.r)
++            {
++                if (s.kind == Step::MAIN) { out.push_back(target(r.spos - 1)); continue; }
++                const bool ok = idx <= mtp_depth;
++                out.push_back(ok ? target(r.spos - 1) : -2);
++                lp.push_back(std::log(ok ? p_ok : p_bad));
++            }
++            trace.emplace_back((int)s.kind, s.M(), s.round);
++            return out;
++        };
++        h.dfl_start = [](int) { return 0; };
++        h.dfl = [this](const DflReq& r) {
++            DflDrafts o{};
++            const int q0 = r.pos0 + r.rows;
++            for (int i = 1; i < DFL_B; ++i) { o.tok[i] = i <= dright ? target(q0 + i - 1) : -1; o.lp[i] = i <= dright ? -0.05f : -3.f; }
++            return o;
++        };
++        h.emit = [this](int, const int* t, int k, int) { got.insert(got.end(), t, t + k); return false; };
++        h.lp = [this](int r) { return lp.at(r); };
++        return h;
++    }
++};
++static Session session()
++{
++    Session s; s.prompt.assign(10, 5); s.first = 9; s.chunk = 8; s.n_gen = 100000; s.dflash = true;
++    return s;
++}
++static bool exact(const std::vector<int>& got) { bool e = true; for (size_t i = 0; i < got.size(); ++i) e &= got[i] == target(9 + (int)i); return e; }
++static DSelTable table(const char* s)
++{
++    DSelTable t;
++    std::string err;
++    if (!t.parse(s, &err)) { std::printf("FAIL parse %s: %s\n", s, err.c_str()); ++fails; }
++    return t;
++}
++static const char* TAB = "v2:49.6,v3:57,v4:64,v8:104,d:6.9,m:2,e:1.17,p:4.9,g:2,k:3,n:3";
++static const char* TABW = "v2:49.6,v3:57,v4:64,v8:104,d:6.9,m:2,e:1.17,p:4.9,g:2,k:3,n:3,w:1";   // the estimates' prior at 1 round
++static DSel dsel(int model, const DSelTable& t, bool start_mtp = false)
++{
++    DSel sel;
++    sel.on = true; sel.start_mtp = start_mtp; sel.probe = 8;
++    sel.d.draft_round = 8.1; sel.m.draft_round = 2.9; sel.m.draft_each = 2.1;   // the fixed-K serving MCOST
++    sel.model = model; sel.tab = t;
++    return sel;
++}
++static KStop kstop3()
++{
++    KStop ks; ks.mode = 1; ks.kmax = 3; ks.tau[1] = 0; ks.tau[2] = 0.5; ks.tau[3] = 0.75;
++    return ks;
++}
++// rounds by drafter from the trace: a DFlash2 verify has 8 rows here (no --spec-adaptive), an MTP one 2..4
++static int count(const Fake& f, int M_lo, int M_hi, long from = 0)
++{
++    int n = 0;
++    for (const auto& t : f.trace) n += std::get<0>(t) == Step::MAIN && std::get<2>(t) >= from && std::get<1>(t) >= M_lo && std::get<1>(t) <= M_hi;
++    return n;
++}
++
++int main()
++{
++    // 1. the table: separators, comments, interpolation, extrapolation, the canonical form, refusals
++    {
++        const DSelTable a = table(TAB);
++        const DSelTable b = table("# a boot's table\n n:3  k:3 g:2\tp:4.9, e:1.17 m:2 d:6.9  v8:104 v4:64 # rows\n v3:57,,v2:49.6\n");
++        CHECK(a.str() == b.str());
++        CHECK(table(a.str().c_str()).str() == a.str());
++        CHECK(table("v2:49.60001,v3:57,v4:64,v8:104,d:6.9,m:2,e:1.17,p:4.9,g:2,k:3,n:3").str() == a.str());   // the 1e-4 grid
++        CHECK(table("v2:49.6001,v3:57,v4:64,v8:104,d:6.9,m:2,e:1.17,p:4.9,g:2,k:3,n:3").str() != a.str());
++        CHECK(std::fabs(a.v[1] - 42.2) < 1e-9);                  // below the first row: the v2-v3 slope
++        CHECK(std::fabs(a.v[6] - 84) < 1e-9);                    // between v4 and v8
++        CHECK(std::fabs(a.verify(3.5) - 60.5) < 1e-9 && std::fabs(a.verify(20) - 104) < 1e-9);
++        CHECK(a.str().find(' ') == std::string::npos && a.str().find(';') == std::string::npos);
++        for (const char* bad : {"", "v2:49.6,d:6.9,m:2,e:1", "v2:49.6,v3:57,m:2,e:1", "v2:49.6,v3:57,d:6.9,m:2,e:1,x:3",
++                                "v2:49.6,v3:57,d:6.9,m:2,e:-1", "v2:49.6,v3:57,d:6.9,m:2,e:1,v9:3", "v2:49.6,v3:57,d:6.9,m:2,e:nan",
++                                "v2:49.6,v3:57,d:6.9,m:2,e:1,k:3,n:2", "v2:49.6,v3:57,d:6.9,m:2,e", "v2:10,v3:57,d:1,m:1,e:1",
++                                "v2:0,v3:57,d:1,m:1,e:1", "v2:49.6,v3:57,d:6.9,m:2,e:1,w:0"})
++        {
++            DSelTable t;
++            std::string err;
++            CHECK(!t.parse(bad, &err) && !err.empty());
++        }
++    }
++    // 2. MTP under the stop verifies three confident right drafts (4 tokens per ~68 ms) against DFlash2's 3 of 7 (4 per
++    //    ~111 ms): the model moves to MTP and stays; the fixed-K pricing (MTP's second position at its seed, MCOST
++    //    2.9) keeps DFlash2. Every committed token is the target's either way
++    for (int model : {0, 1})
++    {
++        Fake f;
++        Batch b(2, 32, f.hooks());
++        b.dflash(7, g6rt::SpecLen());
++        b.dsel(dsel(model, table(TAB)));
++        b.kstop(kstop3());
++        b.admit({0}, {session()});
++        for (int i = 0; i < 200; ++i) CHECK(b.round({0}));
++        const int mtp = count(f, 2, 4, 100), dfl = count(f, 8, 8, 100);
++        if (model) CHECK(mtp > 90 && b.stats(0).switches >= 1);
++        else CHECK(dfl == 100 && b.stats(0).mtp_rounds == 0);
++        CHECK(exact(f.got));
++        if (model)
++        {   // the estimate is the closed form over what the MTP rounds were: 4 tokens at v4 + m + 2e, plus a probe share
++            const auto [rm, rd] = b.dsel_rates();
++            const DSel& s = b.dsel();
++            const double c = (s.rc + s.prior * (64 + 2 + 2 * 1.17)) / (s.rn + s.prior);
++            CHECK(std::fabs(c - (64 + 2 + 2 * 1.17)) < 1e-9);
++            CHECK(std::fabs(rm - (1 + s.m.rate(1) * 3) / (c + 4.9 / 8)) < 1e-12 && rm > 1.15 * rd);
++        }
++    }
++    // 3. MTP under the stop drafts d2 wrong and unsure (0.95 x 0.3 < 0.5), so it verifies one draft (2 tokens per ~53 ms)
++    //    against DFlash2's 5 of 7 (6 per ~111 ms): a request starting on MTP moves to DFlash2 and stays, although the
++    //    table's prior (g 2, three drafts) first prices MTP high
++    {
++        Fake f;
++        f.mtp_depth = 1;
++        f.p_bad = 0.3f;
++        f.dright = 5;
++        Batch b(2, 32, f.hooks());
++        b.dflash(7, g6rt::SpecLen());
++        b.dsel(dsel(1, table(TAB), true));
++        b.kstop(kstop3());
++        b.admit({0}, {session()});
++        for (int i = 0; i < 300; ++i) CHECK(b.round({0}));
++        CHECK(count(f, 2, 2, 0) > 0 && count(f, 3, 4, 0) == 0);  // MTP rounds verified one draft
++        CHECK(count(f, 8, 8, 200) >= 95);
++        CHECK(exact(f.got));
++    }
++    // 4. the table and the estimate's settings survive each request's fresh start (fresh() used to drop the table)
++    {
++        Fake f;
++        Batch b(2, 32, f.hooks());
++        b.dflash(7, g6rt::SpecLen());
++        const DSelTable t = table(TABW);
++        b.dsel(dsel(1, t));
++        b.kstop(kstop3());
++        std::vector<char> seq[2];
++        for (int req = 0; req < 2; ++req)
++        {
++            f.trace.clear();
++            b.admit({0}, {session()});
++            for (int i = 0; i < 60; ++i) CHECK(b.round({0}));
++            for (int j = 1; j <= DSelTable::VX; ++j) CHECK(b.dsel().m.table[j] == t.v[j] && b.dsel().d.table[j] == t.v[j]);
++            CHECK(b.dsel().d.draft_round == 6.9 && b.dsel().m.draft_round == 2 && b.dsel().m.draft_each == 1.17);
++            CHECK(b.dsel().d.prior == 1 && b.dsel().m.prior == 1);   // w
++            for (const auto& x : f.trace) if (std::get<0>(x) == Step::MAIN && std::get<2>(x) >= 0) seq[req].push_back(std::get<1>(x) == 8 ? 'd' : 'm');
++            b.cancel(0); b.release(0);
++        }
++        CHECK(seq[0] == seq[1] && !seq[0].empty());                     // the second request decides as the first did
++        DSel off = dsel(0, t);                                          // model off: the constants, the default table
++        Batch c(2, 32, f.hooks());
++        c.dflash(7, g6rt::SpecLen());
++        c.dsel(off);
++        CHECK(c.dsel().m.table[3] == g6rt::SpecLen().table[3] && c.dsel().m.draft_round == 2.9 && c.dsel().m.prior == 4);
++    }
++    // 5. four ranks, each with the table spelled differently (inline, reordered, from a file with a digit past the grid,
++    //    canonical): the same steps and the same estimates, bit for bit, every round. MTP verifies two of three drafts,
++    //    then DFlash2 drafts six right: with the prior at one round (w) the choice moves to MTP and back
++    {
++        const std::string path = "batch_dselmodel_test.table";
++        { std::ofstream o(path); o << "# from a file\nv8:104\nv4:64\nv3:57.00001\nv2:49.6\nd:6.9 m:2 e:1.17 p:4.9\ng:2 k:3 n:3 w:1 # prior\n"; }
++        std::ifstream in(path);
++        const std::string file((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
++        std::remove(path.c_str());
++        const DSelTable t0 = table(TABW);
++        const std::string spell[4] = {TABW, "w:1,n:3,k:3,g:2,p:4.9,e:1.17,m:2,d:6.9,v8:104,v4:64,v3:57,v2:49.6", file, t0.str()};
++        Fake f[4];
++        std::vector<Batch> r;
++        for (int k = 0; k < 4; ++k)
++        {
++            f[k].dright = 3; f[k].mtp_depth = 2;   // MTP: two right, the third wrong; the choice moves both ways
++            r.emplace_back(2, 32, f[k].hooks());
++            r[k].dflash(7, g6rt::SpecLen());
++            r[k].dsel(dsel(1, table(spell[k].c_str())));
++            r[k].kstop(kstop3());
++            r[k].admit({0}, {session()});
++            CHECK(r[k].dsel().tab.str() == t0.str());
++        }
++        bool same = true;
++        for (int i = 0; i < 500; ++i)
++        {
++            if (i == 150) for (auto& x : f) x.dright = 6;          // the text changes: DFlash2 drafts better
++            for (int k = 0; k < 4; ++k) CHECK(r[k].round({0}));
++            const auto a = r[0].dsel_rates();
++            for (int k = 1; k < 4; ++k)
++            {
++                const auto b = r[k].dsel_rates();
++                same &= std::memcmp(&a.first, &b.first, sizeof a.first) == 0 && std::memcmp(&a.second, &b.second, sizeof a.second) == 0;
++            }
++        }
++        CHECK(same);
++        for (int k = 1; k < 4; ++k) CHECK(f[k].trace == f[0].trace && r[k].stats(0).switches == r[0].stats(0).switches);
++        CHECK(r[0].stats(0).switches >= 2 && r[0].stats(0).mtp_rounds > 20 && count(f[0], 8, 8, 450) > 45);
++        for (const auto& x : f) CHECK(exact(x.got));
++    }
++    // 6. model off with a table given: the steps of a DSel without one (byte-identical to before the model)
++    {
++        std::vector<std::tuple<int, int, long>> ref;
++        for (int arm = 0; arm < 2; ++arm)
++        {
++            Fake f;
++            f.mtp_depth = 2;
++            Batch b(2, 32, f.hooks());
++            b.dflash(7, g6rt::SpecLen());
++            b.dsel(dsel(0, arm ? table(TAB) : DSelTable()));
++            b.kstop(kstop3());
++            b.admit({0}, {session()});
++            for (int i = 0; i < 200; ++i) { CHECK(b.round({0})); if (i == 100) f.dright = 6; }
++            if (!arm) ref = f.trace;
++            else CHECK(f.trace == ref);
++        }
++    }
++    // 7. model 2: the DFlash2 rounds' own draft count (--spec-adaptive) prices its verify from the table too. With an
++    //    8-row verify at 1000 ms it stops verifying seven drafts; model 1 keeps spec_len.h's table and verifies seven
++    for (int model : {1, 2})
++    {
++        Fake f;
++        f.dright = 7; f.mtp_depth = 0;              // DFlash2 drafts all right, MTP's first draft wrong: no MTP rounds
++        g6rt::SpecLen sl;
++        sl.on = true; sl.set_levels({1, 2, 3, 4, 5, 6, 7}); sl.draft_round = 5.6;
++        Batch b(2, 32, f.hooks());
++        b.dflash(7, sl);
++        b.dsel(dsel(model, table("v2:49.6,v3:57,v4:64,v7:96,v8:1000,d:6.9,m:2,e:1.17,p:4.9")));
++        b.kstop(kstop3());
++        b.admit({0}, {session()});
++        for (int i = 0; i < 60; ++i) CHECK(b.round({0}));
++        const int full = count(f, 8, 8, 20), seven = count(f, 7, 7, 20);
++        if (model == 1) CHECK(full == 40);
++        else CHECK(full == 0 && seven == 40);
++        CHECK(exact(f.got));
++    }
++    std::printf("batch_dselmodel_test: %s\n", fails ? "FAIL" : "PASS");
++    return fails ? 1 : 0;
++}
+diff --git a/engine/runtime/s2_batch.h b/engine/runtime/s2_batch.h
+index 07982b8..ebccb55 100644
+--- a/engine/runtime/s2_batch.h
++++ b/engine/runtime/s2_batch.h
+@@ -26,7 +26,8 @@
+ // every rank chooses the same). On MTP rounds the drafter still takes the accepted rows as context, so a switch back
+ // needs no catch-up; every DSel::probe-th of them also drafts, and its 7 drafts are scored against the tokens later
+ // rounds commit. On DFlash2 rounds the MTP first-form pass already drafts d[1], which scores MTP's first position. The
+-// estimates start afresh with each request.
++// estimates start afresh with each request. G6_S2_DSEL_MODEL: the costs come from one frozen table (DSelTable), and MTP
++// rounds are priced as the confidence stop runs them.
+ // Confidence stop (Batch::kstop, G6_MTP_KSTOP): a solo DFlash2 session's MTP rounds draft and verify k <= KStop::kmax
+ // MTP drafts, chosen from the drafts' log-probabilities under the MTP head (StepOut::lp, Hooks::lp): the chain stops
+ // before a draft that could not be verified, and the verify takes the drafts that pass. The log-probabilities are the
+@@ -43,8 +44,10 @@
+ // No CUDA types: the engine adapter (m4sim / g6m4) turns a Step into its StepIn and per-session layout.
+ #pragma once
+ #include <algorithm>
++#include <cctype>
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <functional>
+ #include <stdexcept>
+ #include <string>
+@@ -176,6 +179,117 @@ inline bool dsel_env() { const char* e = getenv("G6_S2_DSEL"); return !e || atoi
+ // step before the MTP first form, on its own stream, and waits for it at the end of the round (after the chain on MTP).
+ // Both are fixed graphs on separate weights, scratch and fabrics, so each one's output bytes are as serial; 0 = serial
+ inline int draft_par_env() { const char* e = getenv("G6_DRAFT_PAR"); return e ? atoi(e) : 0; }
++// G6_S2_DSEL_MODEL=1|2 with G6_S2_DSEL_TABLE (every rank, read at boot; DSel::model): the drafter choice prices both
++// drafters from one frozen cost table in place of the drafting constants (G6_S2_DSEL_DCOST / _MCOST / _MEACH) and
++// spec_len.h's verify table, and prices MTP rounds as the active confidence stop (KStop) runs them, not as K drafts.
++// 2: the DFlash2 rounds' own draft count (--spec-adaptive, Batch::dflash) uses the table too. The table is a list of
++// key:value separated by commas or white space ('#' to the line's end is a comment), given inline or as the path of a
++// file holding it; its canonical form goes into the S2 runtime signature, so ranks with different tables do not start:
++//   v<M>     a verify step of M rows, ms (M 1..8; rows not given are interpolated, and extrapolated past the ends)
++//   d        a DFlash2 round's drafting: the MTP first form and the drafter's query step
++//   m        an MTP round's drafting: the first form and the drafter's context-only step
++//   e        an MTP chain step
++//   p        a probe's extra: the drafter's query step over its context-only one (p / DSel::probe per MTP round)
++//   g k n    MTP rounds under the confidence stop, as the prior of a request's estimate: the drafts accepted after the
++//            first when the first is (g), drafts verified (k) and drafted (n) per round. Default: K, K, the seeds
++//   w        the acceptance estimates' prior in rounds (SpecLen::prior, default 4). With decay 0.9 the seed keeps
++//            w / (w + 10) of every rate, and the positions of a round compound it: at 4 a DFlash2 block whose 7 drafts
++//            are all accepted is expected to commit 6.1 tokens, not 8 (at 1: 7.3), which favours MTP's shorter rounds
++// tools/s2_dsel_table.py writes it from a G6_S2_TIMELINE (+ G6_MTP_LPLOG) boot. Measured once and frozen: step times
++// differ per rank, and a decision that differs between ranks hangs the fabric (spec_len.h).
++struct DSelTable
++{
++    static constexpr int VX = g6rt::SpecLen::KX + 1;    // verify rows 1..VX
++    double v[VX + 1] = {};
++    double d = 0, m = 0, e = 0, p = 0;
++    double g = -1, k = 0, n = 0;                        // the MTP prior (-1 / 0: not given)
++    double w = 0;                                       // SpecLen::prior (0: not given)
++    // the verify ms of a fractional row count (the prior's mean drafts), linear between rows
++    double verify(double rows) const
++    {
++        rows = std::min(std::max(rows, 1.0), (double)VX);
++        const int a = std::min((int)rows, VX - 1);
++        return v[a] + (rows - a) * (v[a + 1] - v[a]);
++    }
++    // the table's text (an inline list, or a file's contents); false with *err on a bad key or value
++    bool parse(const std::string& text, std::string* err)
++    {
++        *this = DSelTable();
++        auto fail = [&](const std::string& w) { *err = "G6_S2_DSEL_TABLE: " + w; return false; };
++        bool have[VX + 1] = {}, hd = false, hm = false, he = false;
++        std::string s;
++        for (size_t i = 0; i < text.size(); ++i)
++        {   // comments out, every separator a space
++            if (text[i] == '#') { while (i < text.size() && text[i] != '\n') ++i; s += ' '; continue; }
++            s += text[i] == ',' || std::isspace((unsigned char)text[i]) ? ' ' : text[i];
++        }
++        size_t a = 0;
++        while ((a = s.find_first_not_of(' ', a)) != std::string::npos)
++        {
++            const size_t b = std::min(s.find(' ', a), s.size());
++            const std::string item = s.substr(a, b - a);
++            a = b;
++            const size_t c = item.find(':');
++            if (c == std::string::npos) return fail("'" + item + "' is not key:value");
++            const std::string key = item.substr(0, c), val = item.substr(c + 1);
++            char* end = nullptr;
++            const double x = q(strtod(val.c_str(), &end));
++            if (val.empty() || *end || !std::isfinite(x) || x < 0) return fail("'" + item + "': not a number >= 0");
++            if (key.size() == 2 && key[0] == 'v' && key[1] >= '1' && key[1] <= '0' + VX)
++            {
++                const int r = key[1] - '0';
++                if (!(x > 0)) return fail("'" + item + "': a verify step takes time");
++                v[r] = x; have[r] = true;
++            }
++            else if (key == "d") { d = x; hd = true; }
++            else if (key == "m") { m = x; hm = true; }
++            else if (key == "e") { e = x; he = true; }
++            else if (key == "p") p = x;
++            else if (key == "g") g = x;
++            else if (key == "k") k = x;
++            else if (key == "n") n = x;
++            else if (key == "w") { if (!(x > 0)) return fail("'" + item + "': the prior needs weight"); w = x; }
++            else return fail("unknown key '" + key + "' (v1..v" + std::to_string(VX) + ", d, m, e, p, g, k, n, w)");
++        }
++        std::vector<int> rs;
++        for (int r = 1; r <= VX; ++r) if (have[r]) rs.push_back(r);
++        if (rs.size() < 2 || !hd || !hm || !he) return fail("needs two or more verify rows v<M>, and d, m and e");
++        if ((k && (k < 1 || k > VX - 1)) || (n && (n < 1 || n > VX - 1)) || (k && n && n < k))
++            return fail("k and n are mean draft counts, 1 <= k <= n");
++        for (int r = 1; r <= VX; ++r)
++        {
++            if (have[r]) continue;
++            size_t j = 1;                 // the pair of given rows around r (or the nearest pair past an end)
++            while (j + 1 < rs.size() && rs[j] < r) ++j;
++            const int lo = rs[j - 1], hi = rs[j];
++            v[r] = q(v[lo] + (v[hi] - v[lo]) * (r - lo) / (hi - lo));
++            if (!(v[r] > 0)) return fail("v" + std::to_string(r) + " extrapolates to " + std::to_string(v[r]) + " ms");
++        }
++        return true;
++    }
++    // every value on a 1e-4 grid, so the canonical form below is equal exactly when the doubles are
++    static double q(double x) { return std::isfinite(x) ? std::round(x * 1e4) / 1e4 : x; }
++    // canonical form: every rank that read the same table prints the same bytes
++    std::string str() const
++    {
++        std::string s;
++        char b[64];
++        for (int r = 1; r <= VX; ++r) { snprintf(b, sizeof b, "v%d:%.10g,", r, v[r]); s += b; }
++        snprintf(b, sizeof b, "d:%.10g,m:%.10g,e:%.10g,p:%.10g", d, m, e, p); s += b;
++        if (g >= 0) { snprintf(b, sizeof b, ",g:%.10g", g); s += b; }
++        if (k > 0) { snprintf(b, sizeof b, ",k:%.10g", k); s += b; }
++        if (n > 0) { snprintf(b, sizeof b, ",n:%.10g", n); s += b; }
++        if (w > 0) { snprintf(b, sizeof b, ",w:%.10g", w); s += b; }
++        return s;
++    }
++    // a SpecLen's verify table, drafting ms and prior weight
++    void price(g6rt::SpecLen& s, double round, double each) const
++    {
++        std::copy(v + 1, v + VX + 1, s.table + 1);
++        s.draft_round = round; s.draft_each = each;
++        if (w > 0) s.prior = w;
++    }
++};
+ struct DSel
+ {
+     bool on = false;
+@@ -187,6 +301,13 @@ struct DSel
+     bool start_mtp = false;
+     bool posclk = false;              // G6_S2_DSEL_POSCLK=1: d and m keep a clock per position (SpecLen::posclk)
+     g6rt::SpecLen d, m;               // DFlash2 and MTP estimates; draft_round / draft_each hold each round's drafting ms
++    int model = 0;                    // G6_S2_DSEL_MODEL (above): 0 = the constants in d and m; 1, 2 = tab
++    DSelTable tab;
++    // model: the request's MTP rounds, decayed as m's positions (SpecLen::pos_decay) per MTP round: rounds and their
++    // table cost (ms), rounds whose first draft was accepted and the drafts accepted after it. The table's prior counts
++    // as `prior` rounds: it decides until the request has MTP rounds, then keeps ~9% (SpecLen's 4 would keep 29%)
++    double rn = 0, rc = 0, an = 0, ag = 0;
++    double prior = 1;
+ };
+ // G6_MTP_KSTOP (every rank, read at boot; Batch::kstop): how many MTP drafts a solo DFlash2 session's MTP round verifies.
+ //   0  off: K every round
+@@ -249,8 +370,17 @@ public:
+     // choose each round's draft count (k <= K); off: every round verifies K drafts
+     void adapt(bool on) { adapt_ = on; }
+     // DFlash2 sessions verify up to kv of the 7 drafts; sl: the plain build's --spec-adaptive policy (sl.on = false: kv)
+-    void dflash(int kv, const g6rt::SpecLen& sl) { dkv_ = kv; dsl_ = sl; }
+-    void dsel(const DSel& d) { sel_ = d; sel_.d.posclk = sel_.m.posclk = d.posclk; kstop(ks_); }
++    void dflash(int kv, const g6rt::SpecLen& sl) { dkv_ = kv; dsl_ = sl; price(); }
++    void dsel(const DSel& d) { sel_ = d; sel_.d.posclk = sel_.m.posclk = d.posclk; price(); kstop(ks_); }
++    const DSel& dsel() const { return sel_; }
++    // the drafter choice's tokens per ms of an MTP round and of a DFlash2 round, as next_mtp compares them
++    std::pair<double, double> dsel_rates() const
++    {
++        double rd = 0;
++        if (dsl_.on) { for (int k : dsl_.levels) rd = std::max(rd, sel_.d.ratio(k, nullptr, k)); }
++        else rd = sel_.d.ratio(dkv_, nullptr, dkv_);
++        return {sel_.model ? mtp_rate() : sel_.m.ratio(K_, nullptr, K_), rd};
++    }
+     // solo MTP rounds' draft count (KStop; mode 2 sets DSel::m's levels and third-position seed, so call it after dsel)
+     void kstop(const KStop& k)
+     {
+@@ -276,7 +406,7 @@ public:
+         x.lo = (int)x.tokens.size() - 1;
+         x.warm = x.lo + std::max(1, reuse_.min);
+         x.pb = -1; x.since = 0; x.mn = 0;
+-        if (sel_.on) { sel_.d = fresh(sel_.d); sel_.m = fresh(sel_.m); }
++        if (sel_.on) restart();
+         Stats& s = stats_[q];
+         if ((int)s.acc.size() < DFL_B) s.acc.resize(DFL_B, 0);
+         s.promoted = s.dfl_lo = x.lo; s.dfl_warm = x.warm;
+@@ -485,6 +615,12 @@ private:
+     {
+         St& x = st_[q];
+         nm = sel_.on && next_mtp(x);
++        if (ks_.log && sel_.on && sel_.model)
++        {   // G6_MTP_LPLOG with DSel::model: the tokens per ms the choice compares after this round, and its MTP means
++            const auto [rm, rd] = dsel_rates();
++            fprintf(stderr, "# dsel round %ld slot %d rm %.6f rd %.6f c1 %.4f mtp_rounds %.3f ms %.3f g %.4f next %s\n", cur_round_, q, rm, rd,
++                    sel_.m.rate(1), sel_.rn, sel_.rn > 0 ? sel_.rc / sel_.rn : 0., sel_.an > 0 ? sel_.ag / sel_.an : 0., nm ? "mtp" : "dfl");
++        }
+         if (x.warm) { nm = base + a + 1 < x.warm; if (!nm) x.warm = 0; }   // G6_DFL_REUSE warm-up: DFlash2 once it is over
+         if (nm != x.mtp) { x.since = 0; ++stats_[q].switches; }
+         ++x.since;
+@@ -605,6 +741,13 @@ private:
+             return;
+         }
+         sel_.m.observe(k, a, ml, pe);
++        if (sel_.model)
++        {   // the round as drafted (x.k) and verified (k); the cost is the table's, never this rank's clock
++            const double f = sel_.m.pos_decay;
++            sel_.rn = sel_.rn * f + 1; sel_.rc = sel_.rc * f + mtp_cost(k, x.k);
++            sel_.an *= f; sel_.ag *= f;
++            if (a >= 1) { sel_.an += 1; sel_.ag += a - 1; }
++        }
+         probe_score(x);
+     }
+     // a probe's drafts pd[j] are for positions pb + j; score them once a mismatch or all DFL_B - 1 are committed
+@@ -622,17 +765,48 @@ private:
+     bool next_mtp(const St& x) const
+     {
+         if (x.since < sel_.dwell) return x.mtp;
+-        double rd = 0;
+-        if (dsl_.on) { for (int k : dsl_.levels) rd = std::max(rd, sel_.d.ratio(k, nullptr, k)); }
+-        else rd = sel_.d.ratio(dkv_, nullptr, dkv_);
+-        const double rm = sel_.m.ratio(K_, nullptr, K_);
++        const auto [rm, rd] = dsel_rates();
+         return x.mtp ? rm * (1 + sel_.margin) >= rd : rm > rd * (1 + sel_.margin);
+     }
++    // DSel::model: an MTP round's tokens per ms under the confidence stop. It commits 1 + c_1 (1 + g) tokens: c_1 = MTP's
++    // first-position rate, which every round teaches (DFlash2 rounds score d[1]); g = the drafts accepted after the first
++    // when the first is, which only MTP rounds teach, so before them the table's prior holds. It costs the mean table
++    // cost of the request's MTP rounds (verify k + 1 rows, m, e per chain step), plus its share of a probe. Both means
++    // shrink toward the table's prior (DSel::prior rounds)
++    double mtp_rate() const
++    {
++        const DSelTable& t = sel_.tab;
++        const double w = sel_.prior;
++        double g0 = t.g;
++        if (g0 < 0) { g0 = 0; double s = 1; for (int j = 2; j <= K_; ++j) { s *= sel_.m.seed[j]; g0 += s; } }
++        const double k0 = t.k > 0 ? t.k : K_, n0 = t.n > 0 ? t.n : std::max<double>(K_, k0);
++        const double c0 = t.verify(k0 + 1) + t.m + t.e * (n0 - 1);
++        const double g = (sel_.ag + w * g0) / (sel_.an + w), c = (sel_.rc + w * c0) / (sel_.rn + w);
++        return (1 + sel_.m.rate(1) * (1 + g)) / (c + t.p / sel_.probe);
++    }
++    double mtp_cost(int k, int nd) const { return sel_.tab.verify(k + 1) + sel_.tab.m + sel_.tab.e * std::max(0, nd - 1); }
++    // DSel::model: the table's costs in the drafter choice's estimates (2: also in the DFlash2 rounds' own draft count)
++    void price()
++    {
++        if (!sel_.model) return;
++        sel_.tab.price(sel_.d, sel_.tab.d, 0);
++        sel_.tab.price(sel_.m, sel_.tab.m, sel_.tab.e);
++        if (sel_.model >= 2) sel_.tab.price(dsl_, sel_.tab.d, 0);
++    }
++    // the drafter choice learns each request afresh; its settings (the verify table included) stay
++    void restart()
++    {
++        sel_.d = fresh(sel_.d);
++        sel_.m = fresh(sel_.m);
++        sel_.rn = sel_.rc = sel_.an = sel_.ag = 0;
++    }
+     static g6rt::SpecLen fresh(const g6rt::SpecLen& o)
+     {
+         g6rt::SpecLen f;
+         f.on = o.on; f.levels = o.levels; f.draft_round = o.draft_round; f.draft_each = o.draft_each; f.posclk = o.posclk;
+         std::copy(o.seed, o.seed + g6rt::SpecLen::KX + 1, f.seed);
++        std::copy(o.table, o.table + g6rt::SpecLen::KX + 2, f.table);
++        f.pos_decay = o.pos_decay; f.bucket_decay = o.bucket_decay; f.prior = o.prior;
+         return f;
+     }
+     // the draft count for the next round of sessions qs: the k with the most expected tokens per ms of the round
+@@ -735,8 +909,7 @@ private:
+         x.armed = p.ins.on();
+         if (x.dfl && sel_.on)             // drafter choice learns each request afresh: the last request's text says little
+         {
+-            sel_.d = fresh(sel_.d);
+-            sel_.m = fresh(sel_.m);
++            restart();
+             x.mtp = sel_.start_mtp;
+         }
+         if (x.dfl && !(h_.dfl && h_.dfl_start)) throw std::runtime_error("s2: DFlash2 session without drafter hooks");
+diff --git a/frontend/README.md b/frontend/README.md
+index e3298a5..8210c6a 100644
+--- a/frontend/README.md
++++ b/frontend/README.md
+@@ -216,7 +216,7 @@ tools/s2_costfit.py engine_rank0.log [--residuals] [--json]   # also ms per whol
+ tools/s2_costfit.py --selftest
+ ```
+ 
+-`G6_S2_TIMELINE=N` (every rank, through `G6ENV_X`) splits the time between decode steps into GPU work and host round trip. Every N main steps each rank prints `# s2_tl rank R mains N: per main step: GPU idle <ms> (host between steps <ms>), drafting GPU span <ms>`, then per step kind (`main`, `draft`, `chain`, `dfl_ctx`, `dfl_query`) the mean GPU span (CUDA events around the graph launch), host input prep, launch call and fence wait, and per transition (`main>draft`, `draft>dfl_ctx`, ...) the mean GPU idle from one step's end to the next step's start and the host time from the fence to the next launch. The GPU idle is the part a device-side accept and launch could remove. Gaps over 20 ms (event fences, an idle engine) count as `breaks`, not transitions. With `G6_DRAFT_PAR` a solo DFlash2 round's drafter step on its own stream is `dfl_ctx_par` / `dfl_query_par`: span = its GPU start to end on that stream (overlapping the first form and chain), wait = the wait at the end of the round alone (the tail they did not hide); it is in no transition. Off, it costs nothing.
++`G6_S2_TIMELINE=N` (every rank, through `G6ENV_X`) splits the time between decode steps into GPU work and host round trip. Every N main steps each rank prints `# s2_tl rank R mains N: per main step: GPU idle <ms> (host between steps <ms>), drafting GPU span <ms>`, then per step kind (`main`, `draft`, `chain`, `dfl_ctx`, `dfl_query`) the mean GPU span (CUDA events around the graph launch), host input prep, launch call and fence wait, and per transition (`main>draft`, `draft>dfl_ctx`, ...) the mean GPU idle from one step's end to the next step's start and the host time from the fence to the next launch. The GPU idle is the part a device-side accept and launch could remove. Gaps over 20 ms (event fences, an idle engine) count as `breaks`, not transitions. With `G6_DRAFT_PAR` a solo DFlash2 round's drafter step on its own stream is `dfl_ctx_par` / `dfl_query_par`: span = its GPU start to end on that stream (overlapping the first form and chain), wait = the wait at the end of the round alone (the tail they did not hide); it is in no transition. Off, it costs nothing. It also prints the mean GPU span per step kind and row count (`# s2_tl rank R rows <kind> M <rows> n <steps> span <ms> ms`). `tools/s2_dsel_table.py rank*.log` turns a boot's lines (with `G6_MTP_LPLOG=1` on rank 0 for the MTP rounds' accept counts) into the drafter choice's cost table, `G6_S2_DSEL_TABLE`; `--selftest` runs its tests.
+ 
+ ## Mock engine and tests
+ 
+diff --git a/scripts/host_tests.sh b/scripts/host_tests.sh
+index a184297..e41392d 100755
+--- a/scripts/host_tests.sh
++++ b/scripts/host_tests.sh
+@@ -1,7 +1,7 @@
+ #!/bin/bash
+ # Host-only tests (g++, no CUDA): the switchless relay's ring and credit accounting, the S2 batch planner
+-# (engine/runtime/s2_batch.h, with a DFlash2 session, its reuse (G6_DFL_REUSE), the insert rule and the MTP confidence
+-# stop), the S2 control barrier, the pool's page lists and prefix reuse (s2/pool.h over the Rust pool in engine/kvman-rs, and pool_diff_test: that pool against the C++ one
++# (engine/runtime/s2_batch.h, with a DFlash2 session, its reuse (G6_DFL_REUSE), the insert rule, the MTP confidence
++# stop and the drafter choice's cost table (G6_S2_DSEL_MODEL, with tools/s2_dsel_table.py)), the S2 control barrier, the pool's page lists and prefix reuse (s2/pool.h over the Rust pool in engine/kvman-rs, and pool_diff_test: that pool against the C++ one
+ # it replaced), runs that grow on demand through Driver::step (driver_grow_test, with insert rules), the scheduler's
+ # prefill choice and its deferral bound (scheduler_fair_test), its notice target's sizing (scheduler_horizon_test),
+ # the pool's block
+@@ -34,6 +34,9 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
+ "$T/batch_insert_test"
+ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_kstop_test.cpp" -o "$T/batch_kstop_test"
+ "$T/batch_kstop_test"
++g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_dselmodel_test.cpp" -o "$T/batch_dselmodel_test"
++"$T/batch_dselmodel_test"
++python3 "$REPO/tools/s2_dsel_table.py" --selftest
+ g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/capture_barrier_test.cpp" -o "$T/capture_barrier_test"
+ "$T/capture_barrier_test"
+ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_reuse_test.cpp" "${KVLIB[@]}" -o "$T/pool_reuse_test"
+diff --git a/tools/s2_dsel_table.py b/tools/s2_dsel_table.py
+new file mode 100755
+index 0000000..2ce1e03
+--- /dev/null
++++ b/tools/s2_dsel_table.py
+@@ -0,0 +1,248 @@
++#!/usr/bin/env python3
++"""Write the drafter choice's cost table (G6_S2_DSEL_TABLE, engine/runtime/s2_batch.h DSelTable) from one boot's logs.
++
++Input: rank logs (stderr) of a boot with G6_S2_TIMELINE=N on every rank, and on rank 0 G6_MTP_LPLOG=1 (the "# kstop"
++lines). Every "# s2_tl" block is cumulative, so the last one of each rank counts; the ranks are averaged. Lines used:
++  # s2_tl rank R step <kind> n N rows X span S prep P launch L wait W ms      per step kind, mean GPU span
++  # s2_tl rank R rows <kind> M <rows> n N span S ms                          per step kind and row count
++  # s2_tl rank R trans <a>><b> n N idle I host H ms                          GPU idle between two steps
++  # kstop round .. slot .. n .. <mtp|dfl> base B k K nd ND a A ...            one per solo round (rank 0)
++Optionally (--roundlog) "# s2_round" lines (G6_S2_ROUNDLOG=1) give the verify ms by rows where no "rows main" line does.
++
++A step costs its GPU span plus the mean GPU idle before a step of its kind (the host's accept, emit and planning):
++  v<M> = main span at M rows + idle before main                 (rows with at least --min-n steps)
++  f    = the first-form draft step; on DFlash2 and MTP rounds it takes a + 1 rows, so with "# kstop" lines it is the
++         per-row span weighted by each drafter's accept counts, else the mean over all of them
++  d    = f(DFlash2 rounds) + dfl_query          m = f(MTP rounds) + dfl_ctx          e = chain
++  p    = dfl_query - dfl_ctx (a probe is a query in place of a context-only step)
++  g k n from the MTP rounds (at least --min-n): drafts accepted after the first when the first is, verified, drafted.
++The table goes to stdout (one line, for G6ENV_X), the derivation to stderr.
++
++  s2_dsel_table.py LOG [LOG ...] [--min-n 30] [--roundlog] [--no-prior]
++  s2_dsel_table.py --selftest
++"""
++import argparse
++import re
++import statistics
++import sys
++import unittest
++
++KINDS = ('main', 'draft', 'chain', 'dfl_ctx', 'dfl_query')
++VX = 8
++STEP = re.compile(r'# s2_tl rank (\d+) step (\w+) n (\d+) rows ([\d.]+) span ([\d.]+) prep ([\d.]+) launch ([\d.]+) wait ([\d.]+) ms')
++ROWS = re.compile(r'# s2_tl rank (\d+) rows (\w+) M (\d+) n (\d+) span ([\d.]+) ms')
++TRANS = re.compile(r'# s2_tl rank (\d+) trans (\w+)>(\w+) n (\d+) idle ([\d.]+) host ([\d.]+) ms')
++KSTOP = re.compile(r'# kstop round (-?\d+) slot \d+ n \d+ (mtp|dfl) base \d+ k (\d+) nd (\d+) a (\d+)')
++RLOG = re.compile(r'# s2_round step \d+ main round (-?\d+) active \d+ S \d+ M (\d+) ms ([\d.]+) path solo')
++
++
++def read(paths, roundlog=False):
++    """-> dict: step[rank][kind] = (n, span), rows[rank][(kind, M)] = (n, span), trans[rank][(a, b)] = (n, idle),
++    rounds = [(kind, k, nd, a)] (rank 0's kstop lines), rlog = {M: [ms]}. Later blocks of a rank replace earlier ones."""
++    out = {'step': {}, 'rows': {}, 'trans': {}, 'rounds': [], 'rlog': {}}
++    for p in paths:
++        with open(p, errors='replace') as f:
++            for ln in f:
++                m = STEP.search(ln)
++                if m:
++                    out['step'].setdefault(int(m.group(1)), {})[m.group(2)] = (int(m.group(3)), float(m.group(5)))
++                    continue
++                m = ROWS.search(ln)
++                if m:
++                    out['rows'].setdefault(int(m.group(1)), {})[(m.group(2), int(m.group(3)))] = (int(m.group(4)), float(m.group(5)))
++                    continue
++                m = TRANS.search(ln)
++                if m:
++                    out['trans'].setdefault(int(m.group(1)), {})[(m.group(2), m.group(3))] = (int(m.group(4)), float(m.group(5)))
++                    continue
++                m = KSTOP.search(ln)
++                if m:
++                    out['rounds'].append((m.group(2), int(m.group(3)), int(m.group(4)), int(m.group(5))))
++                    continue
++                m = RLOG.search(ln) if roundlog else None
++                if m and int(m.group(1)) >= 0:
++                    out['rlog'].setdefault(int(m.group(2)), []).append(float(m.group(3)))
++    return out
++
++
++def rank_mean(per_rank, key, min_n=1):
++    """mean over the ranks that have key with at least min_n samples -> (n of rank 0 or the first, value) or None"""
++    vals = [d[key] for d in per_rank.values() if key in d and d[key][0] >= min_n]
++    if not vals:
++        return None
++    return vals[0][0], sum(v[1] for v in vals) / len(vals)
++
++
++def idle_before(trans, kind):
++    """mean GPU idle before a step of this kind, over every predecessor and rank"""
++    n = s = 0.0
++    for d in trans.values():
++        for (a, b), (c, idle) in d.items():
++            if b == kind:
++                n += c
++                s += c * idle
++    return s / n if n else 0.0
++
++
++def first_form(lg, kind_rounds, min_n):
++    """the first-form step's cost on rounds of one drafter: the per-row spans weighted by that drafter's a + 1, or the
++    mean over all first forms when there are no accept counts or a row count was never seen"""
++    pooled = rank_mean(lg['step'], 'draft')
++    if pooled is None:
++        raise SystemExit('no "# s2_tl ... step draft" line: was G6_S2_TIMELINE set?')
++    if not kind_rounds:
++        return pooled[1], 'pooled'
++    w = {}
++    for _, _, _, a in kind_rounds:
++        w[a + 1] = w.get(a + 1, 0) + 1
++    s = 0.0
++    for M, c in w.items():
++        r = rank_mean(lg['rows'], ('draft', M), 1)
++        if r is None:
++            return pooled[1], 'pooled (no draft span at %d rows)' % M
++        s += c * r[1]
++    return s / sum(w.values()), 'by accepted rows'
++
++
++def table(lg, min_n=30, prior=True, log=sys.stderr):
++    """-> (canonical-order dict of the table's keys, list of derivation lines)"""
++    t, why = {}, []
++    if any(k.endswith('_par') for d in lg['step'].values() for k in d):
++        raise SystemExit('"dfl_*_par" steps: under G6_DRAFT_PAR the drafter step overlaps the first form; measure with it off')
++    im = idle_before(lg['trans'], 'main')
++    for M in range(1, VX + 1):
++        r = rank_mean(lg['rows'], ('main', M), min_n)
++        if r is not None:
++            t['v%d' % M] = r[1] + im
++            why.append('v%d = main span %.3f + idle %.3f (n %d)' % (M, r[1], im, r[0]))
++        elif M in lg['rlog'] and len(lg['rlog'][M]) >= min_n:
++            t['v%d' % M] = statistics.median(lg['rlog'][M])
++            why.append('v%d = median s2_round launch+fence %.3f (n %d)' % (M, t['v%d' % M], len(lg['rlog'][M])))
++    if sum(1 for k in t if k[0] == 'v') < 2:
++        raise SystemExit('fewer than two verify row counts with %d steps: lower --min-n or run more decode' % min_n)
++    cost = {}
++    for k in ('chain', 'dfl_ctx', 'dfl_query'):
++        r = rank_mean(lg['step'], k)
++        if r is None:
++            raise SystemExit('no "# s2_tl ... step %s" line: a DFlash2 session with MTP rounds is needed' % k)
++        cost[k] = r[1] + idle_before(lg['trans'], k)
++        why.append('%s = span %.3f + idle %.3f (n %d)' % (k, r[1], cost[k] - r[1], r[0]))
++    idf = idle_before(lg['trans'], 'draft')
++    fd, hd = first_form(lg, [x for x in lg['rounds'] if x[0] == 'dfl'], min_n)
++    fm, hm = first_form(lg, [x for x in lg['rounds'] if x[0] == 'mtp'], min_n)
++    why.append('first form + idle %.3f: DFlash2 rounds %.3f, MTP rounds %.3f (%s / %s)' % (idf, fd, fm, hd, hm))
++    t['d'] = fd + idf + cost['dfl_query']
++    t['m'] = fm + idf + cost['dfl_ctx']
++    t['e'] = cost['chain']
++    t['p'] = max(0.0, cost['dfl_query'] - cost['dfl_ctx'])
++    mtp = [x for x in lg['rounds'] if x[0] == 'mtp']
++    if prior and len(mtp) >= min_n:
++        acc = [x for x in mtp if x[3] >= 1]
++        t['g'] = sum(x[3] - 1 for x in acc) / len(acc) if acc else 0.0
++        t['k'] = sum(x[1] for x in mtp) / len(mtp)
++        t['n'] = sum(x[2] for x in mtp) / len(mtp)
++        why.append('MTP rounds %d (%d with d1 accepted): g %.4f, k %.4f, n %.4f; first-position rate %.4f' %
++                   (len(mtp), len(acc), t['g'], t['k'], t['n'], len(acc) / len(mtp)))
++    elif prior:
++        why.append('MTP prior left out: %d MTP "# kstop" lines < %d (G6_MTP_LPLOG=1 on rank 0)' % (len(mtp), min_n))
++    return t, why
++
++
++def fmt(t):
++    return ','.join('%s:%.4g' % (k, v) for k, v in t.items())
++
++
++def main(argv=None):
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument('logs', nargs='*')
++    ap.add_argument('--min-n', type=int, default=30, help='steps (rounds) a cell needs')
++    ap.add_argument('--roundlog', action='store_true', help='fill verify rows from "# s2_round" lines (launch+fence)')
++    ap.add_argument('--no-prior', action='store_true', help='leave out g, k, n')
++    ap.add_argument('--selftest', action='store_true')
++    a = ap.parse_args(argv)
++    if a.selftest:
++        return 0 if unittest.main(argv=[sys.argv[0]], exit=False).result.wasSuccessful() else 1
++    if not a.logs:
++        ap.error('no log')
++    t, why = table(read(a.logs, a.roundlog), a.min_n, not a.no_prior)
++    for w in why:
++        print('# ' + w, file=sys.stderr)
++    print(fmt(t))
++    return 0
++
++
++class Test(unittest.TestCase):
++    LOG = """\
++# s2_tl rank 0 mains 100: per main step: GPU idle 0.5 ms
++# s2_tl rank 0 step main n 100 rows 3.0 span 50.000 prep 0.1 launch 0.1 wait 50.0 ms
++# s2_tl rank 0 step main n 400 rows 3.0 span 55.000 prep 0.1 launch 0.1 wait 55.0 ms
++# s2_tl rank 0 step draft n 400 rows 2.0 span 1.500 prep 0.1 launch 0.1 wait 1.5 ms
++# s2_tl rank 0 step chain n 300 rows 1.0 span 1.100 prep 0.1 launch 0.1 wait 1.1 ms
++# s2_tl rank 0 step dfl_ctx n 250 rows 2.0 span 0.500 prep 0.1 launch 0.1 wait 0.5 ms
++# s2_tl rank 0 step dfl_query n 150 rows 3.0 span 5.400 prep 0.1 launch 0.1 wait 5.4 ms
++# s2_tl rank 0 rows main M 2 n 100 span 48.000 ms
++# s2_tl rank 0 rows main M 3 n 200 span 56.000 ms
++# s2_tl rank 0 rows main M 4 n 60 span 64.000 ms
++# s2_tl rank 0 rows main M 8 n 5 span 100.000 ms
++# s2_tl rank 0 rows draft M 1 n 100 span 1.200 ms
++# s2_tl rank 0 rows draft M 2 n 200 span 1.400 ms
++# s2_tl rank 0 rows draft M 3 n 100 span 1.600 ms
++# s2_tl rank 0 trans main>draft n 400 idle 0.100 host 0.2 ms
++# s2_tl rank 0 trans draft>dfl_ctx n 250 idle 0.050 host 0.1 ms
++# s2_tl rank 0 trans draft>dfl_query n 150 idle 0.050 host 0.1 ms
++# s2_tl rank 0 trans dfl_ctx>chain n 250 idle 0.020 host 0.1 ms
++# s2_tl rank 0 trans chain>main n 300 idle 0.200 host 0.3 ms
++# s2_tl rank 0 trans dfl_query>main n 100 idle 0.400 host 0.3 ms
++# s2_tl rank 1 rows main M 3 n 200 span 58.000 ms
++"""
++
++    def lg(self, extra=''):
++        import os
++        import tempfile
++        with tempfile.NamedTemporaryFile('w', suffix='.log', delete=False) as f:
++            f.write(self.LOG + extra)
++        try:
++            return read([f.name])
++        finally:
++            os.unlink(f.name)
++
++    def test_last_block_and_rank_mean(self):
++        lg = self.lg()
++        self.assertEqual(lg['step'][0]['main'], (400, 55.0))
++        self.assertEqual(rank_mean(lg['rows'], ('main', 3)), (200, 57.0))   # ranks 0 and 1
++
++    def test_table(self):
++        t, _ = table(self.lg(), min_n=30)
++        im = (300 * 0.2 + 100 * 0.4) / 400          # idle before main
++        self.assertAlmostEqual(t['v2'], 48 + im)
++        self.assertAlmostEqual(t['v3'], 57 + im)
++        self.assertAlmostEqual(t['v4'], 64 + im)
++        self.assertNotIn('v8', t)                   # 5 steps < min_n
++        self.assertAlmostEqual(t['e'], 1.1 + 0.02)                 # chain span + idle after the context-only step
++        self.assertAlmostEqual(t['d'], 1.5 + 0.1 + 5.4 + 0.05)
++        self.assertAlmostEqual(t['m'], 1.5 + 0.1 + 0.5 + 0.05)
++        self.assertAlmostEqual(t['p'], 4.9)
++        self.assertNotIn('g', t)                    # no kstop lines
++
++    def test_prior_and_first_form_by_rows(self):
++        ks = ''.join('# kstop round %d slot 0 n %d mtp base 10 k %d nd %d a %d lp -0.1 m1 -0.1 m1ok 1 pe 0 hash 0\n' %
++                     (i, i, 1 + i % 2, 2, i % 3) for i in range(60))
++        ks += ''.join('# kstop round %d slot 0 n %d dfl base 10 k 7 nd 7 a 2 lp -0.1 m1 -0.1 m1ok 1 pe 0 hash 0\n' % (i, i) for i in range(40))
++        t, _ = table(self.lg(ks), min_n=30)
++        mtp = [(1 + i % 2, 2, i % 3) for i in range(60)]
++        acc = [x for x in mtp if x[2] >= 1]
++        self.assertAlmostEqual(t['g'], sum(x[2] - 1 for x in acc) / len(acc))
++        self.assertAlmostEqual(t['k'], 1.5)
++        self.assertAlmostEqual(t['n'], 2.0)
++        self.assertAlmostEqual(t['d'], 1.6 + 0.1 + 5.4 + 0.05)          # DFlash2 rounds: a = 2, first form of 3 rows
++        self.assertAlmostEqual(t['m'], (20 * 1.2 + 20 * 1.4 + 20 * 1.6) / 60 + 0.1 + 0.5 + 0.05)
++
++    def test_format_parses_as_engine_list(self):
++        s = fmt({'v2': 49.6, 'v3': 57.0, 'd': 6.9, 'm': 2.0, 'e': 1.17, 'p': 4.9})
++        self.assertEqual(s, 'v2:49.6,v3:57,d:6.9,m:2,e:1.17,p:4.9')
++        self.assertNotIn(' ', s)
++        self.assertNotIn(';', s)                    # it travels through G6ENV_X and a shell command line
++
++
++if __name__ == '__main__':
++    sys.exit(main())

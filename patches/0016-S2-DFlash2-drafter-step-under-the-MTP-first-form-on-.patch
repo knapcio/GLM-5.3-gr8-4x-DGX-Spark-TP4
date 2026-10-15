@@ -1,0 +1,369 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Thu, 15 Oct 2026 19:47:47 +0200
+Subject: [PATCH 16/21] S2: DFlash2 drafter step under the MTP first form on
+ its own stream behind G6_DRAFT_PAR=1|2
+
+A solo DFlash2 round makes the drafter choice before the first form (it reads nothing the first form writes),
+launches the drafter step on its own stream, runs the first form (and the chain on MTP rounds), then waits.
+Same graphs, inputs and fabrics: each step's bytes are as serial. 2: drafting steps on a high-priority stream.
+G6_S2_ROUNDLOG adds a '# s2_dfl' line: the drafter step's launch-to-wait ms.
+batch_draftpar_test: serial and parallel batches give the same tokens, requests, steps and stats.
+---
+ engine/runtime/g6m4.cu                        |  58 +++++--
+ .../runtime/s2/tests/batch_draftpar_test.cpp  | 147 ++++++++++++++++++
+ engine/runtime/s2_batch.h                     |  55 +++++--
+ 3 files changed, 239 insertions(+), 21 deletions(-)
+ create mode 100644 engine/runtime/s2/tests/batch_draftpar_test.cpp
+
+diff --git a/engine/runtime/g6m4.cu b/engine/runtime/g6m4.cu
+index 6b12bee..0e781c5 100644
+--- a/engine/runtime/g6m4.cu
++++ b/engine/runtime/g6m4.cu
+@@ -520,6 +520,15 @@ int main(int argc, char** argv)
+         if (!*e || *end || v < 0 || v > dfl::WIN) die("G6_DFL_REUSE_MIN: 0.." + std::to_string(dfl::WIN) + " rows");
+         dfl_reuse_min = (int)v;
+     }
++    // G6_DRAFT_PAR=1|2 (s2_batch.h draft_par_env; default 0): a solo DFlash2 round's drafter step runs on its own stream
++    // under the MTP first form (and the chain on MTP rounds). 2: a drafting step goes on a high-priority stream (its CTAs
++    // are dispatched first while both wait), a context-only step stays at the default priority. Each graph's bytes are as
++    // serial. Progress: every kernel that waits for peers runs at most 8 CTAs (k_wait_peers 1, k_walk 1, head merges M,
++    // k_qs_get 1..4), so the other stream always finds SMs. In the S2 runtime signature
++    std::string dpe;
++    const int draft_par = env_choice("G6_DRAFT_PAR", 2, 0, &dpe);
++    if (draft_par < 0) die(dpe);
++    if (draft_par && !(dfl && s2mode && mtp)) die("G6_DRAFT_PAR needs --dflash-manifest, --mtp and --serve");
+     g6::Fabric fabg, fabdg;
+     bool fabg_on = false, fabdg_on = false;
+     auto qs_fabric = [&](g6::Fabric& fb, const Model& mm, int port_off, const char* what) {
+@@ -849,6 +858,17 @@ int main(int argc, char** argv)
+         capture([&] { dfl_step(DF, st, true); }, &exec_f[1], "dflash draft ", dfl::B);
+         if (DF.pf_feat) capture([&] { dfl_fill_step(DF, st); }, &exec_f[2], "dflash fill ", dfl::B);
+     }
++    cudaStream_t st_par[2] = {};        // G6_DRAFT_PAR: the drafter's streams, [0] context only, [1] drafting
++    if (draft_par)
++    {
++        int lo = 0, hi = 0;
++        G6RT_CK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
++        G6RT_CK(cudaStreamCreateWithFlags(&st_par[0], cudaStreamNonBlocking));
++        if (draft_par == 2) G6RT_CK(cudaStreamCreateWithPriority(&st_par[1], cudaStreamNonBlocking, hi));
++        else st_par[1] = st_par[0];
++        if (R == 0) fprintf(stderr, "# rank %d: G6_DRAFT_PAR=%d: the DFlash2 drafter step runs under the MTP first form "
++                            "(drafting stream priority %d, range %d..%d)\n", R, draft_par, draft_par == 2 ? hi : 0, lo, hi);
++    }
+     fprintf(stderr, "# rank %d: device tensors %.2f GB\n", R, (image ? img.bytes() : store.bytes) / 1e9);
+     const bool pf_streams = two && getenv("G6_PF_STREAMS") && atoi(getenv("G6_PF_STREAMS")) == 2;   // pf_step2s
+     if (pf_streams && pf_prof().on) die("G6_PF_STREAMS=2 cannot run with G6_PF_PROF (the marks synchronize one stream)");
+@@ -1062,6 +1082,9 @@ int main(int argc, char** argv)
+         std::array<uint32_t, g6s2::MAX_SESSIONS> slot_prompt{};
+         std::array<bool, g6s2::MAX_SESSIONS> slot_whole{};   // G6_DFL_REUSE: a hit holds every prompt row but the last (no prefill)
+         u64 s2_dstep = 0;                // the drafter fabric's steps
++        cudaStream_t dfl_par_st = st;    // G6_DRAFT_PAR: the stream of the drafter step in flight
++        const bool dfl_tl = R == 0 && getenv("G6_S2_ROUNDLOG") && *getenv("G6_S2_ROUNDLOG") == '1';
++        std::chrono::steady_clock::time_point dfl_t0;
+         g6s2::NativeContext nx{m, D, P, P2, DQ, fab, fabd, fabp, fabp2, st, pf_streams ? &lanes2 : nullptr, in, in_d, out, out_d, MP, gsplit, two,
+             [&](const StepIn& si) {
+                 std::vector<uint32_t> sizes(NC, (uint32_t)(si.M * HID * 2));
+@@ -1276,16 +1299,28 @@ int main(int argc, char** argv)
+                     return dfl_from;
+                 };
+                 h.dispatch.dfl = [&](const s2::DflReq& r, const g6s2::Sampling& smp) {
+-                    DflIn di;
+-                    memset(&di, 0, sizeof di);
+-                    di.step = ++s2_dstep;
+-                    di.ctx_rows = r.rows; di.ctx_pos0 = r.pos0; di.q0 = r.pos0 + r.rows; di.lo = r.lo; di.tok0 = r.tok0; di.query = r.query;
+-                    const float dtemp = plan.rs ? 0.f : smp.inv_temp;   // rejection sampling: greedy drafts, as dflash_sequence
+-                    for (int i = 0; i < dfl::B; ++i) di.srow[i] = glue::SampleRow{dtemp, smp.seed, 0u, di.q0 + i, 0, smp.top_p};
+-                    *in_f = di;
+-                    fabf.enqueue_step(di.step, dfl_sizes(DF, di.query));
+-                    G6RT_CK(cudaGraphLaunch(exec_f[di.query ? 1 : 0], st));
+-                    G6RT_CK(cudaStreamSynchronize(st));
++                    // G6_DRAFT_PAR: phase 1 launches on the drafter's stream and returns, phase 2 waits for it (s2::DflReq).
++                    // The target step before phase 1 was fenced on st, and phase 2 comes before the next one
++                    cudaStream_t& ds = dfl_par_st;
++                    if (r.phase != 2)
++                    {
++                        DflIn di;
++                        memset(&di, 0, sizeof di);
++                        di.step = ++s2_dstep;
++                        di.ctx_rows = r.rows; di.ctx_pos0 = r.pos0; di.q0 = r.pos0 + r.rows; di.lo = r.lo; di.tok0 = r.tok0; di.query = r.query;
++                        const float dtemp = plan.rs ? 0.f : smp.inv_temp;   // rejection sampling: greedy drafts, as dflash_sequence
++                        for (int i = 0; i < dfl::B; ++i) di.srow[i] = glue::SampleRow{dtemp, smp.seed, 0u, di.q0 + i, 0, smp.top_p};
++                        *in_f = di;
++                        fabf.enqueue_step(di.step, dfl_sizes(DF, di.query));
++                        ds = r.phase ? st_par[di.query ? 1 : 0] : st;
++                        if (dfl_tl) dfl_t0 = std::chrono::steady_clock::now();
++                        G6RT_CK(cudaGraphLaunch(exec_f[di.query ? 1 : 0], ds));
++                        if (r.phase == 1) return s2::DflDrafts{};
++                    }
++                    G6RT_CK(cudaStreamSynchronize(ds));
++                    if (dfl_tl)   // G6_S2_ROUNDLOG: the drafter step's launch to its wait (G6_DRAFT_PAR: the first form and chain within)
++                        fprintf(stderr, "# s2_dfl step %llu query %d par %d ms %.3f\n", (unsigned long long)s2_dstep, (int)r.query, r.phase ? 1 : 0,
++                                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dfl_t0).count());
+                     g6s2::require(!*fabf.dev().error, "S2 DFlash2 fabric error");
+                     s2::DflDrafts o;
+                     for (int i = 0; i < dfl::B; ++i) { o.tok[i] = out_f->tok[i]; o.lp[i] = out_f->lp[i]; }
+@@ -1311,7 +1346,8 @@ int main(int argc, char** argv)
+                 (dsel_start_mtp ? " dselstart mtp" : "") + (dsel_posclk ? " dselposclk 1" : "") + (dfl_alpha != 1.f ? " dflalpha " + std::to_string(dfl_alpha) : "") +
+                 (kstop.mode ? " kstop " + std::to_string(kstop.mode) + " kmax " + std::to_string(kstop.kmax) + " tau " + std::to_string(kstop.tau[1]) + "," +
+                               std::to_string(kstop.tau[2]) + "," + std::to_string(kstop.tau[3]) + " seed3 " + std::to_string(kstop.seed3) : "") +
+-                (dfl_reuse ? " dflreuse " + std::to_string(dfl_reuse) + "/" + std::to_string(dfl_reuse_min) : "");
++                (dfl_reuse ? " dflreuse " + std::to_string(dfl_reuse) + "/" + std::to_string(dfl_reuse_min) : "") +
++                (draft_par ? " draftpar " + std::to_string(draft_par) : "");
+             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
+                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
+             g6s2::ControlLinks links = g6s2::bootstrap(bc);
+diff --git a/engine/runtime/s2/tests/batch_draftpar_test.cpp b/engine/runtime/s2/tests/batch_draftpar_test.cpp
+new file mode 100644
+index 0000000..197e6b7
+--- /dev/null
++++ b/engine/runtime/s2/tests/batch_draftpar_test.cpp
+@@ -0,0 +1,147 @@
++// G6_DRAFT_PAR (s2_batch.h draft_par_env): a solo DFlash2 round launches the drafter step (phase 1) before the MTP first
++// form and waits for it (phase 2) at the end of the round. Against the serial batch, every scenario must give the same
++// committed tokens, the same drafter requests, the same target / first-form / chain steps and the same stats; and no
++// target step or other drafter step may start while one is in flight. Host only, a fake engine.
++// Build: g++ -std=c++17 -O2 -I engine/runtime engine/runtime/s2/tests/batch_draftpar_test.cpp -o /tmp/batch_draftpar_test
++#include "s2_batch.h"
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++using namespace s2;
++
++static int fails = 0;
++#define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
++
++static int target(int pos) { return (pos * 37 + 11) % 997; }    // the token at position pos + 1
++
++struct Fake
++{
++    int mtp = 0, dfl = 0;             // drafting quality: MTP 0 all right, 1 two in three, 2 none; DFlash2 depth = 7 - dfl
++    std::vector<std::string> steps, reqs;
++    std::vector<int> got, last;       // committed tokens; the last draft or chain step's tokens (lp)
++    bool pending = false;             // a phase 1 drafter step without its phase 2
++    DflDrafts stash{};
++    long overlapped = 0, launches = 0, errors = 0;
++    Hooks hooks()
++    {
++        Hooks h;
++        h.run = [this](const Step& s) {
++            if (s.kind == Step::MAIN && pending) ++errors;     // a target step while the drafter step runs
++            if (pending) ++overlapped;
++            std::string l = s.kind == Step::MAIN ? "M" : s.kind == Step::CHAIN ? "C" : "D";
++            std::vector<int> out;
++            for (const Row& r : s.r)
++            {
++                const int p = r.spos - 1;
++                const bool ok = s.kind == Step::MAIN || mtp == 0 || (mtp == 1 && r.spos % 3 != 0);
++                out.push_back(ok ? target(p) : -2);
++                l += " " + std::to_string(r.tok) + "@" + std::to_string(r.pos);
++            }
++            steps.push_back(l);
++            if (s.kind != Step::MAIN) last = out;
++            return out;
++        };
++        h.dfl_start = [](int) { return 0; };
++        h.dfl = [this](const DflReq& r) {
++            if (r.phase == 2)
++            {
++                if (!pending) ++errors;
++                pending = false;
++                return stash;
++            }
++            if (pending) ++errors;
++            ++launches;
++            reqs.push_back(std::string(r.query ? "Q" : "C") + std::to_string(r.rows) + "@" + std::to_string(r.pos0) + " t" +
++                           std::to_string(r.tok0) + " lo" + std::to_string(r.lo));
++            DflDrafts o{};
++            const int q0 = r.pos0 + r.rows;
++            for (int i = 1; i < DFL_B; ++i) { o.tok[i] = i <= 7 - dfl ? target(q0 + i - 1) : -1; o.lp[i] = -0.05f * i - 0.01f * (q0 % 7); }
++            if (r.phase == 1)
++            {
++                pending = true;
++                stash = o;
++                DflDrafts g{};
++                for (int i = 0; i < DFL_B; ++i) { g.tok[i] = -9; g.lp[i] = 1.f; }   // must not be used
++                return g;
++            }
++            return o;
++        };
++        h.emit = [this](int, const int* t, int k, int) { got.insert(got.end(), t, t + k); return false; };
++        h.lp = [this](int row) { return row < (int)last.size() ? -0.02f * (float)((last[row] + 3) % 11) : 0.f; };
++        return h;
++    }
++};
++
++struct Run
++{
++    std::vector<std::string> steps, reqs;
++    std::vector<int> got;
++    Stats st;
++    long overlapped = 0, launches = 0, errors = 0;
++};
++
++// one scenario: dsel on, kstop mode km; phases of (mtp, dfl) quality, n rounds each
++static Run scenario(bool par, int km, bool start_mtp, bool insert, int reuse)
++{
++    if (par) setenv("G6_DRAFT_PAR", "1", 1);
++    else unsetenv("G6_DRAFT_PAR");
++    Fake f;
++    Batch b(2, 32, f.hooks());
++    b.dflash(7, g6rt::SpecLen());
++    DSel sel;
++    sel.on = true;
++    sel.dwell = 3;
++    sel.start_mtp = start_mtp;
++    sel.d.draft_round = 8.1; sel.m.draft_round = 5.5; sel.m.draft_each = 2.1;
++    b.dsel(sel);
++    if (km)
++    {
++        KStop k;
++        k.mode = km; k.kmax = 3;
++        b.kstop(k);
++    }
++    if (reuse) { DflReuse r; r.mode = reuse; r.min = 6; b.dfl_reuse(r); }
++    Session s; s.prompt.assign(12, 5); s.first = 11; s.chunk = 8; s.n_gen = 100000; s.dflash = !reuse;
++    if (insert) { s.ins.after = 40; s.ins.tokens = {900, 901, 902}; }
++    b.admit({0}, {s});
++    if (reuse) b.promote(0);
++    const int phase[][3] = {{0, 5, 25}, {0, 0, 25}, {1, 4, 30}, {2, 1, 30}, {0, 6, 30}, {1, 2, 30}};
++    for (const auto& p : phase)
++    {
++        f.mtp = p[0]; f.dfl = p[1];
++        for (int i = 0; i < p[2]; ++i) CHECK(b.round({0}));
++    }
++    Run r;
++    r.steps = f.steps; r.reqs = f.reqs; r.got = f.got; r.st = b.stats(0);
++    r.overlapped = f.overlapped; r.launches = f.launches; r.errors = f.errors + (f.pending ? 1 : 0);
++    return r;
++}
++
++int main()
++{
++    long overlapped = 0, mtp_rounds = 0, dfl_rounds = 0, switches = 0, inserted = 0, cases = 0;
++    for (int km : {0, 1, 2})
++        for (int start_mtp : {0, 1})
++            for (int insert : {0, 1})
++                for (int reuse : {0, 2})
++                {
++                    const Run a = scenario(false, km, start_mtp, insert, reuse), c = scenario(true, km, start_mtp, insert, reuse);
++                    const bool same = a.got == c.got && a.reqs == c.reqs && a.steps == c.steps && a.st.rounds == c.st.rounds &&
++                                      a.st.tokens == c.st.tokens && a.st.mtp_rounds == c.st.mtp_rounds && a.st.dfl_rounds == c.st.dfl_rounds &&
++                                      a.st.switches == c.st.switches && a.st.acc == c.st.acc && a.st.inserted == c.st.inserted;
++                    CHECK(same);
++                    CHECK(a.errors == 0 && c.errors == 0 && a.overlapped == 0);
++                    bool exact = true;   // the session's own tokens are the target's (the insert's are its own)
++                    for (size_t i = 0; i < c.got.size(); ++i) exact &= c.got[i] == target(11 + (int)i) || c.got[i] >= 900;
++                    CHECK(exact);
++                    if (!same || c.errors)
++                        std::printf("  km %d start_mtp %d insert %d reuse %d: got %zu/%zu reqs %zu/%zu steps %zu/%zu errors %ld\n", km, start_mtp,
++                                    insert, reuse, a.got.size(), c.got.size(), a.reqs.size(), c.reqs.size(), a.steps.size(), c.steps.size(), c.errors);
++                    overlapped += c.overlapped; mtp_rounds += c.st.mtp_rounds; dfl_rounds += c.st.dfl_rounds; ++cases;
++                    switches += c.st.switches; inserted += c.st.inserted;
++                }
++    CHECK(mtp_rounds > 0 && dfl_rounds > 0 && overlapped > 0 && switches > 0 && inserted > 0);
++    std::printf("batch_draftpar_test: %s (%ld cases, %ld MTP / %ld DFlash2 rounds, %ld switches, %ld inserted, %ld steps under a "
++                "drafter step)\n", fails ? "FAIL" : "PASS", cases, mtp_rounds, dfl_rounds, switches, inserted, overlapped);
++    return fails ? 1 : 0;
++}
+diff --git a/engine/runtime/s2_batch.h b/engine/runtime/s2_batch.h
+index 6a12ec5..07982b8 100644
+--- a/engine/runtime/s2_batch.h
++++ b/engine/runtime/s2_batch.h
+@@ -116,7 +116,9 @@ struct Stats
+ // lo = the lowest position the drafter holds; query: also draft the block after them, bonus token tok0
+ constexpr int DFL_B = 8;              // = dfl::B: the bonus row and 7 drafts
+ constexpr int DFL_WIN = 2048, DFL_RING = 4096;   // = dfl::WIN, dfl::RING: the drafter's window and its KV ring (positions)
+-struct DflReq { int sess, rows, pos0, tok0, lo; bool query; };
++// phase (G6_DRAFT_PAR): 0 = launch and wait; 1 = launch on the drafter's own stream and return at once; 2 = wait for
++// that launch and return its drafts
++struct DflReq { int sess, rows, pos0, tok0, lo; bool query; int phase = 0; };
+ struct DflDrafts { int tok[DFL_B]; float lp[DFL_B]; };
+ 
+ // run(step) -> the sampled token of every row of the step (step.M() ids), for MAIN, DRAFT and CHAIN steps
+@@ -170,6 +172,10 @@ struct S2Cost
+ // G6_S2_DSEL (every rank, read at boot): drafter choice for DFlash2 sessions (Batch::dsel), on unless 0. RigMark TP4:
+ // prose 28.8 -> 30.1 tok/s, code 48.9 -> 49.0, C4 62.7 -> 63.8 (margin 0.15, dwell 8)
+ inline bool dsel_env() { const char* e = getenv("G6_S2_DSEL"); return !e || atoi(e) != 0; }
++// G6_DRAFT_PAR (every rank, read at boot; g6m4 creates the drafter's stream): a solo DFlash2 round launches the drafter
++// step before the MTP first form, on its own stream, and waits for it at the end of the round (after the chain on MTP).
++// Both are fixed graphs on separate weights, scratch and fabrics, so each one's output bytes are as serial; 0 = serial
++inline int draft_par_env() { const char* e = getenv("G6_DRAFT_PAR"); return e ? atoi(e) : 0; }
+ struct DSel
+ {
+     bool on = false;
+@@ -432,6 +438,17 @@ private:
+         if (m) ++stats_[q].mtp_rounds;
+         else ++stats_[q].dfl_rounds;
+         if (h_.emit && h_.emit(q, &x.tokens[base + 1], c, 0)) { x.done = true; return; }
++        // G6_DRAFT_PAR: the drafter choice reads nothing the first form writes, so it is made first and the drafter step
++        // runs under the first form
++        const bool par = par_ && x.force < 0;
++        bool nm = false, probe = false;
++        DflReq r{};
++        if (par)
++        {
++            r = choose_drafter(q, base, a, t[a], nm, probe);
++            r.phase = 1;
++            drafts(q, r);
++        }
+         Step d;
+         d.kind = Step::DRAFT; d.event = v.event;
+         d.round = cur_round_; d.round_active = cur_active_;
+@@ -447,22 +464,39 @@ private:
+             x.pb = -1;
+             return;
+         }
+-        bool nm = sel_.on && next_mtp(x);
++        if (!par)
++        {
++            r = choose_drafter(q, base, a, t[a], nm, probe);
++            drafts(q, r);
++        }
++        else
++        {   // the chain needs only d[1]: it runs before the wait, under the drafter step too
++            if (nm) kchain(q, v.event);
++            r.phase = 2;
++            drafts(q, r);
++        }
++        if (probe) { x.pb = base + a + 1; std::copy(x.dd, x.dd + DFL_B, x.pd); std::copy(x.dl, x.dl + DFL_B, x.pl); }
++        if (!nm) x.pb = -1;
++        if (nm && !par) kchain(q, v.event);
++    }
++    // the drafter of the next round (drafter choice, G6_DFL_REUSE warm-up) and this round's drafter step: the a + 1
++    // committed rows as context, drafting when the next round is on DFlash2 or probes
++    DflReq choose_drafter(int q, int base, int a, int tok, bool& nm, bool& probe)
++    {
++        St& x = st_[q];
++        nm = sel_.on && next_mtp(x);
+         if (x.warm) { nm = base + a + 1 < x.warm; if (!nm) x.warm = 0; }   // G6_DFL_REUSE warm-up: DFlash2 once it is over
+-        if (nm != m) { x.since = 0; ++stats_[q].switches; }
++        if (nm != x.mtp) { x.since = 0; ++stats_[q].switches; }
+         ++x.since;
+         x.mtp = nm;
+-        const bool probe = nm && !x.warm && x.pb < 0 && ++x.mn % sel_.probe == 0;
+-        drafts(q, DflReq{q, a + 1, base, t[a], x.lo, !nm || probe});
+-        if (probe) { x.pb = base + a + 1; std::copy(x.dd, x.dd + DFL_B, x.pd); std::copy(x.dl, x.dl + DFL_B, x.pl); }
+-        if (!nm) x.pb = -1;
+-        if (nm) kchain(q, v.event);
++        probe = nm && !x.warm && x.pb < 0 && ++x.mn % sel_.probe == 0;
++        return DflReq{q, a + 1, base, tok, x.lo, !nm || probe};
+     }
+     void drafts(int q, const DflReq& r)
+     {
+         const DflDrafts o = h_.dfl(r);
+-        if (reuse_.mode) ring_rows(q, r);
+-        if (!r.query) return;
++        if (reuse_.mode && r.phase != 2) ring_rows(q, r);
++        if (!r.query || r.phase == 1) return;
+         for (int i = 1; i < DFL_B; ++i) { st_[q].dd[i] = o.tok[i]; st_[q].dl[i] = o.lp[i]; }
+     }
+ 
+@@ -624,6 +658,7 @@ private:
+     int K_, max_rows_;
+     bool adapt_ = false;
+     int dkv_ = DFL_B - 1;
++    bool par_ = draft_par_env() != 0;
+     g6rt::SpecLen dsl_;
+     DSel sel_;
+     KStop ks_;

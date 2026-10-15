@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Thu, 15 Oct 2026 16:01:29 +0200
-Subject: [PATCH 12/14] Decode attention round 2: G6_ATTN_SC2_TR=2,
+Subject: [PATCH 12/21] Decode attention round 2: G6_ATTN_SC2_TR=2,
  G6_ATTN_CTX3, G6_ATTN_SEL2, G6_IDX_GRP (exact, default off); attnk bench vs
  round 1
 
@@ -536,15 +536,15 @@ index 0c0e410..f64f395 100644
  // SEL32: the same exact selector past context 32768, so no context size runs
  // the full CUB sort. 64-bit key = ordered_score (CUB's float order, both zeros equal as CUB treats them) in the high
 diff --git a/engine/attn/tests/attnk.cu b/engine/attn/tests/attnk.cu
-index 0081d23..cdf613c 100644
+index 936dc3c..cb4a79d 100644
 --- a/engine/attn/tests/attnk.cu
 +++ b/engine/attn/tests/attnk.cu
 @@ -1,27 +1,43 @@
 -// attnk: G6_ATTN_SC2 (scores_sc) and G6_ATTN_CTX2 (context_parts_heads PB / context_pk) against the stock decode attention
 -// chain of one layer, as the engine replays it (g6_attn_replay_run captured in a CUDA graph). Harness = an earlier
--// attention-chain bench (attnmk) without the MK chain kernel.
+-// attention-chain bench without the MK chain kernel.
 +// attnk: exact decode attention kernel arms against the stock decode attention chain of one layer, as the engine replays it
-+// (g6_attn_replay_run captured in a CUDA graph). Harness = an earlier attention-chain bench (attnmk) without the MK
++// (g6_attn_replay_run captured in a CUDA graph). Harness = an earlier attention-chain bench without the MK
 +// chain kernel. Flags under test (each a host-side static the bench assigns): G6_ATTN_SC2 / _SC2_TR (scores_sc), G6_ATTN_CTX2
 +// (context_parts_heads PB / context_pk), G6_ATTN_CTX3 / _CTX3_HG (context_pk3), G6_ATTN_SEL2 (rank_selected), G6_IDX_GRP
 +// (index_scores_g).

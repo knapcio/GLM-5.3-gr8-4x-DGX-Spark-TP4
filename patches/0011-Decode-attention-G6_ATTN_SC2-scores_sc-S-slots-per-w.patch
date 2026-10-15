@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Thu, 15 Oct 2026 12:53:01 +0200
-Subject: [PATCH 11/14] Decode attention: G6_ATTN_SC2 (scores_sc, S slots per
+Subject: [PATCH 11/21] Decode attention: G6_ATTN_SC2 (scores_sc, S slots per
  warp) + G6_ATTN_CTX2 (context PB / packed / E1 PART 32), default off; attnk
  bench
 
@@ -302,13 +302,13 @@ index c41edc8..55318cb 100644
  
 diff --git a/engine/attn/tests/attnk.cu b/engine/attn/tests/attnk.cu
 new file mode 100644
-index 0000000..0081d23
+index 0000000..936dc3c
 --- /dev/null
 +++ b/engine/attn/tests/attnk.cu
 @@ -0,0 +1,331 @@
 +// attnk: G6_ATTN_SC2 (scores_sc) and G6_ATTN_CTX2 (context_parts_heads PB / context_pk) against the stock decode attention
 +// chain of one layer, as the engine replays it (g6_attn_replay_run captured in a CUDA graph). Harness = an earlier
-+// attention-chain bench (attnmk) without the MK chain kernel.
++// attention-chain bench without the MK chain kernel.
 +// Layers: a full-index layer (its own indexer + select) then a shared layer reusing its indices, M rows at live context L in
 +// capture bucket T, S2 batched cell with per-row tables (s2=1, as served). One call's GPU time inside a graph of K calls,
 +// median of TR alternating trials; "cold" = a 96 MB L2 flush before every call, flush subtracted (served case: the experts

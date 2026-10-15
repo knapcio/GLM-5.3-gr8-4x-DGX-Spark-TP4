@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # make-patches.sh GR8_CLONE [REF]: regenerate patches/ from a gr8 clone whose REF (default HEAD) sits on the pinned
-# upstream commit. This is how patches/0001..0014 were made; the series is plain `git format-patch` output:
+# upstream commit. This is how patches/0001..0021 were made; the series is plain `git format-patch` output:
 #
 #   git format-patch --no-signature --zero-commit -o patches <GR8_COMMIT>..<REF>
 #

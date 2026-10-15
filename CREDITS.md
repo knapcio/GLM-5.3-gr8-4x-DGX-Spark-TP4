@@ -22,8 +22,9 @@
   concurrency and prefill benchmark behind the RigMark results in the README. Measurements only; no RigMark code is
   included. The multi-turn numbers come from this repository's own `bench/multiturn.py`.
 - **NVIDIA**: the CUDA images and toolchain the image is built from.
-- **knapcio**: the fourteen patches (fabric MTU negotiation, replicated-GEMV splits, INT4 draft heads, DSel
-  experiments and cost overrides, the shared-expert stream overlap, two rounds of decode attention kernels, the MTP
-  confidence stop, DFlash2 after prefix reuse), the serving configuration, the measurements and the quality checks
-  (m4sim and attnk exactness runs, T=0 identity, qeval). qeval comes from the earlier
+- **knapcio**: the twenty-one patches (fabric MTU negotiation, replicated-GEMV splits, INT4 draft heads, DSel
+  experiments and cost overrides, the shared-expert stream overlap, three rounds of decode attention kernels, the MTP
+  confidence stop, DFlash2 after prefix reuse, the parallel DFlash2 drafter step, the decode step timeline, the DSel
+  cost model and its table tool), the serving configuration, the measured DSel cost table, the measurements and the
+  quality checks (m4sim and attnk exactness runs, T=0 identity, qeval). qeval comes from the earlier
   [GLM-5.3 recipe](https://github.com/knapcio/GLM-5.3-4x-DGX-Spark-TP4).
