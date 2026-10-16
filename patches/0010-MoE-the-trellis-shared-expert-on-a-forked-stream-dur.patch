@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Thu, 15 Oct 2026 08:55:26 +0200
-Subject: [PATCH 10/26] MoE: the trellis shared expert on a forked stream
+Subject: [PATCH 10/30] MoE: the trellis shared expert on a forked stream
  during the router (G6_ROUTE_OVL=1|2, default off)
 
 Trellis-shared layers with separate fc1 / fc2 launches (2+ rows): the shared expert's units read only

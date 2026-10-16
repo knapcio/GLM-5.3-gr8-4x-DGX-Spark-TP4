@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Fri, 16 Oct 2026 04:24:27 +0200
+Subject: [PATCH 28/30] decode buckets: nine slots, seven doublings, so an R
+ off the doubling no longer drops the 2048 bucket
+
+With eight slots a SHARE_LIMIT such as 98304 filled the list (2048 .. 131072, the cap) and context_buckets merged
+the smallest bucket away, so every short-context step ran on the 4096 graph. NBK is now 9 and the doubling stops at
+seven buckets as before: for R = 0 or a power of two among the doublings (every TP default) the list, the graphs and
+the outputs are those of before; an R off the doubling gets the ninth slot (one more bucket of step graphs).
+---
+ engine/runtime/context_buckets.h              |  7 +++--
+ engine/runtime/rank.cuh                       |  9 +++---
+ engine/runtime/tests/test_context_buckets.cpp | 30 ++++++++++++++++++-
+ 3 files changed, 38 insertions(+), 8 deletions(-)
+
+diff --git a/engine/runtime/context_buckets.h b/engine/runtime/context_buckets.h
+index 651d93d..8b9f675 100644
+--- a/engine/runtime/context_buckets.h
++++ b/engine/runtime/context_buckets.h
+@@ -2,13 +2,14 @@
+ #include <algorithm>
+ 
+ // Decode graph capacities. R must be a boundary so a graph never mixes the replicated and CP paths.
+-// If all slots are in use, merge the smallest bucket into the next one; preserve the cap.
++// At most `doublings` buckets below the cap (default N - 1: every slot). If all slots are in use, merge the smallest
++// bucket into the next one; preserve the cap. doublings = N - 2 keeps a slot for an R off the doubling (no merge).
+ template <int N>
+-inline int context_buckets(int (&bk)[N], int base, int capacity, int R)
++inline int context_buckets(int (&bk)[N], int base, int capacity, int R, int doublings = N - 1)
+ {
+     static_assert(N >= 2, "context buckets need room for the cap");
+     int n = 0;
+-    if (base > 0) for (; base < capacity && n < N - 1; base *= 2) bk[n++] = base;
++    if (base > 0) for (; base < capacity && n < doublings && n < N - 1; base *= 2) bk[n++] = base;
+     bk[n++] = capacity;
+     if (R > 0 && R < capacity && std::find(bk, bk + n, R) == bk + n)
+     {
+diff --git a/engine/runtime/rank.cuh b/engine/runtime/rank.cuh
+index 474a772..64fd2a4 100644
+--- a/engine/runtime/rank.cuh
++++ b/engine/runtime/rank.cuh
+@@ -80,7 +80,7 @@ inline void check_headroom(int rank, int capacity, bool log)
+     }
+ }
+ 
+-constexpr int NBK = 8;              // decode context buckets (graph form), at most
++constexpr int NBK = 9;              // decode context buckets (graph form), at most: 7 doublings, the cap, an R off them
+ constexpr int MX = G6_MX, QA = 2048, KVA = 576, IDXQ = 4096, IDXK = 128, IDXW = 32;
+ static_assert(MX <= 32, "k_head_merge: one warp, one row per lane");
+ constexpr int ATT_QT = MX > 8 ? 32 : 16;    // decode attention query tile (CP decode needs rows <= tile; attn allows <= 64); 16 = today's
+@@ -333,8 +333,9 @@ struct Model
+     bool graph = false;               // attention through the replay entry (set before prepare)
+     bool wide = false;                // set before build: tr3.fc1 K3 records into the wide order, in place (bind::widen_fc1)
+     // graph form: captured attention capacities, ascending, the last = the binding's capacity. G6_DEC_BK=B (read at
+-    // build, default 2048): B, 2B, 4B, ... below the capacity, then the capacity; 0 = one bucket (the capacity). A step
+-    // runs the graph of the smallest bucket >= its context (bucket_of); cur = the bucket a capture is recording
++    // build, default 2048): B, 2B, 4B, ... (7 at most) below the capacity, then the capacity, and CP's R when it is not one
++    // of them; 0 = one bucket (the capacity). A step runs the graph of the smallest bucket >= its context (bucket_of);
++    // cur = the bucket a capture is recording
+     int nbk = 1, bk[NBK] = {}, cur = 0;
+     const StepIn* in = nullptr;       // set by the driver: pinned host memory or device memory
+     StepOut* out = nullptr;           //   same
+@@ -518,7 +519,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
+ #if defined(G6_CP) && G6_CP
+         if (m.cp.on) cp_r = m.cp.R;
+ #endif
+-        m.nbk = context_buckets(m.bk, b, capacity, cp_r);
++        m.nbk = context_buckets(m.bk, b, capacity, cp_r, NBK - 2);   // a power-of-two R: the 8-slot list of before
+     }
+     m.cells = dmalloc<G6AttnStepCell>(m.nl);
+     m.shared = dmalloc<int>(m.nl);
+diff --git a/engine/runtime/tests/test_context_buckets.cpp b/engine/runtime/tests/test_context_buckets.cpp
+index 7236a69..7b149b8 100644
+--- a/engine/runtime/tests/test_context_buckets.cpp
++++ b/engine/runtime/tests/test_context_buckets.cpp
+@@ -23,6 +23,17 @@ static std::vector<int> buckets(int base, int capacity, int r)
+     return {out, out + n};
+ }
+ 
++// the engine's list (rank.cuh: NBK = 9 slots, 7 doublings)
++static std::vector<int> buckets9(int base, int capacity, int r)
++{
++    int out[9] = {};
++    int n = context_buckets(out, base, capacity, r, 7);
++    assert(n >= 1 && n <= 9);
++    assert(out[n - 1] == capacity);
++    assert(std::is_sorted(out, out + n));
++    return {out, out + n};
++}
++
+ int main()
+ {
+     // With CP off or the usual R=32768, every graph capacity matches the old schedule.
+@@ -47,5 +58,22 @@ int main()
+             std::vector<int>{4096, 8192, 16384, 32768, 65536, 98304, 131072}));
+     assert((buckets(0, 131072, 98304) == std::vector<int>{98304, 131072}));
+     assert(buckets(2048, 614400, 131072) == old_buckets(2048, 614400));
+-    std::cout << "context_buckets: PASS (R=0/32768 schedule byte-exact; R=98304; BK=4096)\n";
++
++    // Nine slots, seven doublings: the eight-slot list whenever R is 0 or one of the seven doublings (at the default
++    // base 2048: every power of two from 4096 to 131072), and an R off them is added without merging the smallest bucket.
++    for (int cap : {65536, 131072, 212224, 262144, 310528, 408832, 614400})
++        for (int base : {0, 512, 1024, 2048, 4096, 8192})
++            for (int r : {0, 4096, 32768, 65536, 131072, 262144})
++            {
++                const auto old = old_buckets(base, cap);
++                if (r && (!base || std::find(old.begin(), old.end(), r) == old.end())) continue;
++                assert(buckets9(base, cap, r) == buckets(base, cap, r));
++            }
++    assert((buckets9(2048, 212224, 98304) ==
++            std::vector<int>{2048, 4096, 8192, 16384, 32768, 65536, 98304, 131072, 212224}));
++    assert((buckets9(2048, 614400, 98304) ==
++            std::vector<int>{2048, 4096, 8192, 16384, 32768, 65536, 98304, 131072, 614400}));
++    assert((buckets9(2048, 310528, 65536) ==
++            std::vector<int>{2048, 4096, 8192, 16384, 32768, 65536, 131072, 310528}));
++    std::cout << "context_buckets: PASS (R=0/32768 schedule byte-exact; R=98304; BK=4096; 9 slots = 8 for R on the doubling)\n";
+ }

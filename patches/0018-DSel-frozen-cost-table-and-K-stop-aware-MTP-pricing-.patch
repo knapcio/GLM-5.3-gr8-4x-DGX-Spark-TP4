@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Thu, 15 Oct 2026 19:51:48 +0200
-Subject: [PATCH 18/26] DSel: frozen cost table and K-stop-aware MTP pricing
+Subject: [PATCH 18/30] DSel: frozen cost table and K-stop-aware MTP pricing
  behind G6_S2_DSEL_MODEL=1|2
 
 G6_S2_DSEL_TABLE (inline key:value list or a file; the same on every

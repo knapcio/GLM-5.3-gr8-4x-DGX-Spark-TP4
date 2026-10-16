@@ -18,12 +18,15 @@ v0.1 was measured with the v0.2 `G6ENV_X` line without `G6_DFL_REUSE=2`. v0.2's 
 
 [`bench/conc.py`](../bench/conc.py): aggregate tok/s **[per-stream tok/s]**, RigMark's prose, code and structured
 prompts, 256 output tokens, temperature 0, `reasoning_effort: low`, medians of three rounds per cell, c identical
-requests sent at once. v0.5 and v0.4: median per cell over three boots (v0.5's three boots are within 0.3 tok/s of each
-other). v0.4 was measured against three v0.3 boots, two of each interleaved in one session (v0.3's three-boot medians:
+requests sent at once. v0.6, v0.5 and v0.4: median per cell over three boots (v0.6's three boots are within 2 tok/s
+of each other, most cells within 1.3; v0.5's within 0.3). v0.4 was measured against three v0.3 boots, two of each interleaved in one session (v0.3's three-boot medians:
 prose 36.2 / 49.3 / 63.3, code 46.3 / 59.2 / 75.5, structured 70.6 / 65.7 / 85.0). Earlier rows: one boot per release.
 
 | Release | Prompt type | c1 | c2 | c4 |
 |---|---|---:|---:|---:|
+| v0.6 (median of three boots) | prose | 37.3 [38.4] | 51.3 [27.4] | 66.2 [18.5] |
+| v0.6 (median of three boots) | code | 48.8 [50.0] | 61.6 [32.9] | 78.9 [22.4] |
+| v0.6 (median of three boots) | structured | 75.0 [77.9] | 68.3 [37.1] | 88.7 [26.1] |
 | v0.5 (median of three boots) | prose | 37.4 [38.5] | 51.5 [27.4] | 66.3 [18.5] |
 | v0.5 (median of three boots) | code | 48.9 [50.1] | 61.7 [32.8] | 78.9 [22.4] |
 | v0.5 (median of three boots) | structured | 74.9 [77.7] | 68.3 [37.2] | 88.7 [26.0] |
@@ -70,6 +73,7 @@ the README's Reproducing section. RigMark sends single-turn requests.
 
 | c1 decode | prose | code | structured |
 |---|---:|---:|---:|
+| v0.6, full run | 38.5 | 58.3 | 70.2 |
 | v0.5, full run | 37.8 | 57.9 | 70.2 |
 | v0.5, run after a warm-up request (no concurrency section) | 38.0 | 59.1 | 70.2 |
 | v0.4, full run | 36.4 | 55.9 | 71.1 |
@@ -80,6 +84,7 @@ the README's Reproducing section. RigMark sends single-turn requests.
 
 | Concurrency, aggregate end-to-end tok/s | C1 | C2 | C4 |
 |---|---:|---:|---:|
+| v0.6 | 46.3 | 56.7 | 73.3 |
 | v0.5 | 46.1 | 57.4 | 72.5 |
 | v0.4 | 43.6 | 56.1 | 68.6 |
 | v0.2 | 38.8 | 54.3 | 67.6 |
@@ -88,6 +93,7 @@ the README's Reproducing section. RigMark sends single-turn requests.
 
 | Prefill, cold, tok/s | 8K | 32K | 64K | 128K |
 |---|---:|---:|---:|---:|
+| v0.6 (full run) | 1375 | 1381 | 1306 | 1157 |
 | v0.5 (after a warm-up request) | 1359 | 1383 | 1316 | 1154 |
 | v0.5 (full run, first prefill after boot) | 1299 | 1374 | 1306 | 1160 |
 | v0.4 | 1375 | 1378 | 1313 | 1160 |
@@ -127,7 +133,35 @@ v0.2's `G6_S2_DSEL_MCOST=2.9`, which it replaces.
 | 0024 | off (`G6_AR_WAITFOLD=1` measured) | decset: level (+0.3 % prose, within noise); one-GPU bench -0.18 ms per step |
 | 0025 | off (`G6_MTP_HEAD_SKIP=4` measured) | decset: prose -1.0 %, code +4.2 % from one prompt whose text changed, structured -1 % |
 | 0026 | `G6_K1_SPLIT=1:/4,3:2x1,4-32:/4` `G6_K1_TLBW=2048` (on top of 0023) | decset: prose +2.0 %, code +1.7 %, structured +1.5 % (three runs each); `k1_audit` at served routes: split table -11 us per MoE call at 3 rows (-2.9 %), translation prefetch -8.5 us per call with the route overlap; the MoE kernel reaches 85 % of a plain read of the same bytes with all 75 layers resident, 91 % with 8 |
+| 0027 | off (launcher rule for `--share-limit`) | no speed effect; accepts limits such as 98304 that the power-of-two rule kept out |
+| 0028 | off (`SHARE_LIMIT=98304` measured) | long-context decode below (one chain and the ninth bucket); with no limit the buckets, graphs and outputs are unchanged |
+| 0029 | `G6_CP_ONECHAIN=1` | long-context decode (below): 70K / 80K / 90K-token prompts 35.96 / 37.23 / 36.92 vs 34.71 / 36.32 / 36.29 tok/s flags-off (one run each, T=0, same output SHA); a 120K-prompt decode screen 37.0 vs 33.8 tok/s. Short prompts: level |
+| 0030 | (with `G6_MTP_KSTOP=1`) | correctness: a `G6_DFL_REUSE`-promoted session verifies at most `kmax` of the shared chain's drafts; no speed effect measured beyond the K-stop's own |
 | — | `SPEC_ACCEPT=rejection` (upstream option) | decset at T=1.0, top_p 0.95 (two runs each): prose +0.2 %, code +2.4 %, structured +6.2 %; T=0 unchanged |
+
+## Long context: one chain and the ninth bucket (v0.6)
+
+Past the replication boundary R, decode attention runs the other ranks' head groups on each rank's own keys. Upstream
+does that as one chain per remote head group (three at TP=4): 18 launches a layer. Patch 0029, `G6_CP_ONECHAIN=1`,
+folds them into one 48-head call: 8 launches a layer, byte-identical partials (`engine/attn/tests/cpgroups.cu`).
+Patch 0028 adds a ninth decode bucket, so the launcher's `--share-limit` can take a limit off the power-of-two
+doublings (98304) without merging the 2048 bucket away. Both were measured on one engine build (ident `8f52350c`),
+T=0, one run each, fresh boot per arm; decode tok/s on long prompts:
+
+| Configuration | 70K | 80K | 90K | ~120K (ctx table) |
+|---|---:|---:|---:|---:|
+| flags off | 34.71 | 36.32 | 36.29 | 33.8 |
+| `G6_CP_ONECHAIN=1` | 35.96 | 37.23 | 36.92 | 37.0 |
+| `SHARE_LIMIT=98304` (no one-chain) | 39.43 | 39.32 | 41.14 | 36.7 |
+
+- The one-chain arm's output SHA is identical to flags-off at all three sizes (bit-exact); the ninth bucket regroups
+  verify rows, so the `SHARE_LIMIT` arm's text differs (drafting class).
+- TTFT is level across the arms (80K: 12.9–13.1 s, 90K: 11.7–11.8 s; the 70K prompt includes a cold start,
+  55–56 s).
+- At short prompts the arms are level: `bench/decset.py` prose 42.69 (`SHARE_LIMIT`) vs 42.36 (off); the serving
+  configuration's own numbers (RigMark, conc table above) are level with v0.5.
+- `SHARE_LIMIT` costs maximum context: 310K → 212K. It stays off in the serving configuration; the one-chain call is
+  on.
 
 ## Multi-turn (prefix-cache hits)
 
@@ -162,6 +196,8 @@ Mean of the per-turn ratios (`bench/multiturn.py compare`): prefix-hit turns (A2
 
 | Check | Result |
 |---|---|
+| T=0 identity / KL, v0.6 | top-20 logprobs on the 75 qeval prompts vs the v0.5 configuration, prefix-cached pass: 34/75 identical, mean KL 2.7e-3 on the 3,590 common positions (noise scale 5.0e-3) |
+| Sampled qeval / T=0 qeval / needle, v0.6 | 577/600 sampled with `SPEC_ACCEPT=rejection` (v0.5 577/600; the dh32f reference 578/600, standard error 0.8 pp); 71/75 T=0; 96K needle correct |
 | T=0 identity / KL, v0.5 | the same check, rerun on v0.5: 34/75 identical, mean KL 2.7e-3 on the common prefix (noise scale 5.0e-3) |
 | Sampled qeval / T=0 qeval / needle, v0.5 | 577/600 sampled with `SPEC_ACCEPT=rejection`; 72/75 T=0; 96K needle correct |
 | T=0 identity / KL, v0.4 | the same check: 34/75 identical, mean KL 2.7e-3 on the common prefix (noise scale 5.0e-3, as below) |

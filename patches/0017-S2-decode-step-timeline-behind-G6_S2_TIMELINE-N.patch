@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Thu, 15 Oct 2026 08:51:12 +0200
-Subject: [PATCH 17/26] S2: decode step timeline behind G6_S2_TIMELINE=N
+Subject: [PATCH 17/30] S2: decode step timeline behind G6_S2_TIMELINE=N
 
 Every rank, off by default. Around each decode step launch (main,
 first-form draft, chain, DFlash2 context-only and query steps) the host

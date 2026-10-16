@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Fri, 16 Oct 2026 15:17:21 +0200
+Subject: [PATCH 30/30] S2 K-stop: verify at most kmax drafts (a session
+ G6_DFL_REUSE promoted keeps the shared chain's K)
+
+---
+ engine/runtime/s2_batch.h | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/engine/runtime/s2_batch.h b/engine/runtime/s2_batch.h
+index aa0e279..b0929a9 100644
+--- a/engine/runtime/s2_batch.h
++++ b/engine/runtime/s2_batch.h
+@@ -719,12 +719,14 @@ private:
+         for (int j = 1; j <= n; ++j) if (kprob(x, j) < ks_.tau[j]) return false;
+         return kprob(x, n) >= ks_.tau[n + 1];
+     }
+-    // KStop: the drafts of x.d[1..x.k] to verify (at least one)
++    // KStop: the drafts of x.d[1..x.k] to verify (at least one, at most kmax: a session G6_DFL_REUSE promoted holds the
++    // shared chain's K drafts, which can be more than kmax, and tau has kmax + 1 entries)
+     int kverify(const St& x, double* pe) const
+     {
+-        if (ks_.mode == 2) return sel_.m.choose(x.dlm.data(), x.k, x.k, pe);
++        const int n = std::min(x.k, kmax());
++        if (ks_.mode == 2) return sel_.m.choose(x.dlm.data(), n, n, pe);
+         int k = 0;
+-        while (k < x.k && kprob(x, k + 1) >= ks_.tau[k + 1]) ++k;
++        while (k < n && kprob(x, k + 1) >= ks_.tau[k + 1]) ++k;
+         return std::max(k, 1);
+     }
+     float dlp(int row) const { return h_.lp && (ks_.mode || ks_.log) ? h_.lp(row) : NAN; }

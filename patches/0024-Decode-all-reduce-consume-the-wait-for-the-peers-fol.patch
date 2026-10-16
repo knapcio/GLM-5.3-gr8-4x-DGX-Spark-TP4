@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Fri, 16 Oct 2026 04:42:40 +0200
-Subject: [PATCH 24/26] Decode all-reduce consume: the wait for the peers
+Subject: [PATCH 24/30] Decode all-reduce consume: the wait for the peers
  folded into the norm kernel behind G6_AR_WAITFOLD=1|2
 
 k_ar_wait_add_norm<W> (glue.cuh) runs k_ar_add_norm's loads, adds and stores in the same order after the wait

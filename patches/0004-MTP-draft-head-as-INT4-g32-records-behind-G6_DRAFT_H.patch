@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Thu, 15 Oct 2026 03:03:28 +0200
-Subject: [PATCH 04/26] MTP draft head as INT4 g32 records behind
+Subject: [PATCH 04/30] MTP draft head as INT4 g32 records behind
  G6_DRAFT_HEAD_I4
 
 G6_DRAFT_HEAD_I4=1 (default 0, needs --mtp): at boot every rank converts its

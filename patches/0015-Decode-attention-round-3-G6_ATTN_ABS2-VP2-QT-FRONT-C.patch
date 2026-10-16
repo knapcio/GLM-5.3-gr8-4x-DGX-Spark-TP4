@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Thu, 15 Oct 2026 20:06:12 +0200
-Subject: [PATCH 15/26] Decode attention round 3: G6_ATTN_ABS2 / VP2 / QT /
+Subject: [PATCH 15/30] Decode attention round 3: G6_ATTN_ABS2 / VP2 / QT /
  FRONT / CTX4 (exact, default off); attnk bench vs round 2
 
 absorb_m2 (G6_ATTN_ABS2=1|2|4|8): absorb_m with R outputs per warp (R weight rows in flight per lane), the q_b rows staged

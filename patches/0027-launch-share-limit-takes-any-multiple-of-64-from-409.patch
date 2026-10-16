@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Fri, 16 Oct 2026 04:23:20 +0200
+Subject: [PATCH 27/30] launch: --share-limit takes any multiple of 64 from
+ 4096
+
+The engine accepts any G6_CP_R that is a multiple of a KV page and inserts it as a decode bucket boundary
+(context_buckets.h), so the launcher's power-of-two rule only kept out limits such as 98304 (CAP 212224 at
+TP=4 with the default 1,981 pages a rank).
+---
+ KNOBS.md                     | 2 +-
+ docs/SETTINGS.md             | 2 +-
+ tools/launch/options.py      | 6 +++---
+ tools/launch/test_options.py | 5 ++++-
+ 4 files changed, 9 insertions(+), 6 deletions(-)
+
+diff --git a/KNOBS.md b/KNOBS.md
+index dd1ca77..d968df7 100644
+--- a/KNOBS.md
++++ b/KNOBS.md
+@@ -36,7 +36,7 @@ manifest instead.
+ |---|---|---|---|---|
+ | `CAP` | 310528 | 614400 | 241600 | KV pool in tokens, and so the longest context. Lower it first when a box runs short of memory. Unset, it follows `SHARE_LIMIT`: each rank keeps the same KV memory (1,981 pages of 64 tokens at TP=4, 2,026 at TP=6, 1,941 at TP=3) |
+ | `KV_FORMAT` | fp8 | fp8 | fp8 | experimental. The KV latent row: `fp8` (656 B) or `int4` (416 B, INT4 after a Hadamard rotation). `int4` runs `bin/g6m4-int4` (in the image; `KV_FORMAT=int4 ./gr8 glm53 build` builds it), and its default `CAP` keeps fp8's memory a rank: 415,232 at TP=4 (2,390 pages a rank, measured against fp8 at 1,920; the fp8 default is 1,981 now), 345,088 at TP=3 and 857,600 at TP=6 (estimates). At TP=4 it decodes about 3% slower and prefills about 6% faster, and finds the same needles. `docs/KV4.md` |
+-| `SHARE_LIMIT` | 65536 | 32768 | 65536 | requests up to this many tokens (prompt + `max_tokens`) share decode steps; a longer one waits for the others and runs alone. Every rank holds the first `SHARE_LIMIT` tokens of a session and a share of the rest, so a higher limit leaves a shorter longest context: at TP=4, 32768 gives `CAP` 408832. A power of two from 4096 |
++| `SHARE_LIMIT` | 65536 | 32768 | 65536 | requests up to this many tokens (prompt + `max_tokens`) share decode steps; a longer one waits for the others and runs alone. Every rank holds the first `SHARE_LIMIT` tokens of a session and a share of the rest, so a higher limit leaves a shorter longest context: at TP=4, 32768 gives `CAP` 408832 and 98304 gives 212224. A multiple of 64 from 4096 (a value that is not a power of two adds a decode bucket at the limit) |
+ | `SESS` | 8 | 8 | 8 | requests decoding at once (1-8); every reachable step graph is captured at boot (about 2.5 GiB at 8) |
+ | `REUSE` | 1 | 1 | 1 | 1 = `--reuse-prefix`: a request that continues an earlier one re-prefills only the new part. 0 = off |
+ | `KV_STORE` | off | off | off | experimental. Block stores below the KV pool (`--kv-store`, given once per store, or stores separated by `;` in a file or the environment), tried in order: `STORE,size=N(M\|G\|T)[,persist=on\|off]`. STORE is `ssd:PATH` (a folder on each box: rank r uses `PATH/r<r>`), `remote:HOST:PORT` or `remote:auto` (a KV node the mentat group announces, `./gr8 kv up`). An SSD store is cleared at every boot. With `persist=on` its system prefixes and the counts survive restarts while the model, layout, block format and engine build stay the same; a boot that served wrong output would hand them on, so persist only a store you trust. Sizes are per rank, G = 2^30. Needs `REUSE`. `engine/kvman-rs/REMOTE-TIER.md` |
+diff --git a/docs/SETTINGS.md b/docs/SETTINGS.md
+index 36fd1cc..5a8e5f4 100644
+--- a/docs/SETTINGS.md
++++ b/docs/SETTINGS.md
+@@ -71,7 +71,7 @@ the short version.
+ | `G6_DEC_SPLIT` | 3 | the decode step is captured as two graphs split at layer 3, so the second submission overlaps the first one's GPU time |
+ | `G6_DEC_SHARED_SCRATCH` | 1 | one decode attention scratch for all layers (frees memory for the big pool; needs `--pfv2`) |
+ | `G6_CP` | 1 | context-parallel KV on (build flag `-DG6_CP=1` too) |
+-| `G6_CP_R` | `SHARE_LIMIT` | the first R tokens of KV are replicated on every rank. Pages past R are spread across ranks. Under S2 it is also the largest request that shares decode steps. A decode bucket (2048 doubling) |
++| `G6_CP_R` | `SHARE_LIMIT` | the first R tokens of KV are replicated on every rank. Pages past R are spread across ranks. Under S2 it is also the largest request that shares decode steps. A multiple of 64; R is always a decode bucket boundary (a value off the 2048 doubling is added as a bucket of its own) |
+ | `G6_CP_S3` | 1 | CP combine order (1 = head-group overlap order, same arithmetic as 0) |
+ | `G6_CP_PF_VERIFY` | 1 | check every KV page staged to another rank against a hash |
+ | `G6_CP_PF_HASH2` | 1 | the fast HASH2 page hash for that check (build flag `-DG6_CP_PF_HASH2=1`). This is the "H2" in K1H2 |
+diff --git a/tools/launch/options.py b/tools/launch/options.py
+index a8ea7dd..4c96a18 100644
+--- a/tools/launch/options.py
++++ b/tools/launch/options.py
+@@ -300,9 +300,9 @@ def validate(o):
+         raise OptionError(f'--default-thinking-budget {o.get("DEFAULT_THINKING_BUDGET")}: want a whole number '
+                           '(0 = no limit)')
+     share = o.get('SHARE_LIMIT')
+-    if share is not None and not (str(share).isdigit() and int(share) >= 4096 and int(share) & (int(share) - 1) == 0):
+-        # the engine needs the limit to be one of its decode buckets (2048 doubling)
+-        raise OptionError(f'--share-limit {share}: want a power of two from 4096')
++    if share is not None and not (str(share).isdigit() and int(share) >= 4096 and int(share) % 64 == 0):
++        # the engine takes any multiple of a KV page (64 tokens) and makes it a decode bucket boundary (context_buckets.h)
++        raise OptionError(f'--share-limit {share}: want a multiple of 64 from 4096')
+     if o.get('V2') and not o.get('V2_SLICES'):
+         raise OptionError('--v2 needs --v2-slices')
+     if o.get('V2_DENSE_FORM') not in (None, 'trellis', 'rounded'):
+diff --git a/tools/launch/test_options.py b/tools/launch/test_options.py
+index 225ec4c..36b5fe9 100644
+--- a/tools/launch/test_options.py
++++ b/tools/launch/test_options.py
+@@ -221,7 +221,10 @@ class CanonicalTests(unittest.TestCase):
+         self.assertIn('G6_CP_R=32768 ', text)
+         _, text, _ = self.digest('--share-limit', '32768', '--cap', '200000')
+         self.assertIn('CAP=200000\n', text)
+-        for bad in ('3000', '4095', '0', 'x'):
++        _, text, _ = self.digest('--share-limit', '98304')
++        self.assertIn('CAP=212224\n', text)              # 98304 + (1981 - 1536) x 64 x 4
++        self.assertIn('G6_CP_R=98304 ', text)
++        for bad in ('3000', '4095', '4100', '0', 'x'):
+             with self.assertRaises(opt.OptionError):
+                 self.digest('--share-limit', bad)
+ 

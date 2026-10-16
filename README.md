@@ -1,7 +1,7 @@
 # Full GLM-5.3 on 4× NVIDIA DGX Spark with gr8 (TP4)
 
 A recipe for serving full [GLM-5.3](https://huggingface.co/zai-org/GLM-5.3) on four DGX Sparks with tensor parallelism
-4, using the [gr8](https://github.com/kindlingai/gr8) engine by kindlingai at a pinned upstream commit, plus twenty-six
+4, using the [gr8](https://github.com/kindlingai/gr8) engine by kindlingai at a pinned upstream commit, plus thirty
 small patches. The weights are kindlingai's EXLR8 quantization
 [kindlingai/glm-5.3-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4) (width manifest `home`),
 with GLM-5.3's own MTP layer and the [incoai/GLM-5.3-DFlash2](https://huggingface.co/incoai/GLM-5.3-DFlash2) drafter.
@@ -9,22 +9,24 @@ with GLM-5.3's own MTP layer and the [incoai/GLM-5.3-DFlash2](https://huggingfac
 This repository holds only the patches, the build, an example configuration and the results. It contains no engine
 fork, no weights and no images: the engine comes from upstream at `6448a16`, the weights from Hugging Face, the base
 image from upstream's registry. Every patch except the fabric MTU fix (0001, always on) is behind a flag that defaults
-to off, so the patched engine behaves as upstream until `G6ENV_X` turns the levers on.
+to off, so the patched engine behaves as upstream until `G6ENV_X` turns the levers on. The exceptions are the fabric
+MTU fix (0001, always on), the launcher's share-limit rule (0027, part of the launcher), and the K-stop cap (0030,
+active wherever the K-stop is on); 0028 changes the buckets only when `SHARE_LIMIT` is set.
 
-Release **v0.5**, 2026-10-16. The tables below are this release's measurements. What changed in each release, and by
+Release **v0.6**, 2026-10-16. The tables below are this release's measurements. What changed in each release, and by
 how much, is in [CHANGELOG.md](CHANGELOG.md); A/B measurements against earlier releases and the upstream baseline are
 in [docs/history.md](docs/history.md).
 
 ## RigMark — thinking on, effort low
 
-Measured 2026-10-16 on the v0.5 configuration with [RigMark](https://github.com/alexellis/rigmark) 1.0.0 (settings in
+Measured 2026-10-16 on the v0.6 configuration with [RigMark](https://github.com/alexellis/rigmark) 1.0.0 (settings in
 [Reproducing](#reproducing)), temperature 0, `reasoning_effort: low` (the model's chat template has no thinking-off
-mode). Each cell is RigMark's median for that workload. c1 decode and prefill: a run without the concurrency section,
-after one unrelated 8K warm-up request; concurrency: a full run.
+mode). Each cell is RigMark's median for that workload; the v0.6 numbers are from one full run (c1 decode, prefill and
+concurrency together).
 
 | c1 decode | prose | code | structured |
 |---|---:|---:|---:|
-| tok/s | 38.0 | 59.1 | 70.2 |
+| tok/s | 38.5 | 58.3 | 70.2 |
 
 Concurrency, aggregate end-to-end tok/s **[per-stream decode tok/s]**. At c ≥ 2 the sessions share verify steps and
 draft with MTP (the DFlash2 drafter serves a session that is alone), so code and structured, where DFlash2 drafts long
@@ -32,13 +34,13 @@ blocks, gain less from concurrency than prose.
 
 | Concurrency | C1 | C2 | C4 |
 |---|---:|---:|---:|
-| aggregate [per-stream] | 46.1 [51.5] | 57.4 [33.1] | 72.5 [22.0] |
+| aggregate [per-stream] | 46.3 [51.7] | 56.7 [33.0] | 73.3 [22.3] |
 
 Cold prefill, input tok/s (unique prompts, no prefix reuse). A 96K-token needle prompt: correct answer.
 
 | Prompt length | 8K | 32K | 64K | 128K |
 |---|---:|---:|---:|---:|
-| cold prefill tok/s | 1359 | 1383 | 1316 | 1154 |
+| cold prefill tok/s | 1375 | 1381 | 1306 | 1157 |
 
 The decode table by prompt type and concurrency from [`bench/conc.py`](bench/conc.py) and every release's results are
 in [docs/history.md](docs/history.md).
@@ -77,6 +79,10 @@ is in [docs/history.md](docs/history.md#multi-turn-prefix-cache-hits).
 | 0024 | Decode all-reduce: the wait for the peers folded into the norm kernel. Measured level with the serving flags; off | off | — | knapcio |
 | 0025 | MTP first form without its head on DFlash2 rounds that stay on DFlash2. Measured slower on prose; off | off | — | knapcio |
 | 0026 | MoE decode kernel: a split table per step row count (`G6_K1_SPLIT`: fc1 CTA shape and fc2 n-split, same summation order), and a translation prefetch at the start of each expert's fc1 (`G6_K1_TLBW`), because a step's routed experts touch about 5,300 2 MB pages per rank, more than the GPU's translation cache covers (about 4 GB). Also in the patch, off: the weight image from `cuMemCreate` chunks (`G6_IMG_VMM`) and the `k1_audit` bench | `G6_K1_SPLIT=1:/4,3:2x1,4-32:/4` `G6_K1_TLBW=2048` | bit-exact | knapcio |
+| 0027 | The launcher's `--share-limit` takes any multiple of 64 from 4096, not only powers of two, so a context-share limit such as 98304 (the cap is 212224 at TP=4) is accepted | off (`--share-limit` when wanted) | — (launcher) | knapcio |
+| 0028 | Decode buckets: nine slots instead of eight, so a share limit off the power-of-two doublings (98304) no longer merges the 2048 bucket away and short-context steps keep their own graph. With no limit, or a power-of-two limit, the bucket list, the graphs and the outputs are those of before | off (`SHARE_LIMIT=…` when wanted) | bit-exact with the defaults; a ninth-bucket configuration regroups verify rows and can change T=0 output | knapcio |
+| 0029 | CP decode: past R, the other ranks' head groups run as one 48-head attention call (one `k_vget`, one call whose merge writes each group's partial, the three puts in the S1 order) instead of three separate chains: 8 launches a layer instead of 18. TP=4 only, and not with `G6_ATTN_FLIP` | `G6_CP_ONECHAIN=1` | bit-exact | knapcio |
+| 0030 | S2 K-stop: a session that `G6_DFL_REUSE` promoted keeps the shared chain's K drafts; at most `kmax` of them are verified (the confidence stop's `tau` has `kmax` + 1 entries). No new flag: it tightens 0013 wherever the K-stop is on | (with `G6_MTP_KSTOP=1`) | drafting | knapcio |
 
 The measured contribution of each lever is in [docs/history.md](docs/history.md#per-lever-contributions).
 
@@ -107,9 +113,9 @@ not guaranteed byte-identical to upstream over long generations.
 
 | Check | Result |
 |---|---|
-| T=0 identity / KL | v0.5, top-20 logprobs on the 75 qeval prompts vs an earlier configuration (GEMV split + INT4 draft heads + DSel probe 32), prefix-cached pass: mean KL 2.7e-3 on the common prefix, below the batching-noise scale (details in [docs/history.md](docs/history.md)) |
+| T=0 identity / KL | v0.6, top-20 logprobs on the 75 qeval prompts vs the v0.5 configuration, prefix-cached pass: mean KL 2.7e-3 on the 3,590 common positions, below the batching-noise scale (details in [docs/history.md](docs/history.md)) |
 | Sampled qeval | 577/600 (T=1.0, top_p 0.95, 8 seeds × 75 tasks, rejection sampling: `SPEC_ACCEPT=rejection`) |
-| T=0 qeval | 72/75, single run |
+| T=0 qeval | 71/75, single run |
 | Needle | 96K-token needle: correct answer |
 | GEMV split exactness, m4sim | every combination of `G6_QA_SPLIT` / `G6_IDXQ_SPLIT` / `G6_MTP_SPLIT` byte-identical to flags off on the plain, graph, MTP, S2 and CP paths: 30/30 |
 | Attention exactness, attnk bench (rounds 1 and 2, serving flags) | byte-identical to stock at T 2K / 8K / 32K × M 1 / 3 / 8 / 12 |
@@ -117,6 +123,8 @@ not guaranteed byte-identical to upstream over long generations.
 | Parallel drafter step (`G6_DRAFT_PAR=1`) | same tokens, steps and statistics as serial in `batch_draftpar_test`; identical T=0 output on the four-box cluster |
 | Route overlap exactness | identical T=0 output on the four-box cluster; byte-compared by `engine/kernels/tests/k1_ovl_test.cu` |
 | L2 prefetch and MoE split / translation prefetch exactness (`G6_L2PF`, `G6_K1_SPLIT`, `G6_K1_TLBW`) | byte-identical in `l2pf_bench` and `k1_audit`; T=0 top-20 logprobs on the 75 qeval prompts identical to the configuration without them, 75/75 prompts, KL 0 (fresh boot each) |
+| CP one-chain attention (`G6_CP_ONECHAIN=1`) | the merged call's partials byte-identical to the three separate calls (`engine/attn/tests/cpgroups.cu`); identical T=0 decode at 70K / 80K / 90K-token prompts (same output SHA as the flags-off boot) |
+| Ninth decode bucket (`SHARE_LIMIT=98304`) | with the defaults the buckets, graphs and outputs are unchanged (host tests of `context_buckets`); a ninth bucket regroups verify rows, so its T=0 output is not comparable byte for byte (drafting class) |
 
 qeval is the 75-task quality screen from the earlier
 [GLM-5.3 recipe](https://github.com/knapcio/GLM-5.3-4x-DGX-Spark-TP4) (`bench/qeval.py`). The m4sim exactness runs used
@@ -128,7 +136,7 @@ and KL checks against earlier configurations are in [docs/history.md](docs/histo
 - **Engine flags** (serving): `G6ENV_X` and `SPEC_ACCEPT` in [docker/env.example](docker/env.example), the same lines on every box:
 
   ```bash
-  G6ENV_X="G6_QA_SPLIT=1 G6_IDXQ_SPLIT=1 G6_MTP_SPLIT=1 G6_DRAFT_HEAD_I4=1 G6_DFL_HEAD_I4=1 G6_S2_DSEL_PROBE=32 G6_ROUTE_OVL=1 G6_ATTN_SC2=4 G6_ATTN_SC2_TR=2 G6_ATTN_CTX2=4 G6_ATTN_CTX3=2 G6_ATTN_SEL2=16 G6_IDX_GRP=16 G6_MTP_KSTOP=1 G6_MTP_KSTOP_KMAX=3 G6_MTP_KSTOP_TAU=0,0.5,0.75 G6_DFL_REUSE=2 G6_ATTN_QT=1 G6_ATTN_FRONT=1 G6_DRAFT_PAR=1 G6_S2_DSEL_MODEL=1 G6_S2_DSEL_TABLE=v2:46.63,v3:54.71,v4:63.99,v5:71.54,v6:79.37,v7:88.23,v8:96.82,d:7.285,m:2.039,e:1.155,p:5.026,g:1.107,k:2.177,n:2.486,w:1,r:0.95 G6_DFL_BODY_I4=1 G6_L2PF=15 G6_K1_SPLIT=1:/4,3:2x1,4-32:/4 G6_K1_TLBW=2048"
+  G6ENV_X="G6_QA_SPLIT=1 G6_IDXQ_SPLIT=1 G6_MTP_SPLIT=1 G6_DRAFT_HEAD_I4=1 G6_DFL_HEAD_I4=1 G6_S2_DSEL_PROBE=32 G6_ROUTE_OVL=1 G6_ATTN_SC2=4 G6_ATTN_SC2_TR=2 G6_ATTN_CTX2=4 G6_ATTN_CTX3=2 G6_ATTN_SEL2=16 G6_IDX_GRP=16 G6_MTP_KSTOP=1 G6_MTP_KSTOP_KMAX=3 G6_MTP_KSTOP_TAU=0,0.5,0.75 G6_DFL_REUSE=2 G6_ATTN_QT=1 G6_ATTN_FRONT=1 G6_DRAFT_PAR=1 G6_S2_DSEL_MODEL=1 G6_S2_DSEL_TABLE=v2:46.63,v3:54.71,v4:63.99,v5:71.54,v6:79.37,v7:88.23,v8:96.82,d:7.285,m:2.039,e:1.155,p:5.026,g:1.107,k:2.177,n:2.486,w:1,r:0.95 G6_DFL_BODY_I4=1 G6_L2PF=15 G6_K1_SPLIT=1:/4,3:2x1,4-32:/4 G6_K1_TLBW=2048 G6_CP_ONECHAIN=1"
   SPEC_ACCEPT=rejection
   ```
 
@@ -162,6 +170,9 @@ and KL checks against earlier configurations are in [docs/history.md](docs/histo
 
 - **Decode table**: `python3 bench/conc.py --prompts <rigmark>/prompts.json` against the head's API (rounds 3,
   256 output tokens).
+- **Optional context-share limit**: `SHARE_LIMIT=98304` in `G6ENV_X` (the launcher's `--share-limit`, patches 0027 and
+  0028) speeds up long-context decode ([docs/history.md](docs/history.md#long-context-one-chain-and-the-ninth-bucket-v06))
+  and costs maximum context (310K → 212K). Off by default; not part of the serving configuration.
 - **Decode over 24 prompts** (used for the release A/B in [CHANGELOG.md](CHANGELOG.md)): `python3 bench/decset.py`
   against the head's API; 12 prose, 6 code and 6 structured prompts in the script, c1, T=0, 384 output tokens.
 
@@ -228,6 +239,7 @@ and KL checks against earlier configurations are in [docs/history.md](docs/histo
   T=0, within the same class as batching; a wrong table mainly costs speed.
 - **The parallel drafter step (0016) acts on a session that is alone** drafting with DFlash2; batched rounds run as in
   upstream.
+- **`G6_CP_ONECHAIN=1` is TP=4 only and refuses `G6_ATTN_FLIP`**: the boot dies if either does not hold.
 - **Never set `G6_ATTN_P11=1`**: it takes precedence over `G6_ATTN_SC2` / `G6_ATTN_CTX2` / `G6_ATTN_CTX3` and replaces
   the measured attention kernels.
 
@@ -241,7 +253,7 @@ gr8 expects, and about 90 GB of disk per box for its part of the model.
    engine and places it in the pinned upstream image:
 
    ```bash
-   docker buildx build --platform linux/arm64 -t gr8-glm53-recipe:v0.5 --load .
+   docker buildx build --platform linux/arm64 -t gr8-glm53-recipe:v0.6 --load .
    ```
 
    Use the same image on all four boxes (build it on each, or `docker save` / `docker load`).

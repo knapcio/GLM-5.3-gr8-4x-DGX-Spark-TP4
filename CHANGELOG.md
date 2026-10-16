@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.6 — 2026-10-16
+
+v0.5 plus four patches, thirty in all. Upstream base (`6448a16`) unchanged; patches 0001–0026 differ only in the series
+count of their subject lines.
+
+- CP decode in one chain (0029), `G6_CP_ONECHAIN=1`: past the replication boundary, the other ranks' head groups run as
+  one 48-head attention call (one `k_vget`, one call whose merge writes each group's partial, the three puts in the S1
+  order) instead of three separate chains — 8 launches a layer instead of 18. Bit-exact: `engine/attn/tests/cpgroups.cu`
+  byte-compares the merged partials against the three calls, and the long-prompt decode output is identical (same SHA as
+  flags-off at 70K / 80K / 90K-token prompts). TP=4 only, and the boot refuses `G6_ATTN_FLIP` with it.
+- The launcher's `--share-limit` takes any multiple of 64 from 4096 (0027), not only powers of two, so a context-share
+  limit such as 98304 (the cap is 212224 at TP=4) is accepted. The Dockerfile also copies the patched launcher options
+  into the runtime image, so the limit works in the served container.
+- Decode buckets: nine slots instead of eight (0028), so a limit off the doublings no longer merges the 2048 bucket away
+  and short-context steps keep their own graph. With no limit, or a power-of-two limit, the buckets, graphs and outputs
+  are those of before.
+- S2 K-stop (0030): a session that `G6_DFL_REUSE` promoted keeps the shared chain's K drafts; at most `kmax` of them are
+  verified (the confidence stop's `tau` has `kmax` + 1 entries). No new flag: it tightens 0013 wherever the K-stop is on.
+- `docker/env.example`: `G6ENV_X` gains `G6_CP_ONECHAIN=1`; image tag `gr8-glm53-recipe:v0.6`. `SHARE_LIMIT` stays off:
+  it costs maximum context (310K → 212K); it is a documented option ([README](README.md#reproducing),
+  [docs/history.md](docs/history.md#long-context-one-chain-and-the-ninth-bucket-v06)).
+
+Measured against v0.5 on the same machines: RigMark full run prose 38.5 / code 58.3 / structured 70.2 (v0.5 37.8 / 57.9 /
+70.2), C1/C2/C4 aggregate 46.3 / 56.7 / 73.3 (v0.5 46.1 / 57.4 / 72.5); the decode table (median of three boots, details
+in [docs/history.md](docs/history.md#decode-by-prompt-type-and-concurrency-releases)) is level with v0.5 within about
+1 tok/s per cell; cold prefill 1375 / 1381 / 1306 / 1157 tok/s (8K–128K). The release's gains are in long-context
+decode ([docs/history.md](docs/history.md#long-context-one-chain-and-the-ninth-bucket-v06)): `G6_CP_ONECHAIN=1`
++1.7…+3.6 % at 70K–90K and +9.5 % at a ~120K-token prompt; `SHARE_LIMIT=98304` (without the one-chain call)
++8.3…+13.6 % at 70K–90K. Short prompts: level. T=0 top-20 logprobs on the 75 qeval prompts vs v0.5, prefix-cached pass:
+34/75 identical, mean KL 2.7e-3 (batching-noise scale 5.0e-3). Sampled qeval 577/600 (T=1.0 with rejection sampling;
+v0.5 577/600, the dh32f reference 578/600); T=0 qeval 71/75; 96K needle correct.
+
 ## v0.5 — 2026-10-16
 
 v0.4 plus four patches, twenty-six in all, and one upstream launcher option. Upstream base (`6448a16`) unchanged;

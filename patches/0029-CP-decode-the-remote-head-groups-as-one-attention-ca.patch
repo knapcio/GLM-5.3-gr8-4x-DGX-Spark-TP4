@@ -1,0 +1,425 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Fri, 16 Oct 2026 04:33:44 +0200
+Subject: [PATCH 29/30] CP decode: the remote head groups as one attention call
+ behind G6_CP_ONECHAIN=1
+
+Past R each rank runs the other ranks' head groups over its own keys: today one k_vget, cp_group (scores, cp_softmax,
+context parts, merge) and k_vput per group, 18 launches a layer at TP=4. With G6_CP_ONECHAIN=1 one k_vget_heads puts
+the three groups' q / rope side by side and g6_attn_cp_groups runs one 48-head call whose merge (merge_parts_g) writes
+each group's partial into its own block; the three puts follow in the S1 order (8 launches). Every kernel indexes a
+(row, head) by row * heads + h and batches heads in groups that divide 16, so each head runs the 16-head kernel on the
+same operands in the same order: the published partials are byte-identical (engine/attn/tests/cpgroups.cu compares
+them and times both forms on one GPU). TP=4 only and not with G6_ATTN_FLIP (the boot dies otherwise); about 1.3 MB per
+CP fabric row for the gathered queries and the call's own scratch. Off (default): unchanged.
+---
+ docs/SETTINGS.md              |   1 +
+ engine/attn/attn.cu           |  49 ++++++++++
+ engine/attn/attn.h            |   7 ++
+ engine/attn/tests/cpgroups.cu | 178 ++++++++++++++++++++++++++++++++++
+ engine/kernels/cpglue.cuh     |  23 +++++
+ engine/runtime/rank.cuh       |  47 ++++++++-
+ 6 files changed, 302 insertions(+), 3 deletions(-)
+ create mode 100644 engine/attn/tests/cpgroups.cu
+
+diff --git a/docs/SETTINGS.md b/docs/SETTINGS.md
+index 5a8e5f4..83f1291 100644
+--- a/docs/SETTINGS.md
++++ b/docs/SETTINGS.md
+@@ -73,6 +73,7 @@ the short version.
+ | `G6_CP` | 1 | context-parallel KV on (build flag `-DG6_CP=1` too) |
+ | `G6_CP_R` | `SHARE_LIMIT` | the first R tokens of KV are replicated on every rank. Pages past R are spread across ranks. Under S2 it is also the largest request that shares decode steps. A multiple of 64; R is always a decode bucket boundary (a value off the 2048 doubling is added as a bucket of its own) |
+ | `G6_CP_S3` | 1 | CP combine order (1 = head-group overlap order, same arithmetic as 0) |
++| `G6_CP_ONECHAIN` | 0 | 1 = past R, the other ranks' head groups run as one attention call of 48 heads instead of three of 16 (the scores, softmax, context and merge kernels once per layer, not three times; their partials are published after it, in the order `G6_CP_S3=0` uses). Byte-exact. TP=4 only, and not with `G6_ATTN_FLIP`; about 1.3 MB a row of the CP fabric's rows (`G6_CP_MMAX`) for the gathered queries and the call's scratch |
+ | `G6_CP_PF_VERIFY` | 1 | check every KV page staged to another rank against a hash |
+ | `G6_CP_PF_HASH2` | 1 | the fast HASH2 page hash for that check (build flag `-DG6_CP_PF_HASH2=1`). This is the "H2" in K1H2 |
+ | `G6_PROGRESS_ISOLATE` | 1 | just before the first fabric barrier, move every thread that is not a fabric proxy thread off the proxy CPUs (the cores of the proxies this rank started, see `--proxy-cpu`) so no worker thread can preempt a progress thread. 0 = off (the A/B switch). Anything but 0/1 is rejected at startup. A thread that cannot be moved is named in the log |
+diff --git a/engine/attn/attn.cu b/engine/attn/attn.cu
+index 3ced2de..9936d1f 100644
+--- a/engine/attn/attn.cu
++++ b/engine/attn/attn.cu
+@@ -911,6 +911,18 @@ __global__ void cp_softmax(Input input,float* scores,float* m_out,float* l_out){
+     float s=0;for(int j=t;j<TOP;j+=256){float v=isfinite(mx)?expf(p[j]-mx):0;p[j]=v;s+=v;}s=warp_sum(s);if((t&31)==0)tmp[t/32]=s;__syncthreads();
+     if(t==0){den=0;for(int j=0;j<8;j++)den+=tmp[j];m_out[i]=mx;l_out[i]=den;}
+ }
++// G6_CP_ONECHAIN (cp_groups_body): merge_parts over a call of G head groups of gh heads (a.heads = G gh), each group's
++// (row, head) written into its own partial block as cp_group_body writes it: (row, head h) of the call is (row, h % gh) of
++// group g = h / gh, block g at part + g gblk = c [n][gh][512], m [n][gh], l [n][gh]; m / l come from cp_softmax's
++// [n x heads] outputs ml (m) and ml + n heads (l). The sum is merge_parts' (parts 0..P-1 in order).
++template<class Input,int P>
++__global__ void merge_parts_g(Input input,const float* parts,const float* ml,float* part,int gh,int64_t gblk){
++    auto a=resolve(input);if(!a.active)return;
++    const int rowhead=blockIdx.x,t=threadIdx.x,row=rowhead/a.heads,h=rowhead%a.heads,j=row*gh+h%gh;
++    const int64_t nb=(int64_t)a.rows*gh;float* b=part+(int64_t)(h/gh)*gblk;
++    for(int d=t;d<512;d+=256){float s=0;for(int part=0;part<P;part++)s+=parts[((int64_t)rowhead*P+part)*512+d];b[(int64_t)j*512+d]=s;}
++    if(t==0){const int64_t nh=(int64_t)a.rows*a.heads;b[nb*512+j]=ml[rowhead];b[nb*513+j]=ml[nh+rowhead];}
++}
+ // LSE merge of my head group's partials in shard order 0..cp_nr-1: M = max m_s, w_s = exp(m_s - M), L = sum w_s l_s,
+ // ctx = (sum w_s c_s) / L. part_all: [s] blocks of c [n][H][512], m [n][H], l [n][H] (n = a.rows); block stride rounded
+ // up to 4 floats (16 B; NR=6 head groups of 10/11 heads make n*H*514 odd x 2)
+@@ -965,6 +977,23 @@ static cudaError_t cp_group_body(const G6Attn& a,Input input,Work w,const float*
+     launch_merge_parts(a,input,w.parts,part,n,stream);
+     return cudaGetLastError();
+ }
++// G6_CP_ONECHAIN: cp_group_body over G head groups at once (a.heads = G gh; q / rope [n][G gh][512] / [64], the groups'
++// heads side by side), each group's partial into its block (merge_parts_g). The scores / context kernels index every
++// (row, head) by row * a.heads + h and batch heads in groups of 16 (scores) or 2..16 (context), which divide gh
++// (g6_attn_cp_groups_ok), so each head runs the H-head call's kernel with its operands in the same order: the same bits.
++// w: prob [n heads][TOP], parts [n heads][P][512], ml [2][n heads] (g6_attn_cp_groups_bytes).
++template<class Input>
++static cudaError_t cp_groups_body(const G6Attn& a,Input input,Work w,float* ml,const float* q,const float* rope,float* part,int gh,
++                                  int64_t gblk,cudaStream_t stream){
++    const int n=a.rows,nh=n*a.heads;
++    w.q=const_cast<float*>(q);w.rope=const_cast<float*>(rope);
++    launch_mla_scores(a,input,w,0,n,stream);
++    cp_softmax<<<nh,256,0,stream>>>(input,w.prob,ml,ml+nh);
++    launch_context_parts(a,input,w,0,n,stream);
++    if(ctx_e1(a,n))merge_parts_g<Input,PART_E1><<<nh,256,0,stream>>>(input,w.parts,ml,part,gh,gblk);
++    else merge_parts_g<Input,PART><<<nh,256,0,stream>>>(input,w.parts,ml,part,gh,gblk);
++    return cudaGetLastError();
++}
+ template<class Input>
+ static cudaError_t cp_finish_body(const G6Attn& a,Input input,Work& w,const float* part_all,cudaStream_t stream){
+     const int n=a.rows;
+@@ -1089,6 +1118,26 @@ extern "C" int g6_attn_cp_finish(const G6Attn* a,const G6AttnStepCell* cell,void
+     cudaStream_t stream=(cudaStream_t)s;
+     return cp_call(a,cell,scratch,bytes,[&](auto in,ga::Work& w){return ga::cp_finish_body(*a,in,w,part_all,stream);});
+ }
++extern "C" int g6_attn_cp_groups_ok(int gh){return gh>0&&gh%16==0&&ga::attn_flip_min()<0;}
++// prob, parts, ml of cp_groups_body, each 256-B aligned
++static size_t cp_groups_at(int heads,int rows,int k){
++    const size_t nh=(size_t)heads*rows,b[3]={nh*ga::TOP*4,nh*(ga::attn_ctx2()==9?ga::PART_E1:ga::PART)*512*4,nh*2*4};
++    size_t o=0;for(int i=0;i<k;i++)o+=(b[i]+255)&~size_t(255);return o;
++}
++extern "C" size_t g6_attn_cp_groups_bytes(int heads,int rows){return heads>0&&rows>0?cp_groups_at(heads,rows,3):0;}
++extern "C" int g6_attn_cp_groups(const G6Attn* a,const G6AttnStepCell* cell,void* buf,size_t bytes,const float* q,const float* rope,
++                                 float* part,int gh,int64_t gblk,void* s){
++    if(!a||!a->indices||!a->mla_cache||!a->block_table||!buf||!q||!rope||!part||!g6_attn_cp_groups_ok(gh)||a->heads%gh||
++       a->heads/gh>7)return (int)cudaErrorInvalidValue;
++    G6Attn one=*a;one.heads=gh;   // the call's shape is that of each group's call
++    if(!ga::cp_ok(&one)||bytes<g6_attn_cp_groups_bytes(a->heads,a->rows)||gblk<(int64_t)a->rows*gh*514)return (int)cudaErrorInvalidValue;
++    cudaStream_t stream=(cudaStream_t)s;
++    ga::Work w{};char* b=(char*)buf;
++    w.prob=(float*)(b+cp_groups_at(a->heads,a->rows,0));w.parts=(float*)(b+cp_groups_at(a->heads,a->rows,1));
++    float* ml=(float*)(b+cp_groups_at(a->heads,a->rows,2));
++    if(cell)return (int)ga::cp_groups_body(*a,ga::ReplayInput{*a,cell},w,ml,q,rope,part,gh,gblk,stream);
++    return (int)ga::cp_groups_body(*a,*a,w,ml,q,rope,part,gh,gblk,stream);
++}
+ extern "C" int g6_attn_cp_qabs(const G6Attn* a,void* scratch,const float** q,const float** rope){
+     if(!ga::cp_ok(a)||!scratch||!q||!rope)return (int)cudaErrorInvalidValue;
+     auto w=ga::workspace(*a,scratch);if(!w.total)return (int)cudaErrorInvalidValue;
+diff --git a/engine/attn/attn.h b/engine/attn/attn.h
+index 8e4e10a..7c2a811 100644
+--- a/engine/attn/attn.h
++++ b/engine/attn/attn.h
+@@ -57,6 +57,13 @@ extern "C" int g6_attn_cp_index(const G6Attn*,const G6AttnStepCell* cell,void* s
+ extern "C" int g6_attn_cp_merge_index(const G6Attn*,const G6AttnStepCell* cell,const uint64_t* cand_all,void* stream);
+ // split-K partial of one head group over my score-owned keys of the merged list: unnormalized (m, l, c)
+ extern "C" int g6_attn_cp_group(const G6Attn*,const G6AttnStepCell* cell,void* scratch,size_t bytes,const float* q,const float* rope,float* part,void* stream);
++// G6_CP_ONECHAIN: g6_attn_cp_group of G head groups of gh heads in ONE call (a->heads = G * gh): q / rope [M][G gh][512] /
++// [M][G gh][64] (group g's heads at g * gh), group g's partial into part + g * gblk floats (gblk >= M * gh * 514). The same bits
++// as G calls when g6_attn_cp_groups_ok(gh). buf: device, g6_attn_cp_groups_bytes(G * gh, M) bytes (its own scratch)
++extern "C" int g6_attn_cp_groups_ok(int gh);
++extern "C" size_t g6_attn_cp_groups_bytes(int heads,int rows);
++extern "C" int g6_attn_cp_groups(const G6Attn*,const G6AttnStepCell* cell,void* buf,size_t bytes,const float* q,const float* rope,float* part,
++                                 int gh,int64_t gblk,void* stream);
+ // LSE merge of part_all in shard order 0..cp_nr-1 -> context -> value_project -> a->output
+ extern "C" int g6_attn_cp_finish(const G6Attn*,const G6AttnStepCell* cell,void* scratch,size_t bytes,const float* part_all,void* stream);
+ // my absorbed query in the scratch workspace (valid after g6_attn_cp_front)
+diff --git a/engine/attn/tests/cpgroups.cu b/engine/attn/tests/cpgroups.cu
+new file mode 100644
+index 0000000..5c310a3
+--- /dev/null
++++ b/engine/attn/tests/cpgroups.cu
+@@ -0,0 +1,178 @@
++// cpgroups: G6_CP_ONECHAIN on one GPU. Past R every layer of a CP step runs, on each rank, the other ranks' head groups
++// over its own keys (rank.cuh launch_attn_cp, phase 1). Stock (G6_CP_S3=1, as served): per remote group k = 1..nr-1 a
++// k_vget of its q / rope from the q all-gather slot, g6_attn_cp_group (scores, cp_softmax, context parts, merge) of 16
++// heads, a k_vput of its partial. ONE: one k_vget_heads (the three payloads side by side), one g6_attn_cp_groups of 48
++// heads (each partial into its own block), the same three k_vput. The fabric is device memory here (the recv slots hold
++// what the peers' k_vput packed, the send slots are what this rank publishes; doorbells / tickets / error word in device
++// memory), so the step is rank 0 of NR=4 at live context L in capture bucket T with the CP page map of R (pages < R/64
++// replicated, the rest every NR-th page), indices = 2048 distinct positions <= the row's position (uniform; CPG_LOCAL=n:
++// the n most recent positions first, as a local window), so about 1/NR of the slots are this rank's (printed).
++//   EXACT  bytes of the three published partials (send slots, poisoned before every step) ONE vs stock, x chk.
++//   TIME   one step's phase-1 body (the 7 / 9 launches above) inside a graph of K steps, median of TR alternating trials,
++//          hot (no flush) and cold (a 96 MB L2 flush before every step, subtracted: the served case, the experts stream
++//          between layers). Saved per layer, and per step x 78 layers (every layer takes the CP block past R).
++//   Decision (from the brief, before running): keep G6_CP_ONECHAIN for a fleet test only if every arm is IDENTICAL and it
++//   saves >= 20 us per layer cold at the realistic shape (T 131072, L 70000-80000, R 65536) for M = 1 and 3; reject below.
++// Arms: env CPG_ARMS="arm arm ..." with an arm = comma-separated KEY=VALUE attention flags (SC2 TR CTX2 CTX3 HG CTX4) or
++// "stock" (all 0); default "SC2=4,TR=2,CTX2=4,CTX3=2 stock" (the served flags, then the kernels without them).
++// build (from engine/attn/tests), with the engine's flags (scripts/build.sh K1H2_FLAGS, -DG6_NR=4 -DDEC_S2 -DPF_F12):
++//   nvcc -O3 -std=c++17 -gencode=arch=compute_121a,code=sm_121a $FLAGS -o cpgroups cpgroups.cu ../bind.cu -lcublas
++// run: cpgroups T L M [R=65536] [reps=10] [K=16] [TR=7] [chk=3]
++//   sweep: for M in 1 3 12; do ./cpgroups 131072 75000 $M; done; ./cpgroups 131072 70000 3; ./cpgroups 131072 80000 3
++// Exit 3 on any byte difference, 1 on a CUDA / validation error.
++#include "../attn.cu"
++#include "../../kernels/cpglue.cuh"
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <string>
++#include <vector>
++#include <algorithm>
++#define CK(x) do{cudaError_t e_=(x);if(e_!=cudaSuccess){fprintf(stderr,"%s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e_));exit(1);}}while(0)
++#define CKI(x) do{int e_=(x);if(e_){fprintf(stderr,"%s:%d status %d (%s)\n",__FILE__,__LINE__,e_,cudaGetErrorString((cudaError_t)e_));exit(1);}}while(0)
++
++__device__ uint32_t hsh(uint64_t x){x^=x>>33;x*=0xff51afd7ed558ccdull;x^=x>>33;x*=0xc4ceb9fe1a85ec53ull;x^=x>>33;return (uint32_t)x;}
++__device__ float unif(uint64_t seed,uint64_t i){return (float)(hsh(seed*0x9e3779b97f4a7c15ull+i)>>8)*(2.f/16777216.f)-1.f;}   // [-1, 1)
++__global__ void fill_f32(float* p,size_t n,uint64_t seed,float s){
++    for(size_t i=blockIdx.x*(size_t)blockDim.x+threadIdx.x;i<n;i+=(size_t)gridDim.x*blockDim.x)p[i]=s*unif(seed,i);}
++__device__ uint8_t fin8(uint32_t v){uint8_t b=(uint8_t)v;if((b&0x7f)==0x7f)b^=1;return b;}   // finite e4m3 code
++__global__ void fill_kv(uint8_t* c,size_t rows,uint64_t seed){   // latent rows (kvfmt.h) with finite codes, positive scales
++    for(size_t r=blockIdx.x;r<rows;r+=gridDim.x){uint8_t* v=c+r*g6kv::ROW;const int t=threadIdx.x;
++#if G6_KV4
++        if(t<256)v[t]=(uint8_t)hsh(seed+r*1000+t);
++        if(t<16)((__half*)(v+g6kv::SCALE_OFF))[t]=__float2half(0.02f*(1.5f+unif(seed+7,r*16+t)));
++#else
++        for(int d=t;d<512;d+=blockDim.x)v[d]=fin8(hsh(seed+r*1000+d));
++        if(t<4)((float*)(v+g6kv::SCALE_OFF))[t]=0.004f*(1.5f+unif(seed+7,r*4+t));
++#endif
++        if(t<64)((__nv_bfloat16*)(v+g6kv::ROPE_OFF))[t]=__float2bfloat16(0.5f*unif(seed+9,r*64+t));}
++}
++__global__ void l2_flush(const float4* p,size_t n,float* sink){
++    float acc=0;for(size_t i=blockIdx.x*(size_t)blockDim.x+threadIdx.x;i<n;i+=(size_t)gridDim.x*blockDim.x){float4 v=p[i];acc+=v.x+v.y+v.z+v.w;}
++    if(acc==1234.5f)*sink=acc;   // never (the buffer is zero); keeps the loads
++}
++template<class T> static T* dalloc(size_t n){T* p;CK(cudaMalloc(&p,n*sizeof(T)));CK(cudaMemset(p,0,n*sizeof(T)));return p;}
++template<class T> static std::vector<T> host(const T* d,size_t n){std::vector<T> h(n);CK(cudaMemcpy(h.data(),d,n*sizeof(T),cudaMemcpyDeviceToHost));return h;}
++static float med(std::vector<float> v){std::sort(v.begin(),v.end());return v[v.size()/2];}
++template<class F> static cudaGraphExec_t inst(cudaStream_t st,F body){
++    cudaGraph_t g;CK(cudaStreamBeginCapture(st,cudaStreamCaptureModeThreadLocal));body();CK(cudaStreamEndCapture(st,&g));
++    cudaGraphExec_t x;CK(cudaGraphInstantiate(&x,g,0));CK(cudaGraphDestroy(g));return x;}
++static float run_us(cudaGraphExec_t x,cudaStream_t st,int reps){   // us per graph launch
++    for(int i=0;i<2;i++)CK(cudaGraphLaunch(x,st));
++    cudaEvent_t a,b;CK(cudaEventCreate(&a));CK(cudaEventCreate(&b));CK(cudaEventRecord(a,st));
++    for(int i=0;i<reps;i++)CK(cudaGraphLaunch(x,st));
++    CK(cudaEventRecord(b,st));CK(cudaEventSynchronize(b));float ms;CK(cudaEventElapsedTime(&ms,a,b));
++    cudaEventDestroy(a);cudaEventDestroy(b);return ms*1000.f/reps;
++}
++struct Arm{int sc,tr,ctx2,ctx3,hg,ctx4;};
++static void set_arm(const Arm& x){ga::attn_sc2()=x.sc;ga::attn_sc2_tr()=x.tr;ga::attn_ctx2()=x.ctx2;ga::attn_ctx3()=x.ctx3;ga::attn_ctx3_hg()=x.hg;ga::attn_ctx4()=x.ctx4;}
++static bool parse_arm(const std::string& s,Arm& x){
++    x=Arm{0,0,0,0,0,0};if(s=="stock")return true;
++    size_t i=0;while(i<s.size()){size_t e=s.find(',',i);if(e==std::string::npos)e=s.size();const std::string kv=s.substr(i,e-i);i=e+1;
++        const size_t q=kv.find('=');if(q==std::string::npos)return false;const std::string k=kv.substr(0,q);const int v=atoi(kv.c_str()+q+1);
++        if(k=="SC2")x.sc=v;else if(k=="TR")x.tr=v;else if(k=="CTX2")x.ctx2=v;else if(k=="CTX3")x.ctx3=v;else if(k=="HG")x.hg=v;
++        else if(k=="CTX4")x.ctx4=v;else return false;}
++    return true;
++}
++
++int main(int argc,char** argv){
++    if(argc<4){fprintf(stderr,"usage: cpgroups T L M [R=65536] [reps=10] [K=16] [TR=7] [chk=3]\n");return 2;}
++    const int T=atoi(argv[1]),L=atoi(argv[2]),M=atoi(argv[3]),CPR=argc>4?atoi(argv[4]):65536,REPS=argc>5?atoi(argv[5]):10,
++        K=argc>6?atoi(argv[6]):16,TR=argc>7?atoi(argv[7]):7,CHK=argc>8?atoi(argv[8]):3;
++    const int NR=g6nr::NR,H=g6nr::HMAX,NG=NR-1,HA=NG*H,QT=32,PS=64;
++    if(L>T||L<ga::TOP||M<1||M>QT||M>L||CPR<0||CPR%PS||CPR>=L){fprintf(stderr,"bad sizes (M <= 32, 2048 <= L <= T, R < L, R %% 64 == 0)\n");return 2;}
++    if(g6nr::HMIN!=H||!g6_attn_cp_groups_ok(H)){fprintf(stderr,"needs equal head groups of a multiple of 16 heads (G6_NR=4) and G6_ATTN_FLIP off\n");return 2;}
++    std::vector<Arm> arms;std::vector<std::string> specs={"SC2=4,TR=2,CTX2=4,CTX3=2","stock"};
++    if(const char* e=getenv("CPG_ARMS")){specs.clear();std::string s=e;size_t i=0;
++        while(i<s.size()){while(i<s.size()&&s[i]==' ')i++;size_t e2=s.find(' ',i);if(e2==std::string::npos)e2=s.size();if(e2>i)specs.push_back(s.substr(i,e2-i));i=e2;}}
++    for(auto& sp:specs){Arm x;if(!parse_arm(sp,x)){fprintf(stderr,"CPG_ARMS: bad arm %s\n",sp.c_str());return 2;}arms.push_back(x);}
++    const int LOCAL=getenv("CPG_LOCAL")?atoi(getenv("CPG_LOCAL")):0;
++    cudaStream_t st;CK(cudaStreamCreate(&st));
++    // CP page map of rank 0: pages < R/64 replicated, then every NR-th page (bind.cu create)
++    const int tpages=(T+PS-1)/PS;std::vector<int> table(tpages);int phys=0;
++    for(int lp=0;lp<tpages;lp++)table[lp]=(lp<CPR/PS||lp%NR==0)?phys++:G6_CP_REMOTE;
++    uint8_t* mla=dalloc<uint8_t>((size_t)phys*PS*g6kv::ROW);fill_kv<<<1024,256,0,st>>>(mla,(size_t)phys*PS,100);
++    int* dtab=dalloc<int>(tpages);CK(cudaMemcpy(dtab,table.data(),tpages*4,cudaMemcpyHostToDevice));
++    // rows at L - M + i; per row 2048 distinct positions <= its position, in random order (the merged list's order is the
++    // score order, unrelated to the position); CPG_LOCAL=n: the n most recent first
++    std::vector<int> pos(M),ind((size_t)M*ga::TOP);std::mt19937_64 rng(12345);int mine=0;
++    for(int r=0;r<M;r++){pos[r]=L-M+r;std::vector<int> pick;std::vector<char> used(pos[r]+1,0);
++        for(int k=0;k<LOCAL&&k<=pos[r]&&(int)pick.size()<ga::TOP;k++){pick.push_back(pos[r]-k);used[pos[r]-k]=1;}
++        while((int)pick.size()<ga::TOP){const int p=(int)(rng()%(uint64_t)(pos[r]+1));if(!used[p]){used[p]=1;pick.push_back(p);}}
++        std::shuffle(pick.begin()+std::min<size_t>(pick.size(),(size_t)LOCAL),pick.end(),rng);
++        for(int k=0;k<ga::TOP;k++){ind[(size_t)r*ga::TOP+k]=pick[k];mine+=(pick[k]/PS)%NR==0;}}
++    int *dpos=dalloc<int>(M),*dind=dalloc<int>((size_t)M*ga::TOP);unsigned* err=dalloc<unsigned>(1);
++    CK(cudaMemcpy(dpos,pos.data(),M*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(dind,ind.data(),ind.size()*4,cudaMemcpyHostToDevice));
++    G6Attn a{};a.rows=M;a.heads=H;a.context=T;a.page_size=PS;a.page_count=phys;a.table_size=tpages;a.query_tile=QT;
++    a.positions=dpos;a.block_table=dtab;a.mla_cache=mla;a.indices=dind;a.error=err;a.cp_nr=NR;a.cp_rank=0;
++    G6AttnStepCell c{};c.context=L;c.page_count=phys;c.table_size=tpages;c.reuse_rows=0;c.valid=1;
++    G6AttnStepCell* cell;CK(cudaMalloc(&cell,sizeof c));CK(cudaMemcpy(cell,&c,sizeof c,cudaMemcpyHostToDevice));
++    // the fabric in device memory: q all-gather recv slots (both parities: q [M][H][512] | rope [M][H][64] per source, as
++    // k_vput packs them), the three partial send slots, doorbells, tickets, step (parity 0)
++    const size_t qn=(size_t)M*H*512*4,rn=(size_t)M*H*64*4,pb=(size_t)M*H*514*4,tblk=((size_t)M*H*514+3)&~(size_t)3;
++    unsigned long long* bells=dalloc<unsigned long long>(16);u64* stepp=dalloc<u64>(1);unsigned* tick=dalloc<unsigned>(16);
++    g6::VSlotDev vq{};vq.doorbell=bells;vq.error=err;vq.c=0;vq.ncoll=16;vq.nsrc=NG;
++    for(int j=0;j<NG;j++){char* s=dalloc<char>(qn+rn+256);fill_f32<<<256,256,0,st>>>((float*)s,(qn+rn)/4,300+j,0.5f);
++        vq.recv[0][j]=vq.recv[1][j]=s;vq.src[j]=j+1;}
++    g6::VSlotDev vp[7]{};char* sendb[7]={};
++    for(int k=0;k<NG;k++){sendb[k]=dalloc<char>(pb+256);vp[k]=g6::VSlotDev{};vp[k].send[0]=vp[k].send[1]=sendb[k];vp[k].doorbell=bells;
++        vp[k].error=err;vp[k].c=1+k;vp[k].ncoll=16;}
++    // buffers: stock (qbuf of one group, scratch, one partial); ONE (all groups' q, its buffer, NG partial blocks)
++    float *qbuf=dalloc<float>((size_t)M*H*576),*ptmp=dalloc<float>(tblk),*qall=dalloc<float>((size_t)M*HA*576),*pall=dalloc<float>(NG*tblk);
++    G6Attn a1=a;   // each remote group's call: the 16-head shape (rank.cuh: G6Attn ad = *a; ad.heads = hd)
++    G6Attn aa=a;aa.heads=HA;
++    const size_t fl=(size_t)96<<20;float4* fb=dalloc<float4>(fl/16);float* sink=dalloc<float>(1);
++    auto flushk=[&]{l2_flush<<<48*6,256,0,st>>>(fb,fl/16,sink);};
++    CK(cudaStreamSynchronize(st));
++    {int dev=0,sms=0,clk=0,l2=0;CK(cudaGetDevice(&dev));cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,dev);
++     cudaDeviceGetAttribute(&clk,cudaDevAttrClockRate,dev);cudaDeviceGetAttribute(&l2,cudaDevAttrL2CacheSize,dev);
++     printf("GPU %d SMs, attr clock %d MHz, L2 %.1f MB | T=%d L=%d M=%d R=%d NR=%d H=%d (one call %d heads) | phys pages %d, slots of rank 0 %.1f %% "
++            "(local %d) | K=%d reps=%d TR=%d chk=%d\n",sms,clk/1000,l2/1048576.,T,L,M,CPR,NR,H,HA,phys,100.*mine/ind.size(),LOCAL,K,REPS,TR,CHK);}
++    int bad=0;
++    for(size_t ai=0;ai<arms.size();ai++){
++        set_arm(arms[ai]);const std::string tag=specs[ai];
++        const size_t sb=g6_attn_scratch_bytes(&a1),ob=g6_attn_cp_groups_bytes(HA,M);
++        char *scr=dalloc<char>(sb),*obuf=dalloc<char>(ob);
++        auto stock=[&]{for(int k=1;k<NR;k++){
++            cpglue::k_vget<<<16,256,0,st>>>(vq,k-1,stepp,qbuf,qn+rn);
++            CKI(g6_attn_cp_group(&a1,cell,scr,sb,qbuf,qbuf+qn/4,ptmp,st));
++            cpglue::k_vput<<<16,256,0,st>>>(ptmp,pb,nullptr,0,vp[k-1],stepp,tick+k);}};
++        auto one=[&]{cpglue::VHeads s{};for(int k=0;k<NG;k++)s.j[k]=k;float* rall=qall+(size_t)M*HA*512;
++            cpglue::k_vget_heads<<<dim3(16,NG),256,0,st>>>(vq,s,stepp,qall,rall,M,H);
++            CKI(g6_attn_cp_groups(&aa,cell,obuf,ob,qall,rall,pall,H,(int64_t)tblk,st));
++            for(int k=1;k<NR;k++)cpglue::k_vput<<<16,256,0,st>>>(pall+(size_t)(k-1)*tblk,pb,nullptr,0,vp[k-1],stepp,tick+k);};
++        // EXACT: the published partials, every step from poisoned buffers
++        auto take=[&](bool o){std::vector<uint8_t> out;
++            for(int k=0;k<NG;k++)CK(cudaMemsetAsync(sendb[k],0xab,pb,st));
++            CK(cudaMemsetAsync(scr,0xcd,sb,st));CK(cudaMemsetAsync(obuf,0xcd,ob,st));CK(cudaMemsetAsync(ptmp,0xcd,tblk*4,st));
++            CK(cudaMemsetAsync(pall,0xcd,NG*tblk*4,st));CK(cudaMemsetAsync(qbuf,0xcd,(size_t)M*H*576*4,st));CK(cudaMemsetAsync(qall,0xcd,(size_t)M*HA*576*4,st));
++            cudaGraphExec_t g=inst(st,[&]{if(o)one();else stock();});CK(cudaGraphLaunch(g,st));CK(cudaStreamSynchronize(st));cudaGraphExecDestroy(g);
++            for(int k=0;k<NG;k++){auto v=host(sendb[k],pb);out.insert(out.end(),v.begin(),v.end());}return out;};
++        const auto ref=take(false);
++        size_t nd=0,live=0;{const float* f=(const float*)ref.data();   // m of each (group, row, head): -inf = no key of rank 0
++            for(int k=0;k<NG;k++)for(int i=0;i<M*H;i++)live+=std::isfinite(f[k*pb/4+(size_t)M*H*512+i]);}
++        for(int it=0;it<CHK;it++){const auto x=take(true);for(size_t i=0;i<ref.size();i++)nd+=ref[i]!=x[i];
++            const auto y=take(false);for(size_t i=0;i<ref.size();i++)nd+=ref[i]!=y[i];}
++        const unsigned e=host(err,1)[0];
++        printf("EXACT %s T=%d L=%d M=%d x%d | published partials %zu B, bytes differing ONE vs stock (and stock vs stock) %zu | heads with a key of "
++               "rank 0: %zu / %d | err %u | %s\n",tag.c_str(),T,L,M,CHK,ref.size(),nd,live,NG*M*H,e,nd||e?"DIFFER":"IDENTICAL");
++        if(nd||e){bad++;cudaFree(scr);cudaFree(obuf);continue;}
++        // TIME: alternating, hot / cold
++        float tflush=0;{cudaGraphExec_t g=inst(st,[&]{for(int k=0;k<K;k++)flushk();});std::vector<float> v;for(int t=0;t<TR;t++)v.push_back(run_us(g,st,REPS));
++            tflush=med(v)/K;cudaGraphExecDestroy(g);}
++        cudaGraphExec_t g[4]={inst(st,[&]{for(int k=0;k<K;k++)stock();}),inst(st,[&]{for(int k=0;k<K;k++){flushk();stock();}}),
++                             inst(st,[&]{for(int k=0;k<K;k++)one();}),inst(st,[&]{for(int k=0;k<K;k++){flushk();one();}})};
++        std::vector<float> v[4];
++        for(int t=0;t<TR;t++)for(int q=0;q<4;q++)v[q].push_back(run_us(g[q],st,REPS)/K-(q&1?tflush:0));
++        for(auto x:g)cudaGraphExecDestroy(x);
++        float o[4];for(int q=0;q<4;q++)o[q]=med(v[q]);
++        const float sh=o[0]-o[2],sc=o[1]-o[3];
++        printf("TIME %s T=%d L=%d M=%d | stock (3 x vget+group+put) hot %.1f cold %.1f us | ONE (vget_heads+groups+3 put) hot %.1f cold %.1f us | "
++               "saved per layer hot %.1f cold %.1f us, per step (78 layers) hot %.2f cold %.2f ms | flush %.1f us | gate 20 us/layer cold: %s\n",
++               tag.c_str(),T,L,M,o[0],o[1],o[2],o[3],sh,sc,sh*78/1000.,sc*78/1000.,tflush,sc>=20?"PASS":"below (reject)");
++        cudaFree(scr);cudaFree(obuf);
++    }
++    CK(cudaGetLastError());
++    return bad?3:0;
++}
+diff --git a/engine/kernels/cpglue.cuh b/engine/kernels/cpglue.cuh
+index 947c2b3..1a239bc 100644
+--- a/engine/kernels/cpglue.cuh
++++ b/engine/kernels/cpglue.cuh
+@@ -90,6 +90,29 @@ __global__ void __launch_bounds__(256) k_vget(g6::VSlotDev v, int j, const u64*
+     if (blockIdx.x == 0 && threadIdx.x < (n % 16) / 4)
+         reinterpret_cast<unsigned*>(reinterpret_cast<uint4*>(dst) + n / 16)[threadIdx.x] = reinterpret_cast<const unsigned*>(src + n / 16)[threadIdx.x];
+ }
++// G6_CP_ONECHAIN (rank.cuh launch_attn_cp): the q all-gather payloads of n head groups side by side, for one attention
++// call over all of them. grid (G, n), block 256: source j[y]'s recv slot of v (after k_vwait; q [M][hd][512] then rope
++// [M][hd][64], packed as k_vput) -> heads y hd .. (y + 1) hd - 1 of q [M][n hd][512] and rope [M][n hd][64]. The words
++// k_vget copies, at their head's place. q and rope 16-B aligned.
++struct VHeads
++{
++    int j[7];
++};
++__global__ void __launch_bounds__(256) k_vget_heads(g6::VSlotDev v, VHeads s, const u64* stepp, float* q, float* rope, int M, int hd)
++{
++    const int y = blockIdx.y, n = gridDim.y;
++    const uint4* src = reinterpret_cast<const uint4*>(vrecv(v, *stepp, s.j[y]));
++    const size_t qr = (size_t)hd * 128, rr = (size_t)hd * 16, nq = (size_t)M * qr, nt = nq + (size_t)M * rr;   // uint4 a row
++    for (size_t i = blockIdx.x * 256 + threadIdx.x; i < nt; i += (size_t)gridDim.x * 256)
++    {
++        if (i < nq) reinterpret_cast<uint4*>(q)[(i / qr * n + y) * qr + i % qr] = src[i];
++        else
++        {
++            const size_t k = i - nq;
++            reinterpret_cast<uint4*>(rope)[(k / rr * n + y) * rr + k % rr] = src[i];
++        }
++    }
++}
+ #ifdef CP_F1A
+ // F1a: the phase-2 partial waits + gets of launch_attn_cp (one k_vwait + one k_vget per partial) as ONE launch.
+ // grid (G, n), block 256: row y waits for partial collective v[y] (its one source; every CTA of the row spins on the
+diff --git a/engine/runtime/rank.cuh b/engine/runtime/rank.cuh
+index 64fd2a4..7f4bd74 100644
+--- a/engine/runtime/rank.cuh
++++ b/engine/runtime/rank.cuh
+@@ -235,6 +235,13 @@ struct CpState
+     unsigned* tickets = nullptr;      // [colls.ncoll()] publish tickets, device, zero
+     uint64_t* cand = nullptr;         // [nr][MX][2048] candidate lists, own at [rank] (layout [s][M][2048] per step)
+     float *qbuf = nullptr, *part_all = nullptr, *part_tmp = nullptr;   // [MX][HMAX][576], [nr][cp_blk(MX, HMAX)], [nr-1][same]
++    // G6_CP_ONECHAIN=1 (read at build, default 0): the nr-1 remote head groups as ONE attention call (g6_attn_cp_groups)
++    // instead of one call each; the same bits. qall: the gathered q / rope [one_rows][(nr-1) HMAX][576]; one_buf: its scratch
++    bool one = false;
++    int one_rows = 0;
++    float* qall = nullptr;
++    char* one_buf = nullptr;
++    size_t one_bytes = 0;
+     // prefill staging (step 4, prefill.cuh cp_pf_*): two latent pools of one layer at capacity (each followed by one
+     // layer's index pages at pf_ixoff), the identity table, and every layer's CP args while the prefill view is swapped in
+     // (pf_staged); pf_ixon: this staged view stages the index keys (not an S2 run below R)
+@@ -693,8 +700,23 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
+         m.cp.qbuf = dmalloc<float>((size_t)MX * H * 576);
+         m.cp.part_all = dmalloc<float>((size_t)NR * cp_blk(MX, H));
+         m.cp.part_tmp = dmalloc<float>((size_t)(NR - 1) * cp_blk(MX, H));
+-        fprintf(stderr, "# rank %d: G6_CP on, R %d, %s order, %d CP collectives (mmax %d)\n", rank, m.cp.R, m.cp.s3 ? "S3" : "S1",
+-                m.cp.colls.ncoll(), m.cp.colls.mmax);
++        const char* oc = getenv("G6_CP_ONECHAIN");
++        m.cp.one = oc && atoi(oc) == 1;
++        if (m.cp.one)
++        {
++            // equal groups (TP=4: 16 heads each) whose head batches line up with the H-head calls'
++            if (g6nr::HMIN != g6nr::HMAX || !g6_attn_cp_groups_ok(H))
++                die("G6_CP_ONECHAIN=1 needs equal head groups of a multiple of 16 heads (TP=4) and G6_ATTN_FLIP off");
++            m.cp.one_rows = std::min(MX, m.cp.colls.mmax);   // a CP step carries <= colls.mmax rows (its fabric size)
++            m.cp.qall = dmalloc<float>((size_t)m.cp.one_rows * (NR - 1) * H * 576);
++            m.cp.one_bytes = g6_attn_cp_groups_bytes((NR - 1) * H, m.cp.one_rows);
++            m.cp.one_buf = dmalloc<char>(m.cp.one_bytes);
++        }
++        fprintf(stderr, "# rank %d: G6_CP on, R %d, %s order, %d CP collectives (mmax %d)%s\n", rank, m.cp.R, m.cp.s3 ? "S3" : "S1",
++                m.cp.colls.ncoll(), m.cp.colls.mmax, m.cp.one ? ", one chain over the remote head groups (G6_CP_ONECHAIN)" : "");
++        if (m.cp.one && rank == 0)
++            fprintf(stderr, "# rank 0: G6_CP_ONECHAIN: %d rows, %.1f MB (gathered q + scratch)\n", m.cp.one_rows,
++                    ((double)m.cp.one_rows * (NR - 1) * H * 576 * 4 + m.cp.one_bytes) / 1e6);
+     }
+ #endif
+     size_t ab = 0;
+@@ -1074,6 +1096,25 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
+         if (!C.s3 || cc >= 0) G6RT_CK(g6_attn_cp_group(a, cell, scr, sb, q, rope, part_of(r), st));
+         const g6::VSlotDev& vq = C.vs[cq];
+         cpglue::k_vwait<<<1, 32, 0, st>>>(vq, m.stepp, qw, -1, cpglue::ERR_CP);
++        if (C.one)
++        {
++            // G6_CP_ONECHAIN: remote group k (rank (r + k) % nr) = heads (k - 1) H .. kH - 1 of one call; its partial goes
++            // to part_tmp block k - 1 (the S1 layout) and is published below, in the S1 order
++            if (M > C.one_rows) die("G6_CP_ONECHAIN: " + std::to_string(M) + " rows, sized for " + std::to_string(C.one_rows));
++            cpglue::VHeads src{};
++            for (int k = 1; k < nr; ++k)
++            {
++                src.j[k - 1] = cpglue::vsrc_index(vq, (r + k) % nr);
++                if (src.j[k - 1] < 0 || cp_heads((r + k) % nr, y.l) != H) die("G6_CP_ONECHAIN: q all-gather slot or head group");
++            }
++            const int ha = (nr - 1) * H;
++            float* rall = C.qall + (size_t)M * ha * 512;
++            cpglue::k_vget_heads<<<dim3(G, nr - 1), 256, 0, st>>>(vq, src, m.stepp, C.qall, rall, M, H);
++            G6Attn ad = *a;   // the remote groups' heads of absorbed q over MY keys
++            ad.heads = ha;
++            G6RT_CK(g6_attn_cp_groups(&ad, cell, C.one_buf, C.one_bytes, C.qall, rall, C.part_tmp, H, (int64_t)tblk, st));
++        }
++        else
+         for (int k = 1; k < nr; ++k)
+         {
+             const int d = (r + k) % nr, j = cpglue::vsrc_index(vq, d), hd = cp_heads(d, y.l);
+@@ -1086,7 +1127,7 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
+             G6RT_CK(g6_attn_cp_group(&ad, cell, scr, sb, C.qbuf, C.qbuf + qd / 4, out, st));
+             if (C.s3) cpglue::k_vput<<<G, 256, 0, st>>>(out, (size_t)M * hd * 514 * 4, nullptr, 0, C.vs[cpart(k)], m.stepp, C.tickets + cpart(k));
+         }
+-        if (!C.s3)
++        if (!C.s3 || C.one)
+             for (int k = 1; k < nr; ++k)
+                 cpglue::k_vput<<<G, 256, 0, st>>>(C.part_tmp + (size_t)(k - 1) * tblk, (size_t)M * cp_heads((r + k) % nr, y.l) * 514 * 4,
+                                                    nullptr, 0, C.vs[cpart(k)], m.stepp, C.tickets + cpart(k));

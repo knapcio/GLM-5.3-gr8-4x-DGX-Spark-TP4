@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Thu, 15 Oct 2026 12:53:01 +0200
-Subject: [PATCH 11/26] Decode attention: G6_ATTN_SC2 (scores_sc, S slots per
+Subject: [PATCH 11/30] Decode attention: G6_ATTN_SC2 (scores_sc, S slots per
  warp) + G6_ATTN_CTX2 (context PB / packed / E1 PART 32), default off; attnk
  bench
 

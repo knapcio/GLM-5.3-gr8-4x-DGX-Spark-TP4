@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Thu, 15 Oct 2026 23:40:42 +0200
-Subject: [PATCH 20/26] DSel model: price DFlash2 from its rounds as they ran
+Subject: [PATCH 20/30] DSel model: price DFlash2 from its rounds as they ran
  (table key r)
 
 With G6_S2_DSEL_MODEL the K-stop MTP is priced at its real rate (on

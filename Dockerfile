@@ -1,10 +1,11 @@
 # The serving image for this recipe: GB10 (DGX Spark), linux/arm64, CUDA 13, sm_121a, TP=4.
 #
-#   docker buildx build --platform linux/arm64 -t gr8-glm53-recipe:v0.5 --load .
+#   docker buildx build --platform linux/arm64 -t gr8-glm53-recipe:v0.6 --load .
 #
 # It is the measured setup: the published upstream gr8 image, pinned by digest, with its TP=4 engine binary
-# (/opt/gr8/bin/g6m4) replaced by one built from kindlingai/gr8 at the pinned commit plus patches/. Everything else in
-# the image (front end, launcher, loader, shims, entrypoint, uid 1000, environment) is upstream's, unchanged.
+# (/opt/gr8/bin/g6m4) replaced by one built from kindlingai/gr8 at the pinned commit plus patches/, and the
+# launcher's options.py replaced by the patched one (patch 0027: --share-limit accepts any multiple of 64).
+# Everything else in the image (front end, loader, shims, entrypoint, uid 1000, environment) is upstream's, unchanged.
 # The build stages follow upstream's Dockerfile at the pinned commit (toolchain, Rust loader and KV allocator, engine).
 ARG CUDA_VERSION=13.0.1
 ARG UBUNTU=ubuntu24.04
@@ -60,3 +61,5 @@ RUN G6_NR=4 scripts/build.sh /out/bin
 
 FROM ${GR8_RUNTIME} AS runtime
 COPY --from=engine /out/bin/g6m4 /opt/gr8/bin/g6m4
+# patch 0027: the patched launcher options (otherwise the image rejects --share-limit 98304)
+COPY --from=source /src/tools/launch/options.py /opt/gr8/tools/launch/options.py
