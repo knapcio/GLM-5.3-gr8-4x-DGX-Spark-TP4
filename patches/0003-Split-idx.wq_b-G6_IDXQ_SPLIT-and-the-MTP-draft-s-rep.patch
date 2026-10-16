@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Thu, 15 Oct 2026 00:28:29 +0200
-Subject: [PATCH 03/21] Split idx.wq_b (G6_IDXQ_SPLIT) and the MTP draft's
+Subject: [PATCH 03/22] Split idx.wq_b (G6_IDXQ_SPLIT) and the MTP draft's
  replicated GEMVs (G6_MTP_SPLIT)
 
 G6_IDXQ_SPLIT=1: the indexer's wq_b by output tiles on the indexer layers,

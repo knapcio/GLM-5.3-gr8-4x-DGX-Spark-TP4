@@ -18,16 +18,34 @@ v0.1 was measured with the v0.2 `G6ENV_X` line without `G6_DFL_REUSE=2`. v0.2's 
 
 [`bench/conc.py`](../bench/conc.py): aggregate tok/s **[per-stream tok/s]**, RigMark's prose, code and structured
 prompts, 256 output tokens, temperature 0, `reasoning_effort: low`, medians of three rounds per cell, c identical
-requests sent at once; one boot per release.
+requests sent at once. v0.4: median per cell over three boots, against three v0.3 boots, two of each interleaved in one session (v0.3's three-boot
+medians: prose 36.2 / 49.3 / 63.3, code 46.3 / 59.2 / 75.5, structured 70.6 / 65.7 / 85.0). Earlier rows: one boot per release.
 
 | Release | Prompt type | c1 | c2 | c4 |
 |---|---|---:|---:|---:|
+| v0.4 (median of three boots) | prose | 35.3 [36.2] | 48.9 [26.1] | 63.3 [17.7] |
+| v0.4 (median of three boots) | code | 46.7 [47.8] | 59.1 [31.5] | 75.1 [21.4] |
+| v0.4 (median of three boots) | structured | 72.1 [74.8] | 65.6 [35.7] | 84.9 [24.9] |
 | v0.3 | prose | 36.2 [37.3] | 49.2 [26.1] | 63.3 [17.7] |
 | v0.3 | code | 46.3 [47.4] | 59.2 [31.5] | 75.5 [21.4] |
 | v0.3 | structured | 70.6 [73.2] | 65.7 [35.7] | 85.0 [25.0] |
 | v0.2 (2026-10-15) | prose | 34.9 [35.8] | 48.9 [25.9] | 62.8 [17.6] |
 | v0.2 (2026-10-15) | code | 43.4 [44.3] | 58.8 [31.2] | 74.8 [21.3] |
 | v0.2 (2026-10-15) | structured | 69.5 [72.0] | 65.2 [35.4] | 84.3 [24.8] |
+
+## Decode over 24 prompts: v0.4 vs v0.3
+
+[`bench/decset.py`](../bench/decset.py): 12 prose, 6 code and 6 structured prompts, c1, temperature 0,
+`reasoning_effort: low`, 384 output tokens; per kind, all completion tokens over all decode time (first token to end).
+Two runs per release, alternating, fresh boot each.
+
+| Release | prose | code | structured |
+|---|---:|---:|---:|
+| v0.4 | 41.57 / 41.71 | 52.26 / 52.82 | 57.72 / 57.71 |
+| v0.3 | 40.86 / 40.50 | 54.32 / 54.28 | 56.23 / 56.26 |
+
+v0.4 is faster on 8 of the 12 prose prompts. Most of the code difference is one prompt (63.8 → 53.0 tok/s); the median
+over the six code prompts is 52.6 vs 53.1.
 
 ## RigMark: releases and baseline
 
@@ -49,6 +67,7 @@ the README's Reproducing section. RigMark sends single-turn requests.
 
 | Prefill, cold, tok/s | 8K | 32K | 64K | 128K |
 |---|---:|---:|---:|---:|
+| v0.4 | 1375 | 1378 | 1313 | 1160 |
 | v0.3 | 1367 | 1380 | 1311 | 1174 |
 | v0.2 | 1369 | 1370 | 1312 | 1157 |
 | v0.1 | 1367 | 1373 | 1311 | 1181 |
@@ -80,6 +99,7 @@ v0.2's `G6_S2_DSEL_MCOST=2.9`, which it replaces.
 | 0016 | `G6_DRAFT_PAR=1` | prose +0.4 %, code +1.1 %, structured +0.8 % |
 | 0017 | off (`G6_S2_TIMELINE=N` when measuring the DSel table) | diagnostics only |
 | 0018–0020 | `G6_S2_DSEL_MODEL=1` `G6_S2_DSEL_TABLE=…` (with `r:0.95`) | vs `G6_S2_DSEL_MCOST=2.9`: prose +1.8 %, code +3.0 %, structured −3.6 % (two runs each). Without key `r` (0018 alone) a structured request that a dip moved to MTP stayed there: structured −21 % on the cluster; `r` (0020) brings it back to DFlash2 |
+| 0022 | `G6_DFL_BODY_I4=1` (with v0.3's DSel table) | prose +0.3 %, code +2.6 %, structured +5.2 % (three runs each, interleaved with v0.3). With a DSel table re-measured on it (`d:5.726`): prose +0.4 %, code +3.9 %, structured −1.0 % (two runs each); v0.3's table is kept |
 
 ## Multi-turn (prefix-cache hits)
 
@@ -114,6 +134,8 @@ Mean of the per-turn ratios (`bench/multiturn.py compare`): prefix-hit turns (A2
 
 | Check | Result |
 |---|---|
+| T=0 identity / KL, v0.4 | the same check: 34/75 identical, mean KL 2.7e-3 on the common prefix (noise scale 5.0e-3, as below) |
+| Sampled qeval / T=0 qeval / needle, v0.4 | 578/600 sampled, identical per seed; 72/75 T=0; 96K needle correct |
 | T=0 identity / KL, v0.3 | top-20 logprobs on the 75 qeval prompts vs an earlier configuration (GEMV split + INT4 draft heads + DSel probe 32), prefix-cached pass: 34/75 identical, mean KL 2.7e-3 on the common prefix; for scale, one configuration at concurrency 1 vs 4: 30/75 identical, mean KL 5.0e-3 |
 | Sampled qeval / T=0 qeval / needle, v0.3 | 578/600 sampled; 72/75 T=0; 96K needle correct |
 | T=0 identity, v0.1 configuration | top-20 logprobs on the 75 qeval prompts (up to 512 tokens) bit-identical to the previous configuration (GEMV split + INT4 heads + probe 32): 75/75 prompts, 7,551 positions. For scale, the same configuration run at concurrency 1 vs 4 differs with mean KL 5e-3 |

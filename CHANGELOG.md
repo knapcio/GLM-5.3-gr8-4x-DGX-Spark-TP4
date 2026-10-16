@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.4 — 2026-10-16
+
+v0.3 plus one patch, twenty-two in all. Upstream base (`6448a16`) unchanged; patches 0001–0021 differ only in the series count of their subject lines.
+
+- DFlash2 drafter body on INT4 (0022), `G6_DFL_BODY_I4=1`: the drafter's body GEMVs read INT4 g32 copies of their MXFP8
+  records, made at boot, with the same splits: 382 MB of records instead of 701 MB. Drafts only; the target, its
+  weights and the verify steps are unchanged. Also in the patch, off: the MTP draft's eh_proj on INT4
+  (`G6_MTP_EHPROJ_I4`). Drafting.
+- The DSel cost table stays v0.3's. A table re-measured with 0022 prices a DFlash2 round lower (`d:5.726` instead of
+  `d:7.285`) and was level on prose and code and slower on structured in our screens.
+- `G6ENV_X` in `docker/env.example` gains `G6_DFL_BODY_I4=1`; image tag `gr8-glm53-recipe:v0.4`.
+
+Measured against v0.3 on the same machines:
+
+v0.4 vs v0.3: RigMark c1 decode screens (three runs each, interleaved) prose +0.3 %, code +2.6 %, structured +5.2 %;
+RigMark full run prose 36.4 / code 55.9 / structured 71.1 (v0.3 36.2 / 56.2 / 65.8), C1/C2/C4 aggregate 43.6 / 56.1 / 68.6
+(v0.3 43.1 / 55.6 / 68.6). `bench/decset.py` (24 prompts, c1, two runs each, interleaved): prose 41.64 vs 40.68 (+2.4 %,
+faster on 8 of 12 prompts), code 52.54 vs 54.30 (−3.2 %, mostly one prompt: 53.0 vs 63.8; median per prompt 52.6 vs
+53.1), structured 57.72 vs 56.25 (+2.6 %). Decode table (`bench/conc.py`, aggregate, median of three boots each,
+two of them interleaved in one session): prose 35.3 / 48.9 / 63.3 (v0.3 36.2 / 49.3 / 63.3), code 46.7 / 59.1 / 75.1 (v0.3 46.3 / 59.2 / 75.5),
+structured 72.1 / 65.6 / 84.9 (v0.3 70.6 / 65.7 / 85.0) for c1 / c2 / c4; its single prose prompt at c1 is slower on
+v0.4 in all three boots (35.1 / 35.7 / 35.3 vs 36.2 / 36.2 / 36.3), a drafting change moves individual prompts both
+ways. Cold prefill 1375 / 1378 / 1313 / 1160 tok/s (8K-128K, unchanged). T=0
+logprobs: mean KL 2.7e-3 vs the same earlier configuration as v0.3 (noise scale 5.0e-3); sampled qeval 578/600 (unchanged);
+T=0 qeval 72/75; 96K needle correct.
+
 ## v0.3 — 2026-10-16
 
 v0.2 plus seven patches, twenty-one in all (0021 only corrects the table tool's usage text). Upstream base (`6448a16`) unchanged. Of patches 0001–0014 only 0011 and 0012

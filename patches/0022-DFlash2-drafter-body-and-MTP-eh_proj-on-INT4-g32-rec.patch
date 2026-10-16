@@ -1,0 +1,788 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Thu, 15 Oct 2026 21:31:19 +0200
+Subject: [PATCH 22/22] DFlash2 drafter body and MTP eh_proj on INT4 g32
+ records behind G6_DFL_BODY_I4 / G6_MTP_EHPROJ_I4
+
+The drafter's body GEMVs (fc, per layer kv / aconv / q / o / mconv / gu / down) and the MTP draft's eh_proj
+are rebound at boot to INT4 g32 copies of their MXFP8 records (k_mx_to_i4, DEC_I4PAIR repack for the GEMV's
+ks), same splits: 382 MB instead of 701 MB per draft step, eh_proj 10.6 instead of 19.5 MB under
+G6_MTP_SPLIT. Drafts only; default 0 leaves the engine as it was.
+
+dflreplay replays a G6_DFL_DUMP through the MXFP8 and the INT4 drafter on one GPU (matched contexts):
+per-position draft agreement, acceptance against the committed tokens, and a timed body-GEMV graph.
+dhead_i4_test covers the drafter shapes and times them (--time-dfl).
+---
+ docs/SETTINGS.md                      |   2 +
+ engine/ref/dflreplay_emb.py           |  40 +++
+ engine/runtime/build_m4.sh            |   6 +-
+ engine/runtime/dflash.cuh             |  20 ++
+ engine/runtime/dflreplay.cu           | 350 ++++++++++++++++++++++++++
+ engine/runtime/g6m4.cu                |  10 +
+ engine/runtime/rank.cuh               |  50 ++++
+ engine/runtime/tests/dhead_i4_test.cu | 108 +++++++-
+ 8 files changed, 575 insertions(+), 11 deletions(-)
+ create mode 100644 engine/ref/dflreplay_emb.py
+ create mode 100644 engine/runtime/dflreplay.cu
+
+diff --git a/docs/SETTINGS.md b/docs/SETTINGS.md
+index a35e498..c5434b6 100644
+--- a/docs/SETTINGS.md
++++ b/docs/SETTINGS.md
+@@ -89,6 +89,8 @@ the short version.
+ | `G6_MTP_SPLIT` | 0 | MTP draft steps (needs `--mtp`): eh_proj (6144 outputs, 78 MB replicated), then layer 78's q_a / kv_a / indexer k and weights (as `G6_QA_SPLIT=1`) and idx_q (as `G6_IDXQ_SPLIT=1`), split by output tiles and gathered on a draft gather fabric (port + 72). Same bits as 0 |
+ | `G6_DRAFT_HEAD_I4` | 0 | MTP draft steps (needs `--mtp`): the draft's lm_head GEMV reads INT4 g32 records of the rank's vocab slice, made at boot on the GPU from its MXFP8 records (134 MB more per rank at TP4), instead of the MXFP8 records: 45% fewer head bytes per draft step. The target's head and the verify steps are unchanged, so the committed tokens are the target's; drafts (and their log-probabilities, which `--spec-adaptive` reads) can differ from the MXFP8 head's (offline, E9 held-out: first-draft acceptance -0.07 pt [-0.32, +0.17]). Same on every rank. `G6_DRAFT_HEAD_KS` (32, 2..32) / `G6_DRAFT_HEAD_TPC` (1) = the GEMV's k parts per tile and tiles per CTA; every rank must set the same values |
+ | `G6_DFL_HEAD_I4` | 0 | DFlash2 drafter (needs `--dflash-manifest`): its lm_head GEMV reads the same INT4 g32 records as `G6_DRAFT_HEAD_I4` (the MTP draft's copy when that is on, else one made the same way; same `G6_DRAFT_HEAD_KS` / `_TPC`). In selector mode the head's raw logits choose each row's top-16 candidates and enter their walk scores, so INT4 can change both. The target's head and the verify steps are unchanged. Every rank must set the same value |
++| `G6_DFL_BODY_I4` | 0 | DFlash2 drafter (needs `--dflash-manifest`): its body GEMVs (fc, and per layer kv, aconv, q, o, mconv, gu, down) read INT4 g32 copies of their MXFP8 records, made at boot on the GPU by the `G6_DRAFT_HEAD_I4` arithmetic, with the same splits: 382 MB instead of 701 MB per draft step's reads (the pack image keeps the MXFP8 records: +382 MB per rank). The selector's hproj and the head (`G6_DFL_HEAD_I4`) are not touched. Drafts only: the target and the verify steps are unchanged; drafts and their log-probabilities can differ (`engine/runtime/dflreplay.cu` compares both drafters on a `G6_DFL_DUMP`). The drafter choice's cost `G6_S2_DSEL_DCOST` is not changed with it. Every rank must set the same value |
++| `G6_MTP_EHPROJ_I4` | 0 | MTP draft steps (needs `--mtp`): the eh_proj GEMV reads INT4 g32 copies of its MXFP8 records (this rank's tiles under `G6_MTP_SPLIT`: +10.6 MB per rank, else +42.5 MB), on the first form and every chain step. The draft prefill and the target are unchanged; drafts only. Every rank must set the same value |
+ | `G6_DFL_SEL_ALPHA` | 1 | DFlash2 selector walk (needs `--dflash-manifest` and the selector): each candidate scores `logit + a * correction` instead of `logit + correction`, and the draft's log-probability comes from those scores. Drafts only; the verify is unchanged. Every rank must set the same value |
+ | `G6_ROUTE_OVL` | 0 | decode, trellis-shared MoE layers with separate fc1 / fc2 launches (2+ rows): the shared expert runs on a forked stream from before the router GEMV, so its weight reads overlap the router GEMV (8 of 48 SMs) and the single-CTA plan kernel. 1 = its fc1 and fc2 on the fork, joined before the finalize; 2 = its fc1 only, joined before fc2. Same bytes out (`k1_ovl_test`). Fused layers (1 row) and the MTP layer run as before. Read once |
+ | `G6_GV_MULTI` | 1 | steps of up to 8 rows run the GEMVs on the layer input (q_a, kv_a, the indexer's k and weights) as one launch; 0 = one launch each (same bits) |
+diff --git a/engine/ref/dflreplay_emb.py b/engine/ref/dflreplay_emb.py
+new file mode 100644
+index 0000000..e0f9e50
+--- /dev/null
++++ b/engine/ref/dflreplay_emb.py
+@@ -0,0 +1,40 @@
++"""The embedding rows engine/runtime/dflreplay.cu needs: every bonus token of a G6_DFL_DUMP's draft steps, and the mask.
++
++python3 engine/ref/dflreplay_emb.py DUMP --src DRAFTER --glm GLM_DIR --out DIR/emb.bin
++
++DRAFTER: the drafter dir (config.json: dflash_config.mask_token_id). GLM_DIR: model-embed.safetensors (as
++dflash2_replay.py). Writes int32 n, int32 ids[n], float32 rows[n][6144].
++"""
++import argparse
++import json
++import os
++import sys
++
++import numpy as np
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++import dflash2_ref as R  # noqa: E402
++from dflash2_replay import load_dump  # noqa: E402
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument('dump')
++    ap.add_argument('--src', required=True)
++    ap.add_argument('--glm', required=True)
++    ap.add_argument('--out', required=True)
++    a = ap.parse_args()
++    steps, _, _ = load_dump(a.dump)
++    mask = json.load(open(os.path.join(a.src, 'config.json')))['dflash_config']['mask_token_id']
++    ids = sorted({s['tok0'] for s in steps} | {mask})
++    st = R.ST(os.path.join(a.glm, 'model-embed.safetensors'))
++    rows = np.stack([R.bf(st.get('model.embed_tokens.weight', rows=(t, t + 1))[0]) for t in ids]).astype(np.float32)
++    with open(a.out, 'wb') as f:
++        np.array([len(ids)], np.int32).tofile(f)
++        np.array(ids, np.int32).tofile(f)
++        rows.tofile(f)
++    print(f'{a.out}: {len(ids)} rows ({len(steps)} draft steps, mask {mask})')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/engine/runtime/build_m4.sh b/engine/runtime/build_m4.sh
+index 5035f65..d1e809d 100755
+--- a/engine/runtime/build_m4.sh
++++ b/engine/runtime/build_m4.sh
+@@ -2,7 +2,8 @@
+ # build the M4 drivers. usage: build_m4.sh <arch: 121a (DGX Spark GB10) | 120a (RTX 50xx)> [sim|g6|all|dfl|rs|tests]
+ # tests: only the unit tests (tests/row_budget_test.cu, tests/s2_attn_test.cu) into $OUT; scripts/c1_tests.sh builds and runs them.
+ # m4sim: one GPU, six simulated ranks. g6m4: one rank on the real fabric (needs libibverbs; Spark only).
+-# dfl: dfltest only, the DFlash2 drafter step of all ranks on one GPU (engine/ref/dflash2_check.py).
++# dfl: dfltest and dflreplay only, the DFlash2 drafter step of all ranks on one GPU (engine/ref/dflash2_check.py; the
++#      G6_DFL_BODY_I4 replay of a G6_DFL_DUMP)
+ # rs: rstest only, the head kernels of all ranks on one GPU: rejection sampling vs the target distribution.
+ set -e
+ cd "$(dirname "$0")"
+@@ -32,7 +33,8 @@ nice -n 19 nvcc -O3 -std=c++17 $GEN -c ../attn/attn.cu -o $O/attn.o
+ nice -n 19 nvcc -O3 -std=c++17 $GEN -c ../attn/bind.cu -o $O/attn_bind.o
+ if [ "$WHAT" = dfl ]; then
+   nice -n 19 nvcc -O2 -std=c++17 $GEN -o $OUT/dfltest dfltest.cu $O/attn.o $O/attn_bind.o $O/g6pack.o $O/devimage.o -lcublas -lpthread
+-  ls -la $OUT/dfltest
++  nice -n 19 nvcc -O2 -std=c++17 $GEN -o $OUT/dflreplay dflreplay.cu $O/attn.o $O/attn_bind.o $O/g6pack.o $O/devimage.o -lcublas -lpthread
++  ls -la $OUT/dfltest $OUT/dflreplay
+   exit 0
+ fi
+ # the Rust pack loader (engine/loader-rs, G6_RS_LOADER) when its library is built. scripts/build.sh builds it with cargo
+diff --git a/engine/runtime/dflash.cuh b/engine/runtime/dflash.cuh
+index d15840b..99b32bc 100644
+--- a/engine/runtime/dflash.cuh
++++ b/engine/runtime/dflash.cuh
+@@ -697,6 +697,26 @@ inline void dfl_head_i4(Dfl& D, const uint8_t* rec, int tpc, int ks)
+     if (D.head.lm_head.O != D.vn || D.head.lm_head.K != HID) die("G6_DFL_HEAD_I4: INT4 head is not this rank's vocab slice");
+ }
+ 
++// G6_DFL_BODY_I4=1 (g6m4; default 0, needs --dflash-manifest): the drafter's body GEMVs (fc, and per layer kv (context and
++// block: one record), aconv, q, o, mconv, gu, down) read INT4 g32 records made at boot from their MXFP8 records
++// (rank.cuh gv_to_i4, the G6_DRAFT_HEAD_I4 arithmetic), with the same splits: 382 MB instead of 701 MB per rank, which the
++// pack image keeps as well. The selector's hproj (1.6 MB) and the head (G6_DFL_HEAD_I4) are not touched. A BF16 record
++// (dflash2.py --bf16) stays BF16. Drafts only: the target and the verify step are unchanged; the drafts and their
++// log-probabilities can differ from the MXFP8 drafter's (dflreplay.cu measures how often). After dfl_build, before the
++// drafter's graphs.
++inline void dfl_body_i4(Dfl& D, cudaStream_t st)
++{
++    size_t mx = 0, i4 = 0;
++    auto cv = [&](bind::Gv& g) {
++        if (g.codec != bind::MXFP8) return;
++        const size_t b = bind::gv_bytes(g), n = gv_to_i4(g, "G6_DFL_BODY_I4", st);
++        if (n) { mx += b; i4 += n; }
++    };
++    cv(D.fc);
++    for (DLayer& y : D.ly) { cv(y.kvc); cv(y.kv); cv(y.ac); cv(y.q); cv(y.o); cv(y.mc); cv(y.gu); cv(y.down); }
++    fprintf(stderr, "# rank %d: G6_DFL_BODY_I4: drafter body INT4 g32 records, %.1f MB (MXFP8 %.1f MB)\n", D.rank, i4 / 1e6, mx / 1e6);
++}
++
+ // ---------------------------------------------------------------- the step, in phases
+ inline void dfl_xfrag(const __half* src, int K_, u32* f16, u32* b16, cudaStream_t st)
+ {
+diff --git a/engine/runtime/dflreplay.cu b/engine/runtime/dflreplay.cu
+new file mode 100644
+index 0000000..b1502ac
+--- /dev/null
++++ b/engine/runtime/dflreplay.cu
+@@ -0,0 +1,350 @@
++// dflreplay: the G6_DFL_BODY_I4 judge. A G6_DFL_DUMP (rank 0 of a --dflash run, dflash.cuh dfl_dump_step) replayed step
++// by step through two DFlash2 drafters on ONE GPU, all NR ranks of each with a loopback fabric (as dfltest): A on the
++// MXFP8 body records, B on the INT4 g32 copies G6_DFL_BODY_I4 makes (dflash.cuh dfl_body_i4, the same function). Both get
++// the dump's context features, positions and bonus tokens, so every draft step sees the same context in A and B (the
++// target's trajectory is the dump's; matched, unlike two live runs whose acceptance changes what follows).
++//
++// dflreplay DIR DUMP [--sel 0|1] [--head-i4 0|1] [--temp T] [--seed S] [--top-p P] [--rounds N] [--bench N] [--out FILE]
++//   DIR/dflash.r<r>.manifest.json + .pack   drafter packs (tools/convert/dflash2.py), as dfltest
++//   DIR/head.r<r>.manifest.json + .pack     the target lm_head slice of rank r (dflash2.py --head), as dfltest
++//   DIR/emb.bin   int32 n, int32 ids[n], float32 rows[n][6144]: the target embedding rows of the dump's bonus tokens and
++//                 the mask token (engine/ref/dflreplay_emb.py writes it)
++//   --sel        default: the pack's (DFlash2 selector walk when it has one)
++//   --head-i4    1 (default, as serving with G6_DFL_HEAD_I4=1): both drafters' heads read INT4 records; 0: MXFP8
++//   --temp / --seed / --top-p   the drafts' sampling keys (the dump does not record them; 0 = greedy, the drafter's own
++//                default under rejection sampling). Use the dumping run's values for the dump column to match A.
++//   --bench N    then time one rank's body GEMVs of a draft step (context fc + 6 kv, block 6 x aconv q kv o mconv gu
++//                down) for A and B as a captured graph, N replays, cold-ish (the 700 MB set does not fit the 25 MB L2)
++//   --out FILE   one TSV line per draft step: q0, accepted (dump, A, B), committed tokens, drafts and lp of A and B
++// Printed: draft steps scored against the committed tokens; per position r = 1..7 the share of steps where A and B
++// draft the same token; accepted-length histograms; tokens per round 1 + mean(min(accepted, k)) for k = 1..7, which
++// with the verify table (ms at M = k + 1) and the drafter's step time gives committed tokens per ms; A == dump (a check of
++// the replay: equal when the dump's run had the same head and sampling).
++#include <cstdio>
++#include <map>
++#include <vector>
++#include "packfind.h"
++#include "dflash.cuh"
++
++using namespace g6rt;
++constexpr int NR = g6nr::NR;
++
++struct DLoop { const char* send[NR]; char* recv; const u64* stepp; int c, ncoll, n16; size_t stride; };
++// the NIC: every rank's send slot of collective c -> the shared recv slot [c][rank], then the tail. grid NR, block 128.
++__global__ void __launch_bounds__(128) k_dloop(DLoop a)
++{
++    const u64 step = *a.stepp;
++    const size_t slot = (step & 1) * a.ncoll + a.c;
++    const uint4* s = reinterpret_cast<const uint4*>(a.send[blockIdx.x] + slot * a.stride);
++    uint4* d = reinterpret_cast<uint4*>(a.recv + (slot * NR + blockIdx.x) * a.stride);
++    for (int i = threadIdx.x; i < a.n16; i += 128) d[i] = s[i];
++    __syncthreads();
++    if (threadIdx.x == 0) { __threadfence(); *reinterpret_cast<u64*>(d + a.n16) = g6::coll_seq(step, a.c, a.ncoll); }
++}
++
++// one drafter (all ranks) with its own loopback fabric
++struct Var
++{
++    std::vector<Dfl> D;
++    std::vector<DflOut*> out;
++    DLoop loop{};
++    unsigned* err = nullptr;
++};
++static void build_var(Var& v, std::vector<Model>& M, const std::vector<Find>& fd, const DflMeta& meta, bool sel, const DflIn* in,
++                      const int* rows_d, const std::vector<const uint8_t*>& hi4, bool body_i4, cudaStream_t st)
++{
++    const size_t stride = ((size_t)dfl::B * HID * 2 + 8 + 255) / 256 * 256;
++    char* recv = dmalloc<char>(2 * (size_t)dfl::NC * NR * stride);
++    u64* stepp = dmalloc<u64>(1);
++    v.err = dmalloc<unsigned>(1);
++    unsigned long long* bell = dmalloc<unsigned long long>(dfl::NC);
++    v.D.resize(NR);
++    v.out.resize(NR);
++    for (int r = 0; r < NR; ++r)
++    {
++        g6::FabricDev f{};
++        f.send = dmalloc<char>(2 * (size_t)dfl::NC * stride);
++        f.recv = recv; f.doorbell = bell; f.error = v.err;
++        f.rank = r; f.nr = NR; f.ncoll = dfl::NC; f.stride = stride;
++        v.loop.send[r] = f.send;
++        v.out[r] = dmalloc<DflOut>(1);
++        Dfl& D = v.D[r];
++        D.in = in; D.out = v.out[r]; D.nc = 0;
++        dfl_build(D, M[r], fd[r], meta, f, stepp, sel, st);
++        D.emb_rows = rows_d;          // block row r reads row rows_d[r] of the replay's embedding table
++        if (hi4[r]) dfl_head_i4(D, hi4[r], 1, 32);
++        if (body_i4) dfl_body_i4(D, st);
++    }
++    v.loop.recv = recv; v.loop.stepp = stepp; v.loop.ncoll = dfl::NC; v.loop.stride = stride;
++}
++// one step of every rank (DflIn already in device memory; feat already set)
++static void run_var(Var& v, bool query, cudaStream_t st)
++{
++    for (int p = 0; p < (query ? dfl::NPH : 2); ++p)
++    {
++        for (Dfl& x : v.D) dfl_phase(x, p, st, query);
++        if (p < dfl::NC && (query || p == 0))
++        {
++            DLoop a = v.loop;
++            a.c = p; a.n16 = (int)(dfl_payload(v.D[0], p) / 16);
++            k_dloop<<<NR, 128, 0, st>>>(a);
++        }
++    }
++}
++static DflOut out_of(Var& v, const char* name)
++{
++    unsigned e = 0;
++    G6RT_CK(cudaMemcpy(&e, v.err, 4, cudaMemcpyDeviceToHost));
++    if (e) die(std::string(name) + ": fabric error word " + std::to_string(e));
++    std::vector<DflOut> o(NR);
++    for (int r = 0; r < NR; ++r) G6RT_CK(cudaMemcpy(&o[r], v.out[r], sizeof(DflOut), cudaMemcpyDeviceToHost));
++    for (int r = 1; r < NR; ++r)
++        if (memcmp(o[r].tok + 1, o[0].tok + 1, sizeof(int) * dfl::K)) die(std::string(name) + ": ranks disagree on the drafts");
++    return o[0];
++}
++// rank 0's body GEMVs of one draft step, captured, timed over n replays -> ms per step
++static double bench_var(Var& v, int n, cudaStream_t st)
++{
++    Dfl& D = v.D[0];
++    cudaGraph_t g;
++    cudaGraphExec_t ge;
++    G6RT_CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
++    bind::launch(D.fc, st);
++    for (const DLayer& y : D.ly) bind::launch(y.kvc, st);
++    for (const DLayer& y : D.ly)
++    {
++        bind::launch(y.ac, st); bind::launch(y.q, st); bind::launch(y.kv, st); bind::launch(y.o, st);
++        bind::launch(y.mc, st); bind::launch(y.gu, st); bind::launch(y.down, st);
++    }
++    G6RT_CK(cudaStreamEndCapture(st, &g));
++    G6RT_CK(cudaGraphInstantiate(&ge, g, 0));
++    for (int i = 0; i < 3; ++i) G6RT_CK(cudaGraphLaunch(ge, st));
++    cudaEvent_t a, b;
++    G6RT_CK(cudaEventCreate(&a));
++    G6RT_CK(cudaEventCreate(&b));
++    G6RT_CK(cudaEventRecord(a, st));
++    for (int i = 0; i < n; ++i) G6RT_CK(cudaGraphLaunch(ge, st));
++    G6RT_CK(cudaEventRecord(b, st));
++    G6RT_CK(cudaEventSynchronize(b));
++    float ms = 0;
++    G6RT_CK(cudaEventElapsedTime(&ms, a, b));
++    G6RT_CK(cudaGraphExecDestroy(ge));
++    G6RT_CK(cudaGraphDestroy(g));
++    return ms / n;
++}
++
++struct Round { int q0, tok0, dump[dfl::B]; DflOut a, b; };
++static int accept(const int* d, const std::vector<int>& toks, int q0)
++{
++    int n = 0;
++    while (n < dfl::K && q0 + 1 + n < (int)toks.size() && d[1 + n] == toks[q0 + 1 + n]) ++n;
++    return n;
++}
++
++int main(int argc, char** argv)
++{
++    if (argc < 3) die("usage: dflreplay DIR DUMP [--sel 0|1] [--head-i4 0|1] [--temp T] [--seed S] [--top-p P] [--rounds N] [--bench N] [--out FILE]");
++    const std::string dir = argv[1], dump = argv[2];
++    int sel = -1, hi4 = 1, max_rounds = 0, bench = 0;
++    float temp = 0.f, top_p = 0.f;
++    uint32_t seed = 1234;
++    std::string outp;
++    for (int i = 3; i + 1 < argc; i += 2)
++    {
++        const std::string a = argv[i];
++        if (a == "--sel") sel = atoi(argv[i + 1]);
++        else if (a == "--head-i4") hi4 = atoi(argv[i + 1]);
++        else if (a == "--temp") temp = (float)atof(argv[i + 1]);
++        else if (a == "--seed") seed = (uint32_t)strtoul(argv[i + 1], nullptr, 10);
++        else if (a == "--top-p") top_p = (float)atof(argv[i + 1]);
++        else if (a == "--rounds") max_rounds = atoi(argv[i + 1]);
++        else if (a == "--bench") bench = atoi(argv[i + 1]);
++        else if (a == "--out") outp = argv[i + 1];
++        else die("unknown argument " + a);
++    }
++    // the embedding rows
++    FILE* ef = fopen((dir + "/emb.bin").c_str(), "rb");
++    if (!ef) die("no " + dir + "/emb.bin (engine/ref/dflreplay_emb.py)");
++    int ne = 0;
++    if (fread(&ne, 4, 1, ef) != 1 || ne < 1) die("emb.bin: bad header");
++    std::vector<int> eid(ne);
++    std::vector<float> erow((size_t)ne * HID);
++    if (fread(eid.data(), 4, ne, ef) != (size_t)ne || fread(erow.data(), 4, erow.size(), ef) != erow.size()) die("emb.bin: short");
++    fclose(ef);
++    std::map<int, int> erix;
++    for (int i = 0; i < ne; ++i) erix[eid[i]] = i;
++    std::vector<__nv_bfloat16> eb(erow.size());
++    for (size_t i = 0; i < erow.size(); ++i) eb[i] = __float2bfloat16(erow[i]);
++    __nv_bfloat16* emb_d = dmalloc<__nv_bfloat16>(eb.size());
++    G6RT_CK(cudaMemcpy(emb_d, eb.data(), eb.size() * 2, cudaMemcpyHostToDevice));
++    int* rows_d = dmalloc<int>(dfl::B);
++
++    G6RT_CK(bind::init());
++    cudaStream_t st;
++    G6RT_CK(cudaStreamCreate(&st));
++    std::vector<g6::Pack> dp(NR), hp(NR);
++    DevStore store;
++    std::vector<Model> M(NR);
++    std::vector<Find> fd;
++    std::vector<const uint8_t*> h4(NR, nullptr);
++    DflMeta meta;
++    for (int r = 0; r < NR; ++r)
++    {
++        const std::string b = dir + "/dflash.r" + std::to_string(r), h = dir + "/head.r" + std::to_string(r);
++        load_pack(dp[r], b + ".manifest.json", b + ".pack", r);
++        load_pack(hp[r], h + ".manifest.json", h + ".pack", r);
++        fd.push_back(pack_find(dp[r], store));
++        const Find fh = pack_find(hp[r], store);
++        Model& m = M[r];
++        m.rank = r;
++        m.emb = emb_d;
++        m.head_t = bind::head_tensors([&](const char* nm) { return as_bind(fh(nm)); });
++        if (!bind::vocab_slice(r, m.vlo, m.vn)) die("vocab slice");
++        if (hi4) h4[r] = head_i4_records(m.head_t.lm_head, m.vn, 32, r, "dflreplay head", st);
++        if (r == 0) meta = dfl_read_meta(fd[0]);
++    }
++    if (erix.find(meta.mask_id) == erix.end()) die("emb.bin has no row for the mask token " + std::to_string(meta.mask_id));
++    const bool use_sel = sel < 0 ? meta.sel : sel == 1;
++    DflIn* in = dmalloc<DflIn>(1);
++    Var A, B;
++    build_var(A, M, fd, meta, use_sel, in, rows_d, h4, false, st);
++    build_var(B, M, fd, meta, use_sel, in, rows_d, h4, true, st);
++    fprintf(stderr, "# device tensors: %.2f GB held, %.2f GB shared between ranks; %s, head %s\n", store.bytes / 1e9, store.shared_bytes / 1e9,
++            use_sel ? "selector walk" : "argmax", hi4 ? "INT4" : "MXFP8");
++
++    FILE* df = fopen(dump.c_str(), "rb");
++    if (!df) die("cannot open " + dump);
++    FILE* of = outp.empty() ? nullptr : fopen(outp.c_str(), "w");
++    if (of) fprintf(of, "q0\tacc_dump\tacc_a\tacc_b\tcommitted\tdrafts_a\tdrafts_b\tlp_a\tlp_b\n");
++    std::vector<Round> req;               // the request's draft steps, scored at its token record
++    long n_steps = 0, n_rounds = 0, same_pos[dfl::B] = {}, same_all = 0, a_eq_dump = 0;
++    long hist_d[dfl::B] = {}, hist_a[dfl::B] = {}, hist_b[dfl::B] = {};
++    int lo = -1;
++    u64 step = 0;
++    std::vector<__half> fh((size_t)dfl::B * dfl::NT * HID);
++    bool stop = false;
++    while (!stop)
++    {
++        int h[12];
++        if (fread(h, 4, 12, df) != 12) break;
++        if (h[0] == 2)                    // the request's committed tokens: score its draft steps
++        {
++            std::vector<int> toks(h[1]);
++            if (fread(toks.data(), 4, toks.size(), df) != toks.size()) die("dump: short token record");
++            for (const Round& x : req)
++            {
++                const int ad = accept(x.dump, toks, x.q0), aa = accept(x.a.tok, toks, x.q0), ab = accept(x.b.tok, toks, x.q0);
++                ++hist_d[ad]; ++hist_a[aa]; ++hist_b[ab]; ++n_rounds;
++                bool all = true;
++                for (int r = 1; r < dfl::B; ++r)
++                {
++                    const bool s = x.a.tok[r] == x.b.tok[r];
++                    same_pos[r] += s;
++                    all &= s;
++                }
++                same_all += all;
++                a_eq_dump += !memcmp(x.a.tok + 1, x.dump + 1, sizeof(int) * dfl::K);
++                if (of)
++                {
++                    fprintf(of, "%d\t%d\t%d\t%d\t", x.q0, ad, aa, ab);
++                    for (int r = 1; r < dfl::B; ++r) fprintf(of, "%s%d", r > 1 ? "," : "", x.q0 + r < (int)toks.size() ? toks[x.q0 + r] : -1);
++                    for (const DflOut* o : {&x.a, &x.b})
++                    {
++                        fputc('\t', of);
++                        for (int r = 1; r < dfl::B; ++r) fprintf(of, "%s%d", r > 1 ? "," : "", o->tok[r]);
++                    }
++                    for (const DflOut* o : {&x.a, &x.b})
++                    {
++                        fputc('\t', of);
++                        for (int r = 1; r < dfl::B; ++r) fprintf(of, "%s%.4f", r > 1 ? "," : "", o->lp[r]);
++                    }
++                    fputc('\n', of);
++                }
++            }
++            req.clear();
++            lo = -1;
++            continue;
++        }
++        const int kind = h[0], pos0 = h[1], rows = h[2], q0 = h[3], tok0 = h[4];
++        if (rows < 1 || rows > dfl::B) die("dump: bad context row count " + std::to_string(rows));
++        std::fill(fh.begin(), fh.end(), __float2half(0.f));
++        if (fread(fh.data(), 2, (size_t)rows * dfl::NT * HID, df) != (size_t)rows * dfl::NT * HID) die("dump: short features");
++        if (lo < 0) lo = pos0;            // the first context row of a request is its lowest position
++        const bool query = kind == 1;
++        for (Var* v : {&A, &B})
++            for (Dfl& x : v->D) G6RT_CK(cudaMemcpyAsync(x.feat, fh.data(), fh.size() * 2, cudaMemcpyHostToDevice, st));
++        if (query)
++        {
++            if (erix.find(tok0) == erix.end()) die("emb.bin has no row for bonus token " + std::to_string(tok0));
++            int er[dfl::B];
++            er[0] = erix[tok0];
++            for (int r = 1; r < dfl::B; ++r) er[r] = erix[meta.mask_id];
++            G6RT_CK(cudaMemcpyAsync(rows_d, er, sizeof er, cudaMemcpyHostToDevice, st));
++        }
++        DflIn di;
++        memset(&di, 0, sizeof di);
++        di.step = ++step;
++        di.ctx_rows = rows; di.ctx_pos0 = pos0; di.q0 = q0; di.lo = lo; di.tok0 = tok0; di.query = query;
++        for (int r = 0; r < dfl::B; ++r) di.srow[r] = glue::SampleRow{temp > 0 ? 1.f / temp : 0.f, seed, 0u, q0 + r, 0, top_p};
++        G6RT_CK(cudaMemcpyAsync(in, &di, sizeof di, cudaMemcpyHostToDevice, st));
++        run_var(A, query, st);
++        run_var(B, query, st);
++        G6RT_CK(cudaStreamSynchronize(st));
++        G6RT_CK(cudaGetLastError());
++        ++n_steps;
++        if (query)
++        {
++            Round x;
++            x.q0 = q0; x.tok0 = tok0;
++            for (int r = 0; r < dfl::B; ++r) x.dump[r] = r ? h[4 + r] : tok0;
++            x.a = out_of(A, "A (MXFP8)");
++            x.b = out_of(B, "B (INT4)");
++            req.push_back(x);
++            if (max_rounds && n_rounds + (long)req.size() >= max_rounds) stop = true;
++        }
++    }
++    fclose(df);
++    if (of) fclose(of);
++    if (!req.empty()) fprintf(stderr, "# %zu draft steps after the last token record: not scored\n", req.size());
++    printf("replayed %ld drafter steps; scored %ld draft steps\n", n_steps, n_rounds);
++    if (n_rounds)
++    {
++        const double n = (double)n_rounds;
++        printf("A == dump drafts: %.4f\nA == B, all 7 drafts: %.4f\nA == B by position:", a_eq_dump / n, same_all / n);
++        for (int r = 1; r < dfl::B; ++r) printf(" %.4f", same_pos[r] / n);
++        printf("\naccepted histogram 0..7\n");
++        for (auto [name, hh] : {std::pair<const char*, long*>{"dump", hist_d}, {"A", hist_a}, {"B", hist_b}})
++        {
++            printf("  %-4s", name);
++            for (int a = 0; a < dfl::B; ++a) printf(" %ld", hh[a]);
++            printf("\n");
++        }
++        printf("tokens per round at k drafts verified (1 + mean min(accepted, k)), k = 1..7\n");
++        for (auto [name, hh] : {std::pair<const char*, long*>{"dump", hist_d}, {"A", hist_a}, {"B", hist_b}})
++        {
++            printf("  %-4s", name);
++            for (int k = 1; k <= dfl::K; ++k)
++            {
++                double s = 0;
++                for (int a = 0; a < dfl::B; ++a) s += (double)hh[a] * std::min(a, k);
++                printf(" %.4f", 1 + s / n);
++            }
++            printf("\n");
++        }
++    }
++    if (bench > 0)
++    {
++        const double ta = bench_var(A, bench, st), tb = bench_var(B, bench, st);
++        size_t ba = 0, bb = 0;
++        auto add = [](size_t& s, const Dfl& D) {
++            s += bind::gv_bytes(D.fc);
++            for (const DLayer& y : D.ly) s += bind::gv_bytes(y.kvc) + bind::gv_bytes(y.ac) + bind::gv_bytes(y.q) + bind::gv_bytes(y.kv) +
++                                              bind::gv_bytes(y.o) + bind::gv_bytes(y.mc) + bind::gv_bytes(y.gu) + bind::gv_bytes(y.down);
++        };
++        add(ba, A.D[0]);
++        add(bb, B.D[0]);
++        printf("bench rank 0 body GEMVs of a draft step (%d replays): A MXFP8 %.3f ms (%.1f MB, %.0f GB/s), B INT4 %.3f ms (%.1f MB, %.0f GB/s), B - A %.3f ms\n",
++               bench, ta, ba / 1e6, ba / ta / 1e6, tb, bb / 1e6, bb / tb / 1e6, tb - ta);
++    }
++    return 0;
++}
+diff --git a/engine/runtime/g6m4.cu b/engine/runtime/g6m4.cu
+index 20b5058..cfce4a9 100644
+--- a/engine/runtime/g6m4.cu
++++ b/engine/runtime/g6m4.cu
+@@ -491,6 +491,13 @@ int main(int argc, char** argv)
+     const int dfl_i4 = env_choice("G6_DFL_HEAD_I4", 1, 0, &dfe);
+     if (dfl_i4 < 0) die(dfe);
+     if (dfl_i4 && !dfl) die("G6_DFL_HEAD_I4=1 needs --dflash-manifest");
++    // G6_DFL_BODY_I4=1 (dflash.cuh dfl_body_i4; default 0): the DFlash2 drafter's body GEMVs read INT4 g32 copies of their
++    // MXFP8 records. G6_MTP_EHPROJ_I4=1 (rank.cuh build_draft_eh_i4; default 0): the MTP draft's eh_proj does. Drafts only;
++    // +382 / +10.6 MB per rank (+42.5 without G6_MTP_SPLIT). Both in the S2 runtime signature
++    const int dfl_body_i4_on = env_choice("G6_DFL_BODY_I4", 1, 0, &dfe), eh_i4 = env_choice("G6_MTP_EHPROJ_I4", 1, 0, &dfe);
++    if (dfl_body_i4_on < 0 || eh_i4 < 0) die(dfe);
++    if (dfl_body_i4_on && !dfl) die("G6_DFL_BODY_I4=1 needs --dflash-manifest");
++    if (eh_i4 && !mtp) die("G6_MTP_EHPROJ_I4=1 needs --mtp");
+     // G6_S2_DSEL_START=mtp (s2_batch.h DSel::start_mtp; default dflash): a DFlash2 request starts on MTP. In the S2 runtime
+     // signature
+     const char* dse = getenv("G6_S2_DSEL_START");
+@@ -771,6 +778,7 @@ int main(int argc, char** argv)
+             fabdg_on = true;
+             qs_attach(D.d, fabdg.dev(), fd.error);   // the draft fabric's error word, which the draft step checks
+         }
++        build_draft_eh_i4(D, eh_i4);
+         D.d.graph = graph; D.d.in = in_d; D.d.out = out_d;
+         DQ.P.attn_rows = pf_attn_rows(MP);
+         if (MP) build_draft_prefill(DQ, D, find, MP, fp, pfv2, st, &P);
+@@ -795,6 +803,7 @@ int main(int argc, char** argv)
+         if (dfl_i4)
+             dfl_head_i4(DF, D.d.dh_i4 ? D.d.dh_i4 : head_i4_records(m.head_t.lm_head, m.vn, dhead.ks, R, "G6_DFL_HEAD_I4", st),
+                         dhead.tpc, dhead.ks);
++        if (dfl_body_i4_on) dfl_body_i4(DF, st);
+         if (dfl_alpha != 1.f && !DF.sel) die("G6_DFL_SEL_ALPHA needs the selector walk");
+         DF.sel_alpha = dfl_alpha;
+         dfl_attach(m, DF);              // before the target graphs are captured: they carry the residual taps
+@@ -1382,6 +1391,7 @@ int main(int argc, char** argv)
+                 (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "") +
+                 (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
+                 (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
++                (dfl_body_i4_on ? " dflbodyi4 1" : "") + (eh_i4 ? " ehi4 1" : "") +
+                 (dsel_start_mtp ? " dselstart mtp" : "") + (dsel_posclk ? " dselposclk 1" : "") + (dfl_alpha != 1.f ? " dflalpha " + std::to_string(dfl_alpha) : "") +
+                 (kstop.mode ? " kstop " + std::to_string(kstop.mode) + " kmax " + std::to_string(kstop.kmax) + " tau " + std::to_string(kstop.tau[1]) + "," +
+                               std::to_string(kstop.tau[2]) + "," + std::to_string(kstop.tau[3]) + " seed3 " + std::to_string(kstop.seed3) : "") +
+diff --git a/engine/runtime/rank.cuh b/engine/runtime/rank.cuh
+index 311145a..696aab2 100644
+--- a/engine/runtime/rank.cuh
++++ b/engine/runtime/rank.cuh
+@@ -366,6 +366,7 @@ struct Model
+     // vocab slice instead of head_t.lm_head (build_draft_head_i4); dh_tpc / dh_ks = its CTA split. nullptr = MXFP8
+     const uint8_t* dh_i4 = nullptr;
+     int dh_tpc = 1, dh_ks = 32;
++    bool eh_i4 = false;               // G6_MTP_EHPROJ_I4 (MTP draft model only, set before prepare): eh_proj on INT4 g32 records
+     int nc = 0;                       // top_p candidates per rank per row (0 = top_p off); set before the first step
+     unsigned* topp_miss = nullptr;    // device counter: top_p rows whose nucleus went past the candidates
+     void (*dfl_tap)(Model&, int, int, cudaStream_t) = nullptr;   // --dflash: after layer i, copy the residual rows the drafter reads (dflash.cuh)
+@@ -1276,6 +1277,36 @@ inline void route_log_line(FILE* f, const Model& m, const std::vector<int>& ids,
+ 
+ inline const __nv_bfloat16* norm_after(const Model& m, int i) { return i + 1 < m.nl ? m.layers[i + 1].attn_norm : m.final_norm; }
+ 
++// G6_DFL_BODY_I4 / G6_MTP_EHPROJ_I4: a bound MXFP8 GEMV rebound to INT4 g32 records of the same rows (k_mx_to_i4 over
++// its O/16 tiles x K/32 groups, the G6_DRAFT_HEAD_I4 arithmetic; DEC_I4PAIR builds repack them for its ks): same split,
++// fragment table and output, only the weights' codec changes. One copy per (records, tiles, ks), so GEMVs that bind the
++// same records share it (the drafter's kv record: its context and block GEMVs; the MTP eh_proj of every row count).
++// Device memory for the life of the process; the MXFP8 records stay (they sit in the pack image). Returns the bytes made.
++inline size_t gv_to_i4(bind::Gv& g, const char* who, cudaStream_t st)
++{
++    struct Made { const uint8_t* mx; int tiles, ks; const uint8_t* i4; };
++    static std::vector<Made> made;
++    if (!g.on) return 0;
++    if (g.codec != bind::MXFP8) die(std::string(who) + ": a GEMV that is not on MXFP8 records");
++    const int tiles = g.O / 16, ng = g.K / 32;
++    for (const Made& x : made)
++        if (x.mx == g.w && x.tiles == tiles && x.ks == g.ks) { g.codec = bind::INT4; g.w = x.i4; return 0; }
++#if DEC_I4PAIR
++    if ((size_t)ng / g.ks * head_i4::I4GR > 48 * 1024) die(std::string(who) + ": k part too long for k_i4pair's shared memory");
++#endif
++    uint8_t* rec = dmalloc<uint8_t>(head_i4::bytes(tiles, ng));
++    head_i4::launch(g.w, rec, tiles, ng, st);
++    G6RT_CK(cudaGetLastError());
++#if DEC_I4PAIR
++    launch_i4pair(rec, tiles, ng, g.ks, st);   // make_gv kept ng % ks == 0
++    G6RT_CK(cudaGetLastError());
++#endif
++    G6RT_CK(cudaStreamSynchronize(st));
++    made.push_back(Made{g.w, tiles, g.ks, rec});
++    g.codec = bind::INT4; g.w = rec;
++    return head_i4::bytes(tiles, ng);
++}
++
+ inline glue::HeadArgs head_args(Model& m, int M)
+ {
+     return glue::HeadArgs{m.f, m.stepp, 2 * m.nl, M, m.hlog, m.vn, m.vlo, m.vn, m.srow, m.tickets + 2 * m.nl, m.tok_out, m.lp,
+@@ -1306,6 +1337,7 @@ inline const bind::Head& head_for(Model& m, int M)
+             static const int tpc = getenv("G6_QA_SPLIT_TPC") ? atoi(getenv("G6_QA_SPLIT_TPC")) : 1;
+             bind::narrow(H.eh, G.c0[m.rank][0] / 16, G.n[m.rank][0] / 16, tpc);
+         }
++        if (m.eh_i4) gv_to_i4(H.eh, "G6_MTP_EHPROJ_I4", 0);   // after the narrow: this rank's tiles only
+     }
+     return H;
+ }
+@@ -1590,6 +1622,24 @@ inline void build_draft_head_i4(Draft& D, const DraftHeadI4& c, cudaStream_t st)
+     d.dh_i4 = head_i4_records(d.head_t.lm_head, d.vn, c.ks, d.rank, "G6_DRAFT_HEAD_I4", st);
+     d.dh_tpc = c.tpc; d.dh_ks = c.ks;
+ }
++// G6_MTP_EHPROJ_I4=1 (default 0; needs --mtp): the MTP draft's eh_proj GEMV (78 MB MXFP8 per rank, or this rank's tiles
++// under G6_MTP_SPLIT: 19.5 MB) reads INT4 g32 records of the same rows (gv_to_i4), 288 / 528 of the bytes, on every draft
++// pass (first form and chain). Drafts only: the eh_proj of the draft prefill (prefill.cuh, the MTP layer's cache over the
++// prompt) and every target step keep MXFP8, so the committed tokens are the target's at any acceptance. Every rank
++// converts its own tiles by the same arithmetic. After build_draft_head_i4 (head_for binds the INT4 head with it), before
++// prepare: binds the one-row head here so the conversion runs at boot.
++inline void build_draft_eh_i4(Draft& D, bool on)
++{
++    Model& d = D.d;
++    if (!on) return;
++    for (int M = 1; M <= MX; ++M)
++        if (d.head[M].M) die("G6_MTP_EHPROJ_I4: the draft head was bound before its INT4 eh_proj");
++    if (!d.head_t.eh.p) die("G6_MTP_EHPROJ_I4: the draft model has no eh_proj");
++    d.eh_i4 = true;
++    const bind::Gv& g = head_for(d, 1).eh;
++    fprintf(stderr, "# rank %d: G6_MTP_EHPROJ_I4: eh_proj INT4 g32 records, %.1f MB (MXFP8 %.1f MB), %d outputs, ks %d\n", d.rank,
++            bind::gv_bytes(g) / 1e6, (double)(g.O / 16) * (g.K / 32) * head_i4::MXGR / 1e6, g.O, g.ks);
++}
+ #ifdef DEC_S2
+ inline const __half* s2_draft_hid(Draft& D, bool chain, cudaStream_t st);
+ inline void s2_draft_keep(Draft& D, cudaStream_t st);
+diff --git a/engine/runtime/tests/dhead_i4_test.cu b/engine/runtime/tests/dhead_i4_test.cu
+index ba8854b..87b032c 100644
+--- a/engine/runtime/tests/dhead_i4_test.cu
++++ b/engine/runtime/tests/dhead_i4_test.cu
+@@ -9,6 +9,10 @@
+ //    are within that tolerance.
+ // --time: the lm_head GEMV of one TP4 vocab slice (38784 x 6144): today's MXFP8 head (tpc 1, ks 32) against the INT4 head
+ //    over (tpc, ks), M = 1 and 3, mean of reps launches (CUDA events), and the bytes per launch.
++// 3. (G6_DFL_BODY_I4, G6_MTP_EHPROJ_I4) 1 and 2 on the DFlash2 drafter's body shapes and the MTP eh_proj, at their splits.
++// --time-dfl [reps]: those GEMVs at TP4 per-rank sizes, M = 8 (eh_proj M = 1 and 3), MXFP8 against INT4 at the same split,
++//    each cycling through copies of its records that together exceed the 25 MB L2 (a draft step streams 700 MB), and the
++//    sum over one DFlash2 draft step (context fc + 6 kv; 6 x aconv q kv o mconv gu down).
+ // Build: scripts/c1_tests.sh <bin_dir> (TEST=dhead_i4_test)      Exit code: 0 all PASS, 1 any FAIL, 2 CUDA error.
+ #include <algorithm>
+ #include <cmath>
+@@ -173,9 +177,9 @@ static void run_head(const void* rec, int codec, int O, int K, int tpc, int ks,
+     bind::launch(g, nullptr);
+ }
+ 
+-static void test_convert_and_gemv()
++static void test_convert_and_gemv(int n = 1024, int K = 6144, std::vector<std::pair<int, int>> splits = {{1, 32}, {1, 16}, {2, 8}})
+ {
+-    const int n = 1024, K = 6144, ng = K / 32;
++    const int ng = K / 32;
+     std::vector<uint8_t> c, s, q;
+     std::vector<__half> sc;
+     random_mx(n, K, 11u, c, s);
+@@ -200,8 +204,7 @@ static void test_convert_and_gemv()
+     report(bad == 0, b);
+ 
+     // GEMV on the converted records
+-    const int MS[2] = {1, 3};
+-    const int SPLIT[3][2] = {{1, 32}, {1, 16}, {2, 8}};
++    const int MS[3] = {1, 3, 8};
+     std::vector<__half> hx((size_t)8 * K);
+     for (size_t i = 0; i < hx.size(); ++i) hx[i] = __float2half_rn(((rnd(i, 99u) >> 8) * (1.f / 16777216.f) * 2.f - 1.f));
+     __half* dx;
+@@ -213,15 +216,15 @@ static void test_convert_and_gemv()
+     CK(cudaMemcpy(dx, hx.data(), hx.size() * 2, cudaMemcpyHostToDevice));
+     uint8_t* dp;
+     CK(cudaMalloc(&dp, want.size()));
+-    for (const auto& sp : SPLIT)
++    for (const auto& sp : splits)
+     {
+         CK(cudaMemcpy(dp, di4, want.size(), cudaMemcpyDeviceToDevice));
+ #if DEC_I4PAIR
+-        launch_i4pair(dp, n / 16, ng, sp[1], nullptr);
++        launch_i4pair(dp, n / 16, ng, sp.second, nullptr);
+ #endif
+         for (int M : MS)
+         {
+-            run_head(dp, bind::INT4, n, K, sp[0], sp[1], M, dx, xf, dy);
++            run_head(dp, bind::INT4, n, K, sp.first, sp.second, M, dx, xf, dy);
+             CK(cudaDeviceSynchronize());
+             std::vector<float> y((size_t)M * n);
+             CK(cudaMemcpy(y.data(), dy, y.size() * 4, cudaMemcpyDeviceToHost));
+@@ -251,7 +254,7 @@ static void test_convert_and_gemv()
+                 if (rg != gg && std::fabs(ref[rg] - ref[gg]) > 1e-5 * (mag[rg] + mag[gg])) ++argmax_bad;
+             }
+             snprintf(b, sizeof b, "INT4 head GEMV O=%d K=%d tpc=%d ks=%d M=%d: worst |gpu - host| / sum|terms| %.2e, argmax differs in %d rows",
+-                     n, K, sp[0], sp[1], M, worst, argmax_bad);
++                     n, K, sp.first, sp.second, M, worst, argmax_bad);
+             report(worst < 1e-5 && argmax_bad == 0, b);
+         }
+     }
+@@ -316,13 +319,100 @@ static void time_heads(int reps)
+     fflush(stdout);
+ }
+ 
++// the drafter's body GEMVs and the MTP eh_proj at TP4 per-rank sizes (dflash.cuh dfl_build, bind.cuh make_head)
++struct DflShape { const char* name; int O, K, tpc, ks, n; };   // n: launches per draft step
++static const DflShape DFL[] = {{"fc", 1536, 36864, 1, 32, 1}, {"kv", 512, 6144, 1, 32, 12}, {"aconv/mconv", 1536, 6144, 1, 16, 12},
++                               {"q", 2048, 6144, 1, 16, 6}, {"o", 6144, 2048, 2, 8, 6}, {"gu", 6144, 6144, 2, 16, 6},
++                               {"down", 6144, 3072, 2, 8, 6}, {"eh (split)", 1536, 12288, 2, 16, 0}};
++
++static void time_dfl(int reps)
++{
++    const size_t L2SET = 96u << 20;   // > 25 MB L2: each launch reads records the previous ones evicted
++    double tot_mx = 0, tot_i4 = 0;
++    __half* dx;
++    u32* xf;
++    void* dy;
++    CK(cudaMalloc(&dx, (size_t)8 * 36864 * 2));
++    CK(cudaMemset(dx, 0x31, (size_t)8 * 36864 * 2));
++    CK(cudaMalloc(&xf, (size_t)36864 / 16 * 64 * 4 * g6mx::NT));
++    CK(cudaMalloc(&dy, (size_t)8 * 6144 * 4));
++    bind::Xfrag f;
++    f.on = 1; f.src = dx; f.ld = 36864; f.K = 36864; f.M = 8; f.f16 = xf;
++    bind::launch(f, nullptr);
++    cudaEvent_t e0, e1;
++    CK(cudaEventCreate(&e0));
++    CK(cudaEventCreate(&e1));
++    for (const DflShape& d : DFL)
++    {
++        const int ng = d.K / 32;
++        const size_t mxb = (size_t)d.O / 16 * ng * 528, i4b = head_i4::bytes(d.O / 16, ng);
++        const int copies = (int)std::max<size_t>(1, (L2SET + mxb - 1) / mxb);
++        std::vector<uint8_t> h(mxb);
++        for (size_t i = 0; i < mxb; ++i)
++        {
++            uint8_t v = (uint8_t)rnd(i, 7u);
++            if (i % 528 >= 512) v = (uint8_t)(116 + v % 6);
++            else if ((v & 0x7f) == 0x7f) v &= 0xbf;
++            h[i] = v;
++        }
++        std::vector<uint8_t*> mx(copies), i4(copies);
++        for (int c = 0; c < copies; ++c)
++        {
++            CK(cudaMalloc(&mx[c], mxb));
++            CK(cudaMalloc(&i4[c], i4b));
++            CK(cudaMemcpy(mx[c], h.data(), mxb, cudaMemcpyHostToDevice));
++            head_i4::launch(mx[c], i4[c], d.O / 16, ng, nullptr);
++#if DEC_I4PAIR
++            int ks = d.ks;
++            while (ks > 1 && ng % ks) ks >>= 1;       // make_gv's k-part count
++            launch_i4pair(i4[c], d.O / 16, ng, ks, nullptr);
++#endif
++        }
++        for (int M : d.n ? std::vector<int>{8} : std::vector<int>{1, 3})
++        {
++            auto timeit = [&](const std::vector<uint8_t*>& rec, int codec) {
++                std::vector<bind::Gv> g(copies);
++                for (int c = 0; c < copies; ++c)
++                    if (const char* e = bind::make_gv(mk(rec[c], d.O / 16, ng, codec == bind::INT4 ? 288 : 528), codec, d.tpc, d.ks, M, xf, dy,
++                                                      gv::O_F16, g[c]))
++                    {
++                        printf("make_gv: %s\n", e);
++                        exit(2);
++                    }
++                for (int i = 0; i < 2 * copies; ++i) bind::launch(g[i % copies], nullptr);
++                CK(cudaEventRecord(e0));
++                for (int i = 0; i < reps; ++i) bind::launch(g[i % copies], nullptr);
++                CK(cudaEventRecord(e1));
++                CK(cudaEventSynchronize(e1));
++                float ms = 0;
++                CK(cudaEventElapsedTime(&ms, e0, e1));
++                return 1e3 * ms / reps;
++            };
++            const double t = timeit(mx, bind::MXFP8);
++            const double u = timeit(i4, bind::INT4);
++            printf("TIME dfl %-12s O=%d K=%d tpc=%d ks=%d M=%d x%d: MXFP8 %.1f us (%.1f MB, %.0f GB/s), INT4 %.1f us (%.1f MB, %.0f GB/s), %.2fx\n",
++                   d.name, d.O, d.K, d.tpc, d.ks, M, d.n, t, mxb / 1e6, mxb / t / 1e3, u, i4b / 1e6, i4b / u / 1e3, t / u);
++            tot_mx += d.n * t; tot_i4 += d.n * u;
++        }
++        for (int c = 0; c < copies; ++c) { cudaFree(mx[c]); cudaFree(i4[c]); }
++    }
++    printf("TIME dfl draft step body GEMVs: MXFP8 %.3f ms, INT4 %.3f ms, saved %.3f ms\n", tot_mx / 1e3, tot_i4 / 1e3, (tot_mx - tot_i4) / 1e3);
++    cudaFree(dx); cudaFree(xf); cudaFree(dy);
++    fflush(stdout);
++}
++
+ int main(int argc, char** argv)
+ {
+-    int reps = 0;
++    int reps = 0, dreps = 0;
+     for (int i = 1; i < argc; ++i)
++    {
+         if (!strcmp(argv[i], "--time")) reps = i + 1 < argc ? atoi(argv[++i]) : 200;
++        else if (!strcmp(argv[i], "--time-dfl")) dreps = i + 1 < argc ? atoi(argv[++i]) : 400;
++    }
+     test_convert_and_gemv();
++    for (const DflShape& d : DFL) test_convert_and_gemv(256, d.K, {{d.tpc, d.ks}});   // G6_DFL_BODY_I4 / G6_MTP_EHPROJ_I4 shapes
+     if (reps > 0) time_heads(reps);
++    if (dreps > 0) time_dfl(dreps);
+     printf("%d PASS, %d FAIL\n", g_pass, g_fail);
+     return g_fail ? 1 : 0;
+ }

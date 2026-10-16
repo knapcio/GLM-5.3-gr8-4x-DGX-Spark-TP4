@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Thu, 15 Oct 2026 08:15:31 +0200
-Subject: [PATCH 07/21] DFlash2 selector walk: correction coefficient behind
+Subject: [PATCH 07/22] DFlash2 selector walk: correction coefficient behind
  G6_DFL_SEL_ALPHA
 
 score = logit + alpha * correction; the draft lp follows the new scores. Drafts

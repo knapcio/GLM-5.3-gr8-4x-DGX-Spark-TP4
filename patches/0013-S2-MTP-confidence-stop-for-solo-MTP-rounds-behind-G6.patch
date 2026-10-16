@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Thu, 15 Oct 2026 12:53:04 +0200
-Subject: [PATCH 13/21] S2: MTP confidence stop for solo MTP rounds behind
+Subject: [PATCH 13/22] S2: MTP confidence stop for solo MTP rounds behind
  G6_MTP_KSTOP, round log G6_MTP_LPLOG
 
 A DFlash2 session's MTP rounds (drafter choice) chain and verify 1..G6_MTP_KSTOP_KMAX (<= 3) drafts chosen from the

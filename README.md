@@ -1,7 +1,7 @@
 # Full GLM-5.3 on 4× NVIDIA DGX Spark with gr8 (TP4)
 
 A recipe for serving full [GLM-5.3](https://huggingface.co/zai-org/GLM-5.3) on four DGX Sparks with tensor parallelism
-4, using the [gr8](https://github.com/kindlingai/gr8) engine by kindlingai at a pinned upstream commit, plus twenty-one
+4, using the [gr8](https://github.com/kindlingai/gr8) engine by kindlingai at a pinned upstream commit, plus twenty-two
 small patches. The weights are kindlingai's EXLR8 quantization
 [kindlingai/glm-5.3-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4) (width manifest `home`),
 with GLM-5.3's own MTP layer and the [incoai/GLM-5.3-DFlash2](https://huggingface.co/incoai/GLM-5.3-DFlash2) drafter.
@@ -11,13 +11,13 @@ fork, no weights and no images: the engine comes from upstream at `6448a16`, the
 image from upstream's registry. Every patch except the fabric MTU fix (0001, always on) is behind a flag that defaults
 to off, so the patched engine behaves as upstream until `G6ENV_X` turns the levers on.
 
-Release **v0.3**, 2026-10-16. The tables below are this release's measurements. What changed in each release, and by
+Release **v0.4**, 2026-10-16. The tables below are this release's measurements. What changed in each release, and by
 how much, is in [CHANGELOG.md](CHANGELOG.md); A/B measurements against earlier releases and the upstream baseline are
 in [docs/history.md](docs/history.md).
 
 ## Decode by prompt type and concurrency — thinking on, effort low
 
-Measured 2026-10-16 on the v0.3 configuration, one boot.
+Measured 2026-10-16 on the v0.4 configuration: each cell is the median over three boots.
 
 Decode, aggregate tok/s **[per-stream tok/s]**, RigMark's prose, code and structured prompts, 256 output tokens,
 temperature 0, `reasoning_effort: low` (the model's chat template has no thinking-off mode), medians of three rounds per
@@ -28,9 +28,9 @@ structured and code, where DFlash2 drafts long blocks, gain less from concurrenc
 
 | Prompt type | c1 | c2 | c4 |
 |---|---:|---:|---:|
-| prose | 36.2 [37.3] | 49.2 [26.1] | 63.3 [17.7] |
-| code | 46.3 [47.4] | 59.2 [31.5] | 75.5 [21.4] |
-| structured | 70.6 [73.2] | 65.7 [35.7] | 85.0 [25.0] |
+| prose | 35.3 [36.2] | 48.9 [26.1] | 63.3 [17.7] |
+| code | 46.7 [47.8] | 59.1 [31.5] | 75.1 [21.4] |
+| structured | 72.1 [74.8] | 65.6 [35.7] | 84.9 [24.9] |
 
 ## Prefill
 
@@ -39,7 +39,7 @@ prefix reuse). A 96K-token needle prompt: correct answer.
 
 | Prompt length | 8K | 32K | 64K | 128K |
 |---|---:|---:|---:|---:|
-| cold prefill tok/s | 1367 | 1380 | 1311 | 1174 |
+| cold prefill tok/s | 1375 | 1378 | 1313 | 1160 |
 
 RigMark decode results (used to measure each lever) are in [docs/history.md](docs/history.md).
 
@@ -71,6 +71,7 @@ is in [docs/history.md](docs/history.md#multi-turn-prefix-cache-hits).
 | 0019 | `tools/s2_dsel_table.py`: `--w` (the estimates' prior weight) and the measurement boot procedure in its usage text | — (tool) | — (tool, not in the engine) | knapcio |
 | 0020 | DSel cost model, table key `r`: price DFlash2 from the request's DFlash2 rounds and scored probes as they ran (committed tokens over their table cost, aged by `r` per MTP round) instead of its position-rate estimate, so a request that a dip moved to MTP can come back to DFlash2 | `r:0.95` in `G6_S2_DSEL_TABLE` | drafting | knapcio; DSel by kindlingai |
 | 0021 | `tools/s2_dsel_table.py` usage text: the measurement boot removes the model and `G6_DRAFT_PAR` and appends the diagnostics | — | tool docs | knapcio |
+| 0022 | DFlash2 drafter body on INT4 g32 records made at boot from its MXFP8 records (fc and, per layer, kv / aconv / q / o / mconv / gu / down, same splits): the drafter body's records take 382 MB instead of 701 MB. Also in the patch, off: the MTP draft's eh_proj on INT4 (`G6_MTP_EHPROJ_I4`) | `G6_DFL_BODY_I4=1` | drafting | knapcio; DFlash2 by incoai |
 
 The measured contribution of each lever is in [docs/history.md](docs/history.md#per-lever-contributions).
 
@@ -119,7 +120,7 @@ and KL checks against earlier configurations are in [docs/history.md](docs/histo
 - **Engine flags** (serving): `G6ENV_X` in [docker/env.example](docker/env.example), the same line on every box:
 
   ```bash
-  G6ENV_X="G6_QA_SPLIT=1 G6_IDXQ_SPLIT=1 G6_MTP_SPLIT=1 G6_DRAFT_HEAD_I4=1 G6_DFL_HEAD_I4=1 G6_S2_DSEL_PROBE=32 G6_ROUTE_OVL=1 G6_ATTN_SC2=4 G6_ATTN_SC2_TR=2 G6_ATTN_CTX2=4 G6_ATTN_CTX3=2 G6_ATTN_SEL2=16 G6_IDX_GRP=16 G6_MTP_KSTOP=1 G6_MTP_KSTOP_KMAX=3 G6_MTP_KSTOP_TAU=0,0.5,0.75 G6_DFL_REUSE=2 G6_ATTN_QT=1 G6_ATTN_FRONT=1 G6_DRAFT_PAR=1 G6_S2_DSEL_MODEL=1 G6_S2_DSEL_TABLE=v2:46.63,v3:54.71,v4:63.99,v5:71.54,v6:79.37,v7:88.23,v8:96.82,d:7.285,m:2.039,e:1.155,p:5.026,g:1.107,k:2.177,n:2.486,w:1,r:0.95"
+  G6ENV_X="G6_QA_SPLIT=1 G6_IDXQ_SPLIT=1 G6_MTP_SPLIT=1 G6_DRAFT_HEAD_I4=1 G6_DFL_HEAD_I4=1 G6_S2_DSEL_PROBE=32 G6_ROUTE_OVL=1 G6_ATTN_SC2=4 G6_ATTN_SC2_TR=2 G6_ATTN_CTX2=4 G6_ATTN_CTX3=2 G6_ATTN_SEL2=16 G6_IDX_GRP=16 G6_MTP_KSTOP=1 G6_MTP_KSTOP_KMAX=3 G6_MTP_KSTOP_TAU=0,0.5,0.75 G6_DFL_REUSE=2 G6_ATTN_QT=1 G6_ATTN_FRONT=1 G6_DRAFT_PAR=1 G6_S2_DSEL_MODEL=1 G6_S2_DSEL_TABLE=v2:46.63,v3:54.71,v4:63.99,v5:71.54,v6:79.37,v7:88.23,v8:96.82,d:7.285,m:2.039,e:1.155,p:5.026,g:1.107,k:2.177,n:2.486,w:1,r:0.95 G6_DFL_BODY_I4=1"
   ```
 
   `G6_S2_DSEL_MCOST` is no longer set: with `G6_S2_DSEL_MODEL=1` the drafter choice prices both drafters from
@@ -129,7 +130,8 @@ and KL checks against earlier configurations are in [docs/history.md](docs/histo
   in the patched tree (added by patches 0018 and 0019; its usage text has the procedure). The values are milliseconds
   on this hardware (GB10, this fabric, the stock clock cap, these kernels): on other hardware, or after changing the
   kernels or the K-stop settings, measure it again, because a table from other machines misprices the drafters.
-  Measurement boot:
+  The served table above was measured with `G6_DFL_BODY_I4` off (the comparison with a table measured with it on is in
+  [CHANGELOG.md](CHANGELOG.md)). Measurement boot:
 
   1. Boot the serving configuration being priced with the model off and the timeline on: the `G6ENV_X` line above
      without `G6_S2_DSEL_MODEL=1`, `G6_S2_DSEL_TABLE=…` and `G6_DRAFT_PAR=1`, plus
@@ -150,6 +152,8 @@ and KL checks against earlier configurations are in [docs/history.md](docs/histo
 
 - **Decode table**: `python3 bench/conc.py --prompts <rigmark>/prompts.json` against the head's API (rounds 3,
   256 output tokens).
+- **Decode over 24 prompts** (used for the release A/B in [CHANGELOG.md](CHANGELOG.md)): `python3 bench/decset.py`
+  against the head's API; 12 prose, 6 code and 6 structured prompts in the script, c1, T=0, 384 output tokens.
 
 - **RigMark** 1.0.0 ([github.com/alexellis/rigmark](https://github.com/alexellis/rigmark)) against the head's API. Full
   runs:
@@ -221,7 +225,7 @@ gr8 expects, and about 90 GB of disk per box for its part of the model.
    engine and places it in the pinned upstream image:
 
    ```bash
-   docker buildx build --platform linux/arm64 -t gr8-glm53-recipe:v0.3 --load .
+   docker buildx build --platform linux/arm64 -t gr8-glm53-recipe:v0.4 --load .
    ```
 
    Use the same image on all four boxes (build it on each, or `docker save` / `docker load`).
