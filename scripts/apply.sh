@@ -7,7 +7,7 @@ set -euo pipefail
 
 GR8_URL=${GR8_URL:-https://github.com/kindlingai/gr8}
 GR8_COMMIT=6448a16661abd81e9540bc073b3cfa92d7234565      # upstream main, 2026-10-14
-EXPECTED_TREE=631a9568a82ba78e112cb1d83db0fb310f688f95   # git tree id after the 22 patches
+EXPECTED_TREE=a6161aa23cf75705ba6d33fbeab16bcc2ed41bc6   # git tree id after the 26 patches
 
 here=$(cd "$(dirname "$0")/.." && pwd)
 dir=${1:-gr8}

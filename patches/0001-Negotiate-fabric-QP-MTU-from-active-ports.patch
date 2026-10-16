@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Thu, 15 Oct 2026 16:51:21 +0200
-Subject: [PATCH 01/22] Negotiate fabric QP MTU from active ports
+Subject: [PATCH 01/26] Negotiate fabric QP MTU from active ports
 
 ---
  engine/comms/fabric.cpp          | 39 +++++++++++++++++++++++++++-----

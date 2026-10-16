@@ -1,0 +1,1015 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Fri, 16 Oct 2026 08:03:02 +0200
+Subject: [PATCH 23/26] Decode: paced side-stream L2 prefetch of the next
+ weights in the step's idle-DRAM windows (G6_L2PF)
+
+The decode step leaves DRAM idle in its collective waits (the two all-reduces, the
+G6_QA_SPLIT / G6_IDXQ_SPLIT gathers) and through most of the latency-bound attention,
+while the GEMVs around them run below the DRAM rate cold (x_in ~120 GB/s, absorb ~124,
+o_proj 210). With G6_L2PF one warp on a high-priority side stream issues 8 KiB
+cp.async.bulk.prefetch.L2 chunks of the layer's next weights from a token bucket
+(G6_L2PF_GBPS, waves of G6_L2PF_WAVE), as blaesus/dsgx10's paced prefetch does,
+instead of G6_OPROJ_PF's 8-CTA burst; a second warp polls the collective's tails and
+stops the window once it has arrived. One queue per layer in read order (x_in, idx_q,
+q_b, UK, UV, o_proj capped at G6_L2PF_OPMB, router, shared fc1), each window starting
+at its first unread target and continuing where the layer's last window ended.
+Windows (mask): 1 the MLP all-reduce wait (next layer), 2 the gathers, 4 the attention,
+8 the attention all-reduce wait. Budgets G6_L2PF_US / G6_L2PF_MB per window; targets
+G6_L2PF_T. The side stream is forked per window and joined once at the end of the
+step (part). A prefetch writes nothing and changes no load's value: same bytes out.
+Unset / 0: no stream, no launch, the graphs are unchanged.
+
+engine/kernels/tests/l2pf_bench.cu: 78 distinct layers of the decode sequence on one
+GPU in one graph (x_in tiles, q_b, the real attention, o_proj, router || a shared-fc1
+stand-in, wait stand-ins whose tails land 2 us before their end, a MoE stand-in that
+streams 80 MB), with the engine's window calls: byte compare of every layer's outputs
+per arm against off, us per layer per arm and per segment. Built by scripts/build.sh
+(not run).
+---
+ docs/SETTINGS.md                   |   1 +
+ engine/kernels/l2pf.cuh            | 269 ++++++++++++++
+ engine/kernels/tests/l2pf_bench.cu | 573 +++++++++++++++++++++++++++++
+ engine/runtime/g6m4.cu             |   1 +
+ engine/runtime/rank.cuh            |  21 ++
+ scripts/build.sh                   |   6 +
+ 6 files changed, 871 insertions(+)
+ create mode 100644 engine/kernels/l2pf.cuh
+ create mode 100644 engine/kernels/tests/l2pf_bench.cu
+
+diff --git a/docs/SETTINGS.md b/docs/SETTINGS.md
+index c5434b6..36fd1cc 100644
+--- a/docs/SETTINGS.md
++++ b/docs/SETTINGS.md
+@@ -93,6 +93,7 @@ the short version.
+ | `G6_MTP_EHPROJ_I4` | 0 | MTP draft steps (needs `--mtp`): the eh_proj GEMV reads INT4 g32 copies of its MXFP8 records (this rank's tiles under `G6_MTP_SPLIT`: +10.6 MB per rank, else +42.5 MB), on the first form and every chain step. The draft prefill and the target are unchanged; drafts only. Every rank must set the same value |
+ | `G6_DFL_SEL_ALPHA` | 1 | DFlash2 selector walk (needs `--dflash-manifest` and the selector): each candidate scores `logit + a * correction` instead of `logit + correction`, and the draft's log-probability comes from those scores. Drafts only; the verify is unchanged. Every rank must set the same value |
+ | `G6_ROUTE_OVL` | 0 | decode, trellis-shared MoE layers with separate fc1 / fc2 launches (2+ rows): the shared expert runs on a forked stream from before the router GEMV, so its weight reads overlap the router GEMV (8 of 48 SMs) and the single-CTA plan kernel. 1 = its fc1 and fc2 on the fork, joined before the finalize; 2 = its fc1 only, joined before fc2. Same bytes out (`k1_ovl_test`). Fused layers (1 row) and the MTP layer run as before. Read once |
++| `G6_L2PF` | 0 | decode, main model: a paced L2 prefetch (`engine/kernels/l2pf.cuh`) of the weights the step reads next, in the windows where DRAM is idle. One warp on a high-priority side stream issues 8 KiB `cp.async.bulk.prefetch.L2` chunks from a token bucket; a collective window stops once its collective has arrived. Writes nothing: same bytes out. Window mask: 1 = the MLP all-reduce wait (the next layer's q_a / kv_a / idx tiles, q_b, UK, ...), 2 = the `G6_QA_SPLIT` / `G6_IDXQ_SPLIT` gather waits, 4 = the attention (UK, UV, o_proj, ...), 8 = the attention all-reduce wait (router, shared fc1); each window continues the layer's queue where the last ended. `G6_L2PF_T` (0xff) = targets (1 x_in, 2 idx_q, 4 q_b, 8 UK, 16 UV, 32 o_proj, 64 router, 128 shared / dense fc1), `G6_L2PF_GBPS` (175) = pace, `G6_L2PF_WAVE` (8) = chunks per poll at most, `G6_L2PF_US` (30,30,100,30) = budget per window in us at the pace, `G6_L2PF_MB` (10) = MiB per window at most, `G6_L2PF_OPMB` (8) = MB of o_proj's entries per layer (0 = all). Not on the CP attention path's attention window. `engine/kernels/tests/l2pf_bench.cu` measures it |
+ | `G6_GV_MULTI` | 1 | steps of up to 8 rows run the GEMVs on the layer input (q_a, kv_a, the indexer's k and weights) as one launch; 0 = one launch each (same bits) |
+ | `G6_S2_ADAPT` | 0 | S2: choose each round's MTP draft count (1..k) from the sessions' accept rates and the S2 step costs; 1 adds ~1 GiB of main-step graphs |
+ | `G6_S2_GROW` | 1 | S2: a session below R holds the KV pages it needs now and takes more as its output grows, admitted and grown only while every live session can still reach prompt + `max_tokens` + guard; a session that cannot grow sits out rounds. 0 = every run holds that worst case from admission |
+diff --git a/engine/kernels/l2pf.cuh b/engine/kernels/l2pf.cuh
+new file mode 100644
+index 0000000..7bdd33f
+--- /dev/null
++++ b/engine/kernels/l2pf.cuh
+@@ -0,0 +1,269 @@
++// G6_L2PF: a paced L2 prefetch of the weights the decode step reads next, issued in the step's windows where DRAM is
++// idle (the collective waits and the latency-bound attention). Modelled on blaesus/dsgx10 (ds41f kernels/l2pf.cu,
++// docs/engine.md "A paced L2 prefetch in the step's windows"; TensorFold's paced one-block prefetch): one warp on a
++// high-priority side stream issues cp.async.bulk.prefetch.L2 of 8 KiB chunks from a token bucket (G6_L2PF_GBPS, in
++// waves of at most G6_L2PF_WAVE chunks), up to a byte budget per window, and a collective window ends once its
++// collective has arrived (a second warp polls the peers' tails, as k_wait_peers does). Not the burst our G6_OPROJ_PF
++// tried (8 CTAs issuing at once: dependent loads 427 -> 2049 ns in dsgx10's measurement, our attention +12..43 us):
++// small waves leave the attention's dependent loads alone (436 ns at 175 GB/s in waves of 8).
++// cp.async.bulk.prefetch.L2 (sm_90+, so sm_121a): one instruction per chunk handled by the bulk-copy unit, no register,
++// no shared memory, no completion to wait for; it writes nothing and changes no load's value, so every output byte is
++// unchanged. (prefetch.global.L2 would take 128 instructions per 8 KiB; ld + discard ties up registers and load slots.)
++//
++// A layer's targets in the order the step reads them, one queue per layer (plan_layer): x_in (q_a, kv_a, idx_k, idx_w;
++// the rank's tiles under G6_QA_SPLIT), idx_q, q_b, UK, UV, o_proj (capped at G6_L2PF_OPMB), router, the shared expert's
++// fc1 (the dense MLP's gate + up on layers 0-2). Windows (G6_L2PF bits), each from its first target not yet read, and
++// continuing where the layer's earlier windows ended (State, device memory):
++//   1 = W_M  the wait for the MLP partials of layer i-1: layer i's queue from x_in
++//   2 = W_Q  the q_a gather wait (G6_QA_SPLIT) from idx_q, the idx_q gather wait (G6_IDXQ_SPLIT) from UK
++//   4 = W_T  the attention (no collective: its budget only) from UK
++//   8 = W_A  the wait for the attention partials from the router
++// Each window issues at most G6_L2PF_US[w] us at the pace and G6_L2PF_MB MiB. The side stream is forked at each window
++// and joined once at the end of the step (part), so the step's stream never waits for a prefetch. Off (G6_L2PF unset or
++// 0): no stream, no launch, no fork; the graphs are unchanged.
++#pragma once
++#include <cstdio>
++#include <cstdlib>
++#include <cuda_runtime.h>
++#include "bind.cuh"
++#include "glue.cuh"
++
++namespace l2pf
++{
++
++constexpr uint32_t CHUNK = 8192;      // bytes per bulk prefetch
++constexpr int MAXR = 16;              // ranges in a queue
++enum { W_M, W_Q, W_T, W_A, NW };
++enum { T_XIN, T_IDXQ, T_QB, T_UK, T_UV, T_OPROJ, T_ROUTER, T_SHARED, NTG };
++
++// a layer's targets: up to 4 byte ranges each, in read order
++struct Plan
++{
++    const void* p[NTG][4] = {};
++    size_t n[NTG][4] = {};
++    void add(int t, const void* q, size_t b)
++    {
++        for (int k = 0; k < 4; ++k)
++            if (!n[t][k]) { p[t][k] = q; n[t][k] = b; return; }
++    }
++};
++struct Queue
++{
++    const uint8_t* p[MAXR];
++    uint32_t n[MAXR];                 // bytes, multiples of 16
++    uint32_t end[MAXR];               // chunks up to and including range i
++    uint32_t from[NTG];               // first chunk of target t
++    int count;
++};
++struct State { unsigned long long tag; uint32_t chunk; };   // tag = step << 8 | layer + 1 of the last window
++struct Stop                           // a collective window ends when every peer's tail of collective c holds its seq
++{
++    g6::FabricDev f{};                // f.nr = 0: no collective (the attention window)
++    const u64* stepp = nullptr;
++    int c = 0;
++    size_t payload = 0;
++};
++
++__device__ __forceinline__ unsigned long long gtimer()
++{
++    unsigned long long t;
++    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
++    return t;
++}
++
++// block 64: warp 0 issues chunks [max(first, where the layer's last window ended), + budget) at one per ns_chunk ns
++// (a poll issues those due, at most wave <= 32); warp 1 polls the collective's tails and stops warp 0 once all arrived.
++__global__ void __launch_bounds__(64) k_l2pf(const __grid_constant__ Queue q, int layer, uint32_t first, uint32_t budget,
++                                             uint32_t ns_chunk, int wave, Stop s, State* st)
++{
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
++    __shared__ volatile int stop, fin;
++    const int lane = threadIdx.x & 31;
++    if (threadIdx.x == 0) { stop = 0; fin = 0; }
++    __syncthreads();
++    const u64 step = *s.stepp;
++    if (threadIdx.x >= 32)
++    {
++        if (!s.f.nr) return;
++        const u64 seq = g6::coll_seq(step, s.c, s.f.ncoll);
++        const bool peer = lane < s.f.nr && lane != s.f.rank;
++        const u64* tail = peer ? reinterpret_cast<const u64*>(glue::peer_slot(s.f, step, s.c, lane) + s.payload) : nullptr;
++        while (!fin)
++        {
++            if (__all_sync(~0u, !peer || glue::ld_acquire_sys(tail) == seq)) { stop = 1; break; }
++            __nanosleep(128);
++        }
++        return;
++    }
++    const unsigned long long tag = step << 8 | static_cast<unsigned>(layer + 1);
++    uint32_t c0 = 0;
++    if (lane == 0 && st->tag == tag) c0 = st->chunk;
++    c0 = max(__shfl_sync(~0u, c0, 0), first);
++    const uint32_t total = q.count ? q.end[q.count - 1] : 0, last = min(total, c0 + budget);
++    const unsigned long long t0 = __shfl_sync(~0u, gtimer(), 0);
++    uint32_t done = min(c0, last);
++    while (done < last && !stop)
++    {
++        const unsigned long long t = __shfl_sync(~0u, gtimer(), 0), by_now = c0 + (t - t0) / ns_chunk + 1;
++        const uint32_t cap = min(last, done + static_cast<uint32_t>(wave)), due = by_now < cap ? static_cast<uint32_t>(by_now) : cap;
++        const uint32_t c = done + lane;
++        if (c < due)
++        {
++            int i = 0;
++            while (c >= q.end[i]) ++i;
++            const uint32_t off = (c - (i ? q.end[i - 1] : 0)) * CHUNK, left = q.n[i] - off;
++            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(q.p[i] + off), "r"(min(left, CHUNK)) : "memory");
++        }
++        if (due > done) done = due;
++        else __nanosleep(64);
++    }
++    if (lane == 0) { st->tag = tag; st->chunk = max(done, c0); }
++    fin = 1;
++#endif
++}
++
++struct Cfg
++{
++    int win = 0;                      // G6_L2PF: window mask (0 = off)
++    unsigned tmask = (1u << NTG) - 1; // G6_L2PF_T: targets (bit = T_*)
++    float gbps = 175;                 // G6_L2PF_GBPS: the pace
++    int wave = 8;                     // G6_L2PF_WAVE: chunks per poll at most (1..32)
++    float us[NW] = {30, 30, 100, 30}; // G6_L2PF_US: budget per window, us at the pace (W_M, W_Q, W_T, W_A)
++    float mb = 10;                    // G6_L2PF_MB: MiB per window at most
++    float opmb = 8;                   // G6_L2PF_OPMB: o_proj's entries prefetched per layer, MB (0 = all)
++    cudaStream_t side = nullptr;
++    cudaEvent_t fork = nullptr, join = nullptr;
++    State* state = nullptr;
++    int prio = 0;
++    bool armed = false, pending = false;
++};
++inline Cfg& cfg() { static Cfg c; return c; }
++
++// the side stream, events and state (once, outside any capture); win = 0 makes nothing
++inline cudaError_t setup(const Cfg& in)
++{
++    Cfg& c = cfg();
++    const cudaStream_t side = c.side;
++    const cudaEvent_t fork = c.fork, join = c.join;
++    State* state = c.state;
++    const int prio = c.prio;
++    c = in;
++    c.side = side; c.fork = fork; c.join = join; c.state = state; c.prio = prio;
++    c.armed = c.pending = false;
++    c.wave = c.wave < 1 ? 1 : c.wave > 32 ? 32 : c.wave;
++    if (!(c.gbps > 0)) c.gbps = 175;
++    if (!c.win || c.side) return cudaSuccess;
++    int lo = 0, hi = 0;
++    cudaError_t e = cudaDeviceGetStreamPriorityRange(&lo, &hi);
++    c.prio = hi;
++    if (e == cudaSuccess) e = cudaStreamCreateWithPriority(&c.side, cudaStreamNonBlocking, hi);
++    if (e == cudaSuccess) e = cudaEventCreateWithFlags(&c.fork, cudaEventDisableTiming);
++    if (e == cudaSuccess) e = cudaEventCreateWithFlags(&c.join, cudaEventDisableTiming);
++    if (e == cudaSuccess) e = cudaMalloc(&c.state, sizeof(State));
++    if (e == cudaSuccess) e = cudaMemset(c.state, 0, sizeof(State));
++    return e;
++}
++// G6_L2PF, G6_L2PF_T, G6_L2PF_GBPS, G6_L2PF_WAVE, G6_L2PF_US=wm,wq,wt,wa, G6_L2PF_MB, G6_L2PF_OPMB (bind::init)
++inline cudaError_t init_env()
++{
++    Cfg c;
++    const char* e = getenv("G6_L2PF");
++    c.win = e ? atoi(e) & 15 : 0;
++    if (!c.win) return cudaSuccess;
++    if ((e = getenv("G6_L2PF_T")) && *e) c.tmask = static_cast<unsigned>(strtoul(e, nullptr, 0));
++    if ((e = getenv("G6_L2PF_GBPS")) && *e) c.gbps = static_cast<float>(atof(e));
++    if ((e = getenv("G6_L2PF_WAVE")) && *e) c.wave = atoi(e);
++    if ((e = getenv("G6_L2PF_US")) && *e) sscanf(e, "%f,%f,%f,%f", &c.us[0], &c.us[1], &c.us[2], &c.us[3]);
++    if ((e = getenv("G6_L2PF_MB")) && *e) c.mb = static_cast<float>(atof(e));
++    if ((e = getenv("G6_L2PF_OPMB")) && *e) c.opmb = static_cast<float>(atof(e));
++    fprintf(stderr, "# G6_L2PF=%d: targets 0x%x, %.0f GB/s in waves of %d x 8 KiB, budgets %.0f/%.0f/%.0f/%.0f us, <= %.1f MiB a window, "
++            "o_proj <= %.1f MB\n", c.win, c.tmask, c.gbps, c.wave, c.us[0], c.us[1], c.us[2], c.us[3], c.mb, c.opmb);
++    return setup(c);
++}
++
++// a layer's targets from its binding and its attention weights (UK [H][512][192], UV [H][256][512] BF16)
++inline Plan plan_layer(const bind::Layer& b, const void* uk, const void* uv)
++{
++    Plan P;
++    for (const bind::Gv* g : {&b.q_a, &b.kv_a, &b.idx_k, &b.idx_w})
++        if (g->on) P.add(T_XIN, g->w, bind::gv_bytes(*g));
++    if (b.idx_q.on) P.add(T_IDXQ, b.idx_q.w, bind::gv_bytes(b.idx_q));
++    auto dtr_add = [&](int t, const dtr::Gemv& g, size_t cap) {
++        P.add(t, g.a.suh[0], static_cast<size_t>(g.a.K) * 2);
++        P.add(t, g.a.svh[0], static_cast<size_t>(g.a.N) * 2);
++        const size_t n = static_cast<size_t>(g.a.K) * g.a.N * dtr::BITS / 8;
++        P.add(t, g.a.w[0], cap && cap < n ? cap : n);
++    };
++    if (b.q_b_t.on) dtr_add(T_QB, b.q_b_t, 0);
++    else if (b.q_b.on) P.add(T_QB, b.q_b.w, bind::gv_bytes(b.q_b));
++    const int H = b.heads;
++    if (uk) P.add(T_UK, uk, static_cast<size_t>(H) * 512 * 192 * 2);
++    if (uv) P.add(T_UV, uv, static_cast<size_t>(H) * 256 * 512 * 2);
++    const size_t opcap = static_cast<size_t>(cfg().opmb * 1e6);
++    if (b.o_proj_t.on) dtr_add(T_OPROJ, b.o_proj_t, opcap);
++    else if (b.o_proj.on) P.add(T_OPROJ, b.o_proj.w, opcap && opcap < bind::gv_bytes(b.o_proj) ? opcap : bind::gv_bytes(b.o_proj));
++    if (b.router.on) P.add(T_ROUTER, b.router.w, bind::gv_bytes(b.router));
++    if (b.shw) P.add(T_SHARED, b.shw, b.shw_bytes);
++    else if (b.glu_t.on) { for (int k = 0; k < 2; ++k) P.add(T_SHARED, b.glu_t.a.w[k], static_cast<size_t>(b.glu_t.a.K) * b.glu_t.a.N * dtr::BITS / 8); }
++    else { for (int k = 0; k < 2; ++k) P.add(T_SHARED, b.sh[k].p, bind::rec_bytes(b.sh[k])); }
++    return P;
++}
++
++inline Queue queue(const Plan& P, unsigned tmask)
++{
++    Queue q{};
++    uint32_t c = 0;
++    for (int t = 0; t < NTG; ++t)
++    {
++        q.from[t] = c;
++        if (!(tmask >> t & 1)) continue;
++        for (int k = 0; k < 4 && P.n[t][k] && q.count < MAXR; ++k)
++        {
++            const uintptr_t b = reinterpret_cast<uintptr_t>(P.p[t][k]), lo = (b + 15) & ~static_cast<uintptr_t>(15),
++                            hi = (b + P.n[t][k]) & ~static_cast<uintptr_t>(15);
++            if (hi <= lo) continue;
++            q.p[q.count] = reinterpret_cast<const uint8_t*>(lo);
++            q.n[q.count] = static_cast<uint32_t>(hi - lo);
++            c += (q.n[q.count] + CHUNK - 1) / CHUNK;
++            q.end[q.count++] = c;
++        }
++    }
++    return q;
++}
++
++// step (part) begin / end: windows only between them (the main model's launch_step), the side stream joined at the end
++inline void arm() { Cfg& c = cfg(); c.armed = c.win != 0 && c.side; }
++inline void join(cudaStream_t st)
++{
++    Cfg& c = cfg();
++    c.armed = false;
++    if (!c.pending) return;
++    cudaEventRecord(c.join, c.side);
++    cudaStreamWaitEvent(st, c.join, 0);
++    c.pending = false;
++}
++// window w of layer `layer` (the step's layer index), its first target `from`, on st where the window starts
++inline void window(int w, int from, int layer, const Plan& P, const Stop& s, cudaStream_t st)
++{
++    Cfg& c = cfg();
++    if (!c.armed || !(c.win >> w & 1)) return;
++    const Queue q = queue(P, c.tmask);
++    const uint32_t total = q.count ? q.end[q.count - 1] : 0;
++    if (q.from[from] >= total) return;
++    const double ns = CHUNK / c.gbps;
++    const uint32_t ns_chunk = static_cast<uint32_t>(ns + 0.5) ? static_cast<uint32_t>(ns + 0.5) : 1;
++    const double bu = c.us[w] * 1000.0 / ns, bm = c.mb * 1048576.0 / CHUNK;
++    const uint32_t budget = static_cast<uint32_t>(bu < bm ? bu : bm);
++    if (!budget) return;
++    cudaEventRecord(c.fork, st);
++    cudaStreamWaitEvent(c.side, c.fork, 0);
++    cudaLaunchConfig_t lc = {};
++    cudaLaunchAttribute at[1];
++    at[0].id = cudaLaunchAttributePriority;
++    at[0].val.priority = c.prio;
++    lc.gridDim = dim3(1); lc.blockDim = dim3(64); lc.stream = c.side; lc.attrs = at; lc.numAttrs = 1;
++    cudaLaunchKernelEx(&lc, k_l2pf, q, layer, q.from[from], budget, ns_chunk, c.wave, s, c.state);
++    c.pending = true;
++}
++
++}  // namespace l2pf
+diff --git a/engine/kernels/tests/l2pf_bench.cu b/engine/kernels/tests/l2pf_bench.cu
+new file mode 100644
+index 0000000..5afe918
+--- /dev/null
++++ b/engine/kernels/tests/l2pf_bench.cu
+@@ -0,0 +1,573 @@
++// G6_L2PF microbenchmark + exactness check, one GPU: NL distinct layers of the decode step's per-layer sequence at the TP
++// rank shapes, in one CUDA graph, with the engine's prefetch calls (l2pf::arm / window / join, kernels/l2pf.cuh) at the
++// engine's places (rank.cuh launch_consume, launch_layer_in_qs, launch_attn_block):
++//   [W_M] wait stand-in (the MLP all-reduce of layer l-1)          the rank waits, DRAM idle
++//   x_in: the rank's q_a + kv_a (+ idx_k on full layers) tiles, MXFP8 / BF16 gv_multi as under G6_QA_SPLIT=1
++//   [W_Q] wait stand-in (the q_a gather)
++//   q_b: dense trellis, K 2048 x N H*256
++//   [W_T] the real decode attention (g6_attn_replay_run, S2 batched cell; reads UK / UV / KV / index keys)
++//   o_proj: dense trellis, K H*256 x N 6144
++//   [W_A] wait stand-in (the attention all-reduce)
++//   router (BF16 gv, 256 x 6144) on the stream, || a stand-in for the trellis shared expert's fc1 on a forked stream (a
++//   dense trellis K 6144 x N 1024, about the bytes of the rank's gate + up), as G6_ROUTE_OVL=1
++//   MoE stand-in: --moe MB of streaming nc loads at the DRAM rate (the routed experts; evicts L2), then the join
++// A wait stand-in is one warp that idles for its time, with the peer's tail landing --arr us before its end (the
++// window's stop sees the collective arrive there, as in the engine). Every layer's weights are distinct (each layer
++// starts cold, as after the routed experts). The attention runs the serving flags (G6_ATTN_SC2=4 ... G6_ATTN_FRONT=1)
++// unless they are set in the environment (or --stock-attn 1).
++//   EXACT  per arm: every layer's x_in, q_b, attention (output + indices), o_proj, router and shared outputs after one
++//          graph launch, against off, byte for byte (exit 3 otherwise)
++//   TIME   per arm: us per layer (graph time / NL, median of TR alternating trials), against off, x 78 in ms per step;
++//          and per segment (one stamp kernel between segments, a separate graph): wm x_in wq q_b attn o_proj wa
++//          router moe, us per layer
++// Arms: --arms "win[:tmask[:gbps[:opmb[:wave]]]],..." (G6_L2PF windows 1 W_M 2 W_Q 4 W_T 8 W_A, G6_L2PF_T targets
++// 1 x_in 2 idx_q 4 q_b 8 UK 16 UV 32 o_proj 64 router 128 shared; empty field = the --gbps / --opmb / --wave default),
++// budgets --us wm,wq,wt,wa and --mb MiB per window for all arms.
++// build (scripts/build.sh builds it): from the repo root, with the engine's K1H2 flags, -DG6_NR=4 -DDEC_S2 -DPF_F12:
++//   nvcc -O3 -std=c++17 -gencode=arch=compute_121a,code=sm_121a $FLAGS -I engine/kernels -o l2pf_bench \
++//        engine/kernels/tests/l2pf_bench.cu engine/attn/attn.cu engine/attn/bind.cu -lcublas
++// run: l2pf_bench [--M 3,12] [--T 2048] [--L 1000] [--layers 78] [--arms ...] [--gbps 175] [--wave 8] [--us 30,30,100,30]
++//                 [--mb 10] [--opmb 8] [--wm 17] [--wq 20] [--wa 17] [--arr 2] [--moe 80] [--reps 5] [--tr 7] [--seg 1]
++//   e.g. ./l2pf_bench; ./l2pf_bench --T 32768 --L 32000; ./l2pf_bench --M 3 --arms 4,4:32,4:32:125,15
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++#include <cuda_bf16.h>
++#include "../l2pf.cuh"
++#include "../../attn/replay.h"
++#include "../../attn/kvfmt.h"
++
++#define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #x, cudaGetErrorString(e_)); exit(1); } } while (0)
++#define CKI(x) do { int e_ = (x); if (e_) { fprintf(stderr, "%s:%d status %d (%s)\n", __FILE__, __LINE__, e_, cudaGetErrorString((cudaError_t)e_)); exit(1); } } while (0)
++static void die(const std::string& s) { fprintf(stderr, "error: %s\n", s.c_str()); exit(1); }
++constexpr int TOP = 2048;             // attn.cu ga::TOP
++constexpr int QA_T = 2048 / 16 / 4, KVA_T = 576 / 16 / 4, IDXK_T = 128 / 16 / 4;   // the rank's tiles under G6_QA_SPLIT (TP4)
++constexpr int SH_N = 1024;            // shared expert fc1 stand-in outputs (gate + up, 512 each at TP4)
++
++__device__ uint32_t hsh(uint64_t x) { x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull; x ^= x >> 33; return (uint32_t)x; }
++__device__ float unif(uint64_t seed, uint64_t i) { return (float)(hsh(seed * 0x9e3779b97f4a7c15ull + i) >> 8) * (2.f / 16777216.f) - 1.f; }   // [-1, 1)
++__global__ void fill_bf16(__nv_bfloat16* p, size_t n, uint64_t seed, float s, float c)
++{
++    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) p[i] = __float2bfloat16(c + s * unif(seed, i));
++}
++__global__ void fill_half(__half* p, size_t n, uint64_t seed, float s, float c)
++{
++    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) p[i] = __float2half(c + s * unif(seed, i));
++}
++__global__ void fill_u32(uint32_t* p, size_t n, uint64_t seed)
++{
++    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) p[i] = hsh(seed * 0x100000001B3ull + i);
++}
++__device__ uint8_t fin8(uint32_t v) { uint8_t b = (uint8_t)v; if ((b & 0x7f) == 0x7f) b ^= 1; return b; }   // finite e4m3 code
++// MXFP8 gv records [O/16][NG][528]: finite e4m3 codes, E8M0 scales near 2^-7 (the last 16 bytes of a record)
++__global__ void fill_mx(uint8_t* p, size_t recs, uint64_t seed)
++{
++    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < recs * 528; i += (size_t)gridDim.x * blockDim.x)
++        p[i] = i % 528 < 512 ? fin8(hsh(seed + i)) : (uint8_t)(120 + hsh(seed + 7 * i) % 4);
++}
++// latent rows (kvfmt.h) with finite codes, positive scales and small rope
++__global__ void fill_kv(uint8_t* c, size_t rows, uint64_t seed)
++{
++    for (size_t r = blockIdx.x; r < rows; r += gridDim.x)
++    {
++        uint8_t* v = c + r * g6kv::ROW;
++        const int t = threadIdx.x;
++#if G6_KV4
++        if (t < 256) v[t] = (uint8_t)hsh(seed + r * 1000 + t);
++        if (t < 16) ((__half*)(v + g6kv::SCALE_OFF))[t] = __float2half(0.02f * (1.5f + unif(seed + 7, r * 16 + t)));
++#else
++        for (int d = t; d < 512; d += blockDim.x) v[d] = fin8(hsh(seed + r * 1000 + d));
++        if (t < 4) ((float*)(v + g6kv::SCALE_OFF))[t] = 0.004f * (1.5f + unif(seed + 7, r * 4 + t));
++#endif
++        if (t < 64) ((__nv_bfloat16*)(v + g6kv::ROPE_OFF))[t] = __float2bfloat16(0.5f * unif(seed + 9, r * 64 + t));
++    }
++}
++__global__ void fill_idx(uint8_t* c, size_t pages, int ps, uint64_t seed)
++{
++    for (size_t p = blockIdx.x; p < pages; p += gridDim.x)
++    {
++        uint8_t* b = c + p * ps * g6kv::IDX_ROW;
++        for (int i = threadIdx.x; i < ps * 128; i += blockDim.x) b[i] = fin8(hsh(seed + p * 100000 + i));
++        for (int i = threadIdx.x; i < ps; i += blockDim.x) ((float*)(b + ps * 128))[i] = ldexpf(1.f, -6 - (int)(hsh(seed + 3 + p * 64 + i) % 3));
++    }
++}
++// the routed experts' phase: n x 16 B read once with the GEMVs' streaming loads (DRAM rate, evicts L2)
++__global__ void k_moe(const uint4* p, size_t n, float* sink)
++{
++    unsigned acc = 0;
++    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x)
++    {
++        uint4 v;
++        asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p + i));
++        acc ^= v.x ^ v.y ^ v.z ^ v.w;
++    }
++    if (acc == 0x9e3779b9u) *sink = 1.f;   // never (the buffer is zero); keeps the loads
++}
++// a collective wait: one warp idles ns; the peer's tail of collective c lands arr ns before the end
++__global__ void __launch_bounds__(32) k_wait_standin(g6::FabricDev f, const u64* stepp, int c, unsigned ns, unsigned arr)
++{
++    if (threadIdx.x) return;
++    const u64 step = *stepp, t0 = l2pf::gtimer();
++    while (l2pf::gtimer() < t0 + (ns > arr ? ns - arr : 0)) {}
++    glue::st_release_sys(reinterpret_cast<u64*>(const_cast<char*>(glue::peer_slot(f, step, c, 1 - f.rank))), g6::coll_seq(step, c, f.ncoll));
++    while (l2pf::gtimer() < t0 + ns) {}
++}
++__global__ void k_bump(u64* stepp) { *stepp += 1; }
++__global__ void k_stamp(u64* d) { *d = l2pf::gtimer(); }
++
++template <class T> static T* dalloc(size_t n) { T* p; CK(cudaMalloc(&p, n * sizeof(T))); CK(cudaMemset(p, 0, n * sizeof(T))); return p; }
++template <class T> static std::vector<T> host(const T* d, size_t n) { std::vector<T> h(n); CK(cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost)); return h; }
++static size_t ndiff(const void* x, const void* y, size_t bytes) { size_t k = 0; for (size_t i = 0; i < bytes; ++i) k += ((const uint8_t*)x)[i] != ((const uint8_t*)y)[i]; return k; }
++static float med(std::vector<float> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; }
++template <class F> static cudaGraphExec_t inst(cudaStream_t st, F body)
++{
++    cudaGraph_t g;
++    cudaGraphExec_t x;
++    CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
++    body();
++    CK(cudaStreamEndCapture(st, &g));
++    CK(cudaGraphInstantiate(&x, g, 0));
++    CK(cudaGraphDestroy(g));
++    return x;
++}
++static float run_us(cudaGraphExec_t x, cudaStream_t st, int reps)   // us per graph launch
++{
++    for (int i = 0; i < 2; ++i) CK(cudaGraphLaunch(x, st));
++    cudaEvent_t a, b;
++    CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
++    CK(cudaEventRecord(a, st));
++    for (int i = 0; i < reps; ++i) CK(cudaGraphLaunch(x, st));
++    CK(cudaEventRecord(b, st));
++    CK(cudaEventSynchronize(b));
++    float ms;
++    CK(cudaEventElapsedTime(&ms, a, b));
++    cudaEventDestroy(a); cudaEventDestroy(b);
++    return ms * 1000.f / reps;
++}
++struct TV { const void* p = nullptr; int nd = 0; long long shape[4] = {}; };
++static TV tv(const void* p, std::initializer_list<long long> s) { TV t; t.p = p; for (long long v : s) t.shape[t.nd++] = v; return t; }
++static bind::Tensor bt(const void* p, std::initializer_list<long long> s) { bind::Tensor t; t.p = p; for (long long v : s) t.shape[t.nd++] = v; return t; }
++static std::vector<std::string> split(const std::string& s, char d)
++{
++    std::vector<std::string> v;
++    for (size_t p = 0;;) { size_t q = s.find(d, p); v.push_back(s.substr(p, q == std::string::npos ? q : q - p)); if (q == std::string::npos) break; p = q + 1; }
++    return v;
++}
++static std::vector<int> ints(const std::string& s) { std::vector<int> v; for (auto& x : split(s, ',')) v.push_back(atoi(x.c_str())); return v; }
++
++enum { S_WM, S_XIN, S_WQ, S_QB, S_ATTN, S_OPROJ, S_WA, S_ROUTER, S_MOE, NSEG };
++static const char* const SEG[NSEG] = {"wm", "x_in", "wq", "q_b", "attn", "o_proj", "wa", "router", "moe"};
++
++int main(int argc, char** argv)
++{
++    std::vector<int> Ms = {3, 12};
++    std::string arms_s = "15,15:0xf9,15:0x39,15::125,15::250,15:::0,1,2,4,8,4:32,4:48";
++    int T = 2048, L = 1000, NL = 78, REPS = 5, TR = 7, S2 = 1, SEGT = 1, STOCK = 0, wave = 8;
++    float gbps = 175, mb = 10, opmb = 8, wm = 17, wq = 20, wa = 17, arr = 2, moe = 80;
++    float us[l2pf::NW] = {30, 30, 100, 30};
++    for (int i = 1; i < argc; ++i)
++    {
++        const std::string a = argv[i];
++        auto nx = [&]() -> const char* { if (i + 1 >= argc) die("missing value after " + a); return argv[++i]; };
++        if (a == "--M") Ms = ints(nx());
++        else if (a == "--T") T = atoi(nx());
++        else if (a == "--L") L = atoi(nx());
++        else if (a == "--layers") NL = atoi(nx());
++        else if (a == "--arms") arms_s = nx();
++        else if (a == "--gbps") gbps = atof(nx());
++        else if (a == "--wave") wave = atoi(nx());
++        else if (a == "--us") { const char* e = nx(); if (sscanf(e, "%f,%f,%f,%f", &us[0], &us[1], &us[2], &us[3]) != 4) die("--us wm,wq,wt,wa"); }
++        else if (a == "--mb") mb = atof(nx());
++        else if (a == "--opmb") opmb = atof(nx());
++        else if (a == "--wm") wm = atof(nx());
++        else if (a == "--wq") wq = atof(nx());
++        else if (a == "--wa") wa = atof(nx());
++        else if (a == "--arr") arr = atof(nx());
++        else if (a == "--moe") moe = atof(nx());
++        else if (a == "--reps") REPS = atoi(nx());
++        else if (a == "--tr") TR = atoi(nx());
++        else if (a == "--seg") SEGT = atoi(nx());
++        else if (a == "--s2") S2 = atoi(nx());
++        else if (a == "--stock-attn") STOCK = atoi(nx());
++        else die("usage: l2pf_bench [--M 3,12] [--T 2048] [--L 1000] [--layers 78] [--arms win[:tmask[:gbps[:opmb[:wave]]]],...] [--gbps 175] "
++                 "[--wave 8] [--us 30,30,100,30] [--mb 10] [--opmb 8] [--wm 17] [--wq 20] [--wa 17] [--arr 2] [--moe 80] [--reps 5] [--tr 7] "
++                 "[--seg 1] [--s2 1] [--stock-attn 0]");
++    }
++    // the arms: off first
++    std::vector<l2pf::Cfg> arms(1);
++    std::vector<std::string> names = {"off"};
++    for (const std::string& s : split(arms_s, ','))
++    {
++        if (s.empty()) continue;
++        const std::vector<std::string> f = split(s, ':');
++        l2pf::Cfg c;
++        c.win = atoi(f[0].c_str()) & 15;
++        if (!c.win) die("--arms: window mask 1..15");
++        c.tmask = f.size() > 1 && !f[1].empty() ? (unsigned)strtoul(f[1].c_str(), nullptr, 0) : (1u << l2pf::NTG) - 1;
++        c.gbps = f.size() > 2 && !f[2].empty() ? atof(f[2].c_str()) : gbps;
++        c.opmb = f.size() > 3 && !f[3].empty() ? atof(f[3].c_str()) : opmb;
++        c.wave = f.size() > 4 && !f[4].empty() ? atoi(f[4].c_str()) : wave;
++        c.mb = mb;
++        for (int w = 0; w < l2pf::NW; ++w) c.us[w] = us[w];
++        arms.push_back(c);
++        names.push_back(s);
++    }
++    int Mmax = 1;
++    for (int M : Ms) { if (M < 1 || M > G6_MX || M > L) die("--M: rows must be 1..G6_MX and <= L"); Mmax = std::max(Mmax, M); }
++    if (L > T || NL < 2) die("need L <= T and at least 2 layers");
++#ifndef DEC_S2
++    if (S2) die("--s2 1 needs -DDEC_S2");
++#endif
++    if (getenv("G6_L2PF")) fprintf(stderr, "note: G6_L2PF is set; the bench sets the arms itself\n");
++    if (!STOCK)
++        for (const char* kv : {"G6_ATTN_SC2=4", "G6_ATTN_SC2_TR=2", "G6_ATTN_CTX2=4", "G6_ATTN_CTX3=2", "G6_ATTN_SEL2=16", "G6_IDX_GRP=16", "G6_ATTN_QT=1", "G6_ATTN_FRONT=1"})
++        {
++            const std::string s = kv;
++            setenv(s.substr(0, s.find('=')).c_str(), s.substr(s.find('=') + 1).c_str(), 0);
++        }
++    CK(bind::init());
++    const int H = g6nr::HMAX, K = g6nr::QBW, N = HID, pages = (T + 63) / 64;
++    cudaStream_t st;
++    CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
++    int dev = 0, sms = 0, clk = 0, l2 = 0;
++    CK(cudaGetDevice(&dev));
++    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
++    cudaDeviceGetAttribute(&clk, cudaDevAttrClockRate, dev);
++    cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev);
++    printf("GPU %d SMs, clock %d MHz, L2 %.2f MB | TP%d: H %d, q_b 2048 x %d, o_proj %d x %d | T=%d L=%d layers %d s2=%d | stand-ins: "
++           "wm %.0f wq %.0f wa %.0f us (arrival %.1f us before the end), moe %.0f MB | budgets %.0f/%.0f/%.0f/%.0f us, <= %.1f MiB a window | "
++           "attention %s | reps %d TR %d\n", sms, clk / 1000, l2 / 1e6, g6nr::NR, H, K, K, N, T, L, NL, S2, wm, wq, wa, arr, moe, us[0], us[1],
++           us[2], us[3], mb, STOCK ? "stock flags" : "serving flags", REPS, TR);
++    CKI(g6_attn_rope_init(T, st));
++
++    // ---- layers: full-index ones spread as 22 of 78 (the others reuse the last full layer's indices)
++    std::vector<int> full(NL), src(NL);
++    int nfull = 0;
++    for (int l = 0; l < NL; ++l)
++    {
++        full[l] = l == 0 || (l * 22) / 78 != ((l - 1) * 22) / 78;
++        src[l] = full[l] ? l : src[l - 1];
++        nfull += full[l];
++    }
++    __nv_bfloat16 *kvn = dalloc<__nv_bfloat16>(512), *inw = dalloc<__nv_bfloat16>(128), *inb = dalloc<__nv_bfloat16>(128);
++    fill_bf16<<<2, 256, 0, st>>>(kvn, 512, 3, 0.2f, 1); fill_bf16<<<1, 128, 0, st>>>(inw, 128, 4, 0.2f, 1); fill_bf16<<<1, 128, 0, st>>>(inb, 128, 5, 0.1f, 0);
++    __half *qb = dalloc<__half>((size_t)Mmax * H * 256), *kva = dalloc<__half>((size_t)Mmax * 576), *iq = dalloc<__half>((size_t)Mmax * 32 * 128),
++           *ik = dalloc<__half>((size_t)Mmax * 128), *iw = dalloc<__half>((size_t)Mmax * 32);
++    fill_half<<<64, 256, 0, st>>>(qb, (size_t)Mmax * H * 256, 6, 1.f, 0); fill_half<<<8, 256, 0, st>>>(kva, (size_t)Mmax * 576, 7, 1.f, 0);
++    fill_half<<<64, 256, 0, st>>>(iq, (size_t)Mmax * 32 * 128, 8, 1.f, 0); fill_half<<<1, 256, 0, st>>>(ik, (size_t)Mmax * 128, 9, 1.f, 0);
++    fill_half<<<1, 256, 0, st>>>(iw, (size_t)Mmax * 32, 10, 0.1f, 0);
++    // the GEMVs' inputs: x (fragment tables, fp16 and BF16), q_a_n rows (q_b), x2 rows (shared stand-in)
++    const size_t xft = (size_t)g6mx::tiles(Mmax) * (HID / 16) * 64;
++    u32 *xf = dalloc<u32>(xft), *xb = dalloc<u32>(xft);
++    fill_half<<<64, 256, 0, st>>>(reinterpret_cast<__half*>(xf), xft * 2, 11, 1.f, 0);
++    fill_bf16<<<64, 256, 0, st>>>(reinterpret_cast<__nv_bfloat16*>(xb), xft * 2, 12, 1.f, 0);
++    __half *qan = dalloc<__half>((size_t)Mmax * 2048), *x2 = dalloc<__half>((size_t)Mmax * HID);
++    fill_half<<<64, 256, 0, st>>>(qan, (size_t)Mmax * 2048, 13, 1.f, 0); fill_half<<<64, 256, 0, st>>>(x2, (size_t)Mmax * HID, 14, 1.f, 0);
++    int *dpos = dalloc<int>(Mmax), *dtab = dalloc<int>(pages);
++    {
++        std::vector<int> table(pages);
++        for (int i = 0; i < pages; ++i) table[i] = i;
++        CK(cudaMemcpy(dtab, table.data(), pages * 4, cudaMemcpyHostToDevice));
++    }
++    const size_t ukn = (size_t)H * 512 * 192, uvn = (size_t)H * 256 * 512, opb = (size_t)K * N * dtr::BITS / 8, qbb = (size_t)2048 * K * dtr::BITS / 8,
++                 shb = (size_t)HID * SH_N * dtr::BITS / 8;
++    struct Lyr
++    {
++        __nv_bfloat16 *uk, *uv;
++        uint8_t *mla, *ixc = nullptr, *wo, *wq, *ws, *gqa, *gkva, *gik = nullptr, *grt;
++        __half *suo, *svo, *suq, *svq, *sus, *svs, *att, *qay, *kvay, *iky, *qby, *shy;
++        float* rty;
++        int* ind;
++        unsigned* err;
++        uint16_t* y;
++        G6AttnStepCell* cell;
++        G6AttnReplay rp;
++        dtr::Mat mo, mq, ms;
++        bind::Layer B;                // q_a, kv_a, idx_k, x_in, q_b_t, o_proj_t, router, shw (the plan's view)
++        dtr::Gemv sh;                 // the shared stand-in
++    };
++    std::vector<Lyr> Y(NL);
++    for (int l = 0; l < NL; ++l)
++    {
++        Lyr& y = Y[l];
++        y.uk = dalloc<__nv_bfloat16>(ukn); y.uv = dalloc<__nv_bfloat16>(uvn);
++        fill_bf16<<<512, 256, 0, st>>>(y.uk, ukn, 1000 + l, 0.05f, 0); fill_bf16<<<512, 256, 0, st>>>(y.uv, uvn, 2000 + l, 0.05f, 0);
++        y.mla = dalloc<uint8_t>((size_t)pages * 64 * g6kv::ROW);
++        fill_kv<<<1024, 256, 0, st>>>(y.mla, (size_t)pages * 64, 3000 + l);
++        if (full[l]) { y.ixc = dalloc<uint8_t>((size_t)pages * 64 * g6kv::IDX_ROW); fill_idx<<<512, 256, 0, st>>>(y.ixc, pages, 64, 4000 + l); }
++        y.ind = dalloc<int>((size_t)Mmax * TOP);
++        y.err = dalloc<unsigned>(1);
++        y.att = dalloc<__half>((size_t)Mmax * K);
++        y.y = dalloc<uint16_t>((size_t)Mmax * N);
++        CK(cudaMalloc(&y.cell, sizeof(G6AttnStepCell)));
++        // o_proj (side 2), q_b and the shared stand-in (side 1): K4 entries + suh / svh
++        auto mat = [&](uint8_t*& w, __half*& su, __half*& sv, size_t bytes, int k, int n, int side, uint64_t seed, dtr::Mat& m) {
++            w = dalloc<uint8_t>(bytes);
++            fill_u32<<<1024, 256, 0, st>>>(reinterpret_cast<uint32_t*>(w), bytes / 4, seed);
++            su = dalloc<__half>(k); sv = dalloc<__half>(n);
++            fill_half<<<16, 256, 0, st>>>(su, k, seed + 1, 0.5f, 1.f); fill_half<<<16, 256, 0, st>>>(sv, n, seed + 2, 0.01f, 0.f);
++            const int E = (side == dtr::SIDE_OUT ? n : k) / 128;
++            const long long eb = (long long)(side == dtr::SIDE_OUT ? k : n) / 16 * 8 * 32 * dtr::BITS;
++            if (const char* e = dtr::make_mat(tv(w, {E, eb}), tv(su, {k}), tv(sv, {n}), side, m)) die(e);
++        };
++        mat(y.wo, y.suo, y.svo, opb, K, N, dtr::SIDE_IN, 5000 + 10 * l, y.mo);
++        mat(y.wq, y.suq, y.svq, qbb, 2048, K, dtr::SIDE_OUT, 900000 + 10 * l, y.mq);
++        mat(y.ws, y.sus, y.svs, shb, HID, SH_N, dtr::SIDE_OUT, 1900000 + 10 * l, y.ms);
++        // gv records: the rank's q_a / kv_a tiles (MXFP8), idx_k tiles and the router (BF16)
++        y.gqa = dalloc<uint8_t>((size_t)QA_T * 192 * 528); fill_mx<<<512, 256, 0, st>>>(y.gqa, (size_t)QA_T * 192, 7000000 + l);
++        y.gkva = dalloc<uint8_t>((size_t)KVA_T * 192 * 528); fill_mx<<<512, 256, 0, st>>>(y.gkva, (size_t)KVA_T * 192, 8000000 + l);
++        if (full[l]) { y.gik = dalloc<uint8_t>((size_t)IDXK_T * 384 * 512); fill_bf16<<<256, 256, 0, st>>>(reinterpret_cast<__nv_bfloat16*>(y.gik), (size_t)IDXK_T * 384 * 256, 9000000 + l, 0.05f, 0); }
++        y.grt = dalloc<uint8_t>((size_t)16 * 384 * 512); fill_bf16<<<512, 256, 0, st>>>(reinterpret_cast<__nv_bfloat16*>(y.grt), (size_t)16 * 384 * 256, 9500000 + l, 0.05f, 0);
++        y.qay = dalloc<__half>((size_t)Mmax * QA_T * 16); y.kvay = dalloc<__half>((size_t)Mmax * KVA_T * 16); y.iky = dalloc<__half>((size_t)Mmax * IDXK_T * 16);
++        y.qby = dalloc<__half>((size_t)Mmax * K); y.shy = dalloc<__half>((size_t)Mmax * SH_N); y.rty = dalloc<float>((size_t)Mmax * 256);
++    }
++#ifdef DEC_S2
++    G6AttnRow* drows = nullptr;
++    if (S2)
++    {
++        std::vector<G6AttnRow> rr(Mmax);
++        for (auto& x : rr) { x.table = dtab; x.context = L; x.page_count = pages; x.table_size = pages; x.ibase = 0; x.sess = 0; }
++        drows = dalloc<G6AttnRow>(Mmax);
++        CK(cudaMemcpy(drows, rr.data(), Mmax * sizeof(G6AttnRow), cudaMemcpyHostToDevice));
++    }
++#endif
++    dtr::Scratch sc;
++    sc.part_n = dtr::part_floats(N, 1, 64, Mmax);
++    sc.cnt_n = 256;
++    sc.part = dalloc<float>(sc.part_n);
++    sc.cnt = dalloc<int>(sc.cnt_n);
++    // the stand-ins' fabric: rank 0 of 2, three collectives a layer (W_M, W_Q, W_A), payload 0 (the tail at the slot start)
++    g6::FabricDev fab{};
++    fab.rank = 0; fab.nr = 2; fab.ncoll = 3 * NL; fab.stride = 256;
++    fab.send = dalloc<char>((size_t)2 * fab.ncoll * fab.stride);
++    fab.recv = dalloc<char>((size_t)2 * fab.ncoll * fab.nr * fab.stride);
++    fab.doorbell = dalloc<unsigned long long>(fab.ncoll);
++    fab.error = dalloc<unsigned>(1);
++    u64* stepp = dalloc<u64>(1);
++    const int NMOE = 4;
++    const size_t moen = (size_t)(moe * 1e6) / 16;
++    std::vector<uint4*> mbuf(NMOE);
++    for (auto& b : mbuf) b = moen ? dalloc<uint4>(moen) : nullptr;
++    float* sink = dalloc<float>(1);
++    u64* stamps = dalloc<u64>((size_t)NL * (NSEG + 1));
++    cudaStream_t ovl;
++    cudaEvent_t ef, ej;
++    CK(cudaStreamCreateWithFlags(&ovl, cudaStreamNonBlocking));
++    CK(cudaEventCreateWithFlags(&ef, cudaEventDisableTiming)); CK(cudaEventCreateWithFlags(&ej, cudaEventDisableTiming));
++    void* scr = nullptr;
++    size_t sbmax = 0;
++    CK(cudaStreamSynchronize(st));
++
++    for (const int M : Ms)
++    {
++        {
++            std::vector<int> pos(M);
++            for (int i = 0; i < M; ++i) pos[i] = L - M + i;
++            CK(cudaMemcpy(dpos, pos.data(), M * 4, cudaMemcpyHostToDevice));
++        }
++        size_t sb = 0;
++        for (int l = 0; l < NL; ++l)
++        {
++            Lyr& y = Y[l];
++            G6Attn x{};
++            x.rows = M; x.heads = H; x.context = T; x.page_size = 64; x.page_count = x.table_size = pages; x.query_tile = std::max(M, 32);
++            x.q_b = qb; x.kv_a = kva; x.kv_norm = kvn; x.uk = y.uk; x.uv = y.uv; x.positions = dpos; x.block_table = dtab; x.mla_cache = y.mla;
++            x.indices = y.ind; x.output = y.att; x.error = y.err;
++#ifdef DEC_S2
++            x.s2_batched = S2;
++#endif
++            if (full[l]) { x.index_q = iq; x.index_k = ik; x.index_weight = iw; x.index_norm = inw; x.index_bias = inb; x.index_cache = y.ixc; }
++            else { x.reuse_indices = Y[src[l]].ind; x.reuse_rows = M; }
++            G6AttnStepCell c{};
++            c.context = L; c.page_count = pages; c.table_size = pages; c.reuse_rows = full[l] ? 0 : M;
++#ifdef DEC_S2
++            c.rows = drows;
++#endif
++            CK(cudaMemcpy(y.cell, &c, sizeof c, cudaMemcpyHostToDevice));
++            y.rp = G6AttnReplay{x, y.cell, nullptr, 0};
++            sb = std::max(sb, g6_attn_scratch_bytes(&x));
++            bind::Layer& B = y.B;
++            B = bind::Layer();
++            B.M = M; B.heads = H; B.indexer = full[l];
++            const char* e = nullptr;
++            if ((e = bind::make_gv(bt(y.gqa, {QA_T, 192, 528}), bind::MXFP8, 2, 16, M, xf, y.qay, gv::O_F16, B.q_a))) die(e);
++            if ((e = bind::make_gv(bt(y.gkva, {KVA_T, 192, 528}), bind::MXFP8, 2, 16, M, xf, y.kvay, gv::O_F16, B.kv_a))) die(e);
++            if (full[l] && (e = bind::make_gv(bt(y.gik, {IDXK_T, 384, 512}), bind::BF16W, 1, 32, M, xb, y.iky, gv::O_F16, B.idx_k))) die(e);
++            if ((e = bind::make_gv(bt(y.grt, {16, 384, 512}), bind::BF16W, 2, 16, M, xb, y.rty, gv::O_F32, B.router))) die(e);
++            B.q_a.tpc = B.kv_a.tpc = B.idx_k.tpc = 1;          // qs_narrow's G6_QA_SPLIT_TPC default
++            bind::make_gv_multi({&B.q_a, &B.kv_a, &B.idx_k}, M, B.x_in);
++            if ((e = dtr::make_out(y.mq, M, qan, 2048, nullptr, y.qby, K, dtr::O_F16, sc, 0, 0, 1, B.q_b_t))) die(e);
++            if ((e = dtr::make_out(y.mo, M, y.att, K, nullptr, y.y, N, dtr::O_BF16, sc, 64, 0, 1, B.o_proj_t))) die(e);
++            if ((e = dtr::make_out(y.ms, M, x2, HID, nullptr, y.shy, SH_N, dtr::O_F16, sc, 128, 0, 1, y.sh))) die(e);
++            B.shw = y.ws; B.shw_bytes = shb;
++        }
++        if (sb > sbmax) { if (scr) CK(cudaFree(scr)); scr = dalloc<uint8_t>(sb); sbmax = sb; }
++        for (auto& y : Y) { y.rp.scratch = scr; y.rp.scratch_bytes = sbmax; }
++        {
++            const double kvb = (double)std::min(L, TOP) * g6kv::ROW, ixb = (double)L * g6kv::IDX_ROW;
++            const double xin = (double)(QA_T + KVA_T) * 192 * 528 + IDXK_T * 384 * 512;
++            printf("\n== M=%d: per layer: x_in %.2f MB, q_b %.2f, UK+UV %.2f, o_proj %.2f, router %.2f, shared stand-in %.2f, KV %.2f, index keys %.2f "
++                   "(full layers), attention scratch <= %.2f | q_b ks %d, o_proj ks %d, shared ks %d | x_in %s\n", M, xin / 1e6, qbb / 1e6,
++                   (ukn + uvn) * 2 / 1e6, opb / 1e6, 16 * 384 * 512 / 1e6, shb / 1e6, kvb / 1e6, ixb / 1e6, sb / 1e6, Y[0].B.q_b_t.a.ks,
++                   Y[0].B.o_proj_t.a.ks, Y[0].sh.a.ks, Y[0].B.x_in.n ? "one gv_multi" : "three launches");
++        }
++
++        // one graph of NL layers; stamps (seg) between the segments
++        auto body = [&](bool seg) {
++            l2pf::arm();
++            k_bump<<<1, 1, 0, st>>>(stepp);
++            const unsigned na = (unsigned)(arr * 1000);
++            for (int l = 0; l < NL; ++l)
++            {
++                Lyr& y = Y[l];
++                const l2pf::Plan P = l2pf::plan_layer(y.B, y.uk, y.uv);
++                auto stop = [&](int c) { l2pf::Stop s; s.f = fab; s.stepp = stepp; s.c = c; return s; };
++                u64* sp = stamps + (size_t)l * (NSEG + 1);
++                if (seg) k_stamp<<<1, 1, 0, st>>>(sp + S_WM);
++                if (l > 0)
++                {
++                    l2pf::window(l2pf::W_M, l2pf::T_XIN, l, P, stop(3 * l), st);
++                    k_wait_standin<<<1, 32, 0, st>>>(fab, stepp, 3 * l, (unsigned)(wm * 1000), na);
++                }
++                if (seg) k_stamp<<<1, 1, 0, st>>>(sp + S_XIN);
++                if (y.B.x_in.n) bind::launch(y.B.x_in, st);
++                else { bind::launch(y.B.q_a, st); bind::launch(y.B.kv_a, st); bind::launch(y.B.idx_k, st); }
++                if (seg) k_stamp<<<1, 1, 0, st>>>(sp + S_WQ);
++                l2pf::window(l2pf::W_Q, l2pf::T_IDXQ, l, P, stop(3 * l + 1), st);
++                k_wait_standin<<<1, 32, 0, st>>>(fab, stepp, 3 * l + 1, (unsigned)(wq * 1000), na);
++                if (seg) k_stamp<<<1, 1, 0, st>>>(sp + S_QB);
++                bind::launch_q_b(y.B, st);
++                if (seg) k_stamp<<<1, 1, 0, st>>>(sp + S_ATTN);
++                l2pf::Stop none;
++                none.stepp = stepp;
++                l2pf::window(l2pf::W_T, l2pf::T_UK, l, P, none, st);
++                CKI(g6_attn_replay_run(&y.rp, st));
++                if (seg) k_stamp<<<1, 1, 0, st>>>(sp + S_OPROJ);
++                bind::launch_o_proj(y.B, st);
++                if (seg) k_stamp<<<1, 1, 0, st>>>(sp + S_WA);
++                l2pf::window(l2pf::W_A, l2pf::T_ROUTER, l, P, stop(3 * l + 2), st);
++                k_wait_standin<<<1, 32, 0, st>>>(fab, stepp, 3 * l + 2, (unsigned)(wa * 1000), na);
++                if (seg) k_stamp<<<1, 1, 0, st>>>(sp + S_ROUTER);
++                CK(cudaEventRecord(ef, st));
++                CK(cudaStreamWaitEvent(ovl, ef, 0));
++                dtr::launch(y.sh, ovl);
++                CK(cudaEventRecord(ej, ovl));
++                bind::launch(y.B.router, st);
++                if (seg) k_stamp<<<1, 1, 0, st>>>(sp + S_MOE);
++                if (moen) k_moe<<<sms * 4, 256, 0, st>>>(mbuf[l % NMOE], moen, sink);
++                CK(cudaStreamWaitEvent(st, ej, 0));
++                if (seg) k_stamp<<<1, 1, 0, st>>>(sp + NSEG);
++            }
++            l2pf::join(st);
++        };
++        auto set_arm = [&](int a) { CK(l2pf::setup(arms[a])); };
++
++        // ---- exactness: every layer's outputs after one launch of the graph, arm vs off
++        auto snap = [&](int a) {
++            set_arm(a);
++            cudaGraphExec_t x = inst(st, [&] { body(false); });
++            for (auto& y : Y)
++            {
++                CK(cudaMemsetAsync(y.y, 0xff, (size_t)M * N * 2, st)); CK(cudaMemsetAsync(y.att, 0xff, (size_t)M * K * 2, st));
++                CK(cudaMemsetAsync(y.ind, 0x5a, (size_t)M * TOP * 4, st)); CK(cudaMemsetAsync(y.qay, 0xff, (size_t)M * QA_T * 32, st));
++                CK(cudaMemsetAsync(y.kvay, 0xff, (size_t)M * KVA_T * 32, st)); CK(cudaMemsetAsync(y.iky, 0xff, (size_t)M * IDXK_T * 32, st));
++                CK(cudaMemsetAsync(y.qby, 0xff, (size_t)M * K * 2, st)); CK(cudaMemsetAsync(y.shy, 0xff, (size_t)M * SH_N * 2, st));
++                CK(cudaMemsetAsync(y.rty, 0xff, (size_t)M * 256 * 4, st));
++            }
++            CK(cudaGraphLaunch(x, st));
++            CK(cudaStreamSynchronize(st));
++            CK(cudaGraphExecDestroy(x));
++            std::vector<uint8_t> s;
++            auto put = [&](const void* p, size_t n) { auto h = host((const uint8_t*)p, n); s.insert(s.end(), h.begin(), h.end()); };
++            for (int l = 0; l < NL; ++l)
++            {
++                const Lyr& y = Y[l];
++                put(y.qay, (size_t)M * QA_T * 32); put(y.kvay, (size_t)M * KVA_T * 32); if (full[l]) put(y.iky, (size_t)M * IDXK_T * 32);
++                put(y.qby, (size_t)M * K * 2); put(y.att, (size_t)M * K * 2); if (full[l]) put(y.ind, (size_t)M * TOP * 4);
++                put(y.y, (size_t)M * N * 2); put(y.rty, (size_t)M * 256 * 4); put(y.shy, (size_t)M * SH_N * 2);
++                if (host(y.err, 1)[0]) die("attention error flag set");
++                G6AttnStepCell c;
++                CK(cudaMemcpy(&c, y.cell, sizeof c, cudaMemcpyDeviceToHost));
++                if (!c.valid) die("attention cell invalid");
++            }
++            return s;
++        };
++        const std::vector<uint8_t> ref = snap(0);
++        {
++            const std::vector<uint8_t> again = snap(0);
++            printf("EXACT M=%d off vs off: %zu bytes differ (%s)\n", M, ndiff(ref.data(), again.data(), ref.size()), ref == again ? "deterministic" : "NOT DETERMINISTIC");
++            if (ref != again) return 3;
++        }
++        int bad = 0;
++        for (size_t a = 1; a < arms.size(); ++a)
++        {
++            const std::vector<uint8_t> s = snap((int)a);
++            const size_t d = ndiff(ref.data(), s.data(), ref.size());
++            printf("EXACT M=%d arm %-14s x_in, q_b, attention (+ indices), o_proj, router, shared of %d layers (%zu bytes): %zu differ | %s\n",
++                   M, names[a].c_str(), NL, ref.size(), d, d ? "DIFFER" : "IDENTICAL");
++            bad += d != 0;
++        }
++        if (bad) return 3;
++
++        // ---- timing: the arms' graphs alternating over TR trials
++        struct Run { cudaGraphExec_t g, s; std::vector<float> t; std::vector<float> seg[NSEG]; };
++        std::vector<Run> R(arms.size());
++        for (size_t a = 0; a < arms.size(); ++a)
++        {
++            set_arm((int)a);
++            R[a].g = inst(st, [&] { body(false); });
++            R[a].s = SEGT ? inst(st, [&] { body(true); }) : nullptr;
++        }
++        for (int t = 0; t < TR; ++t)
++            for (size_t a = 0; a < arms.size(); ++a)
++            {
++                R[a].t.push_back(run_us(R[a].g, st, REPS) / NL);
++                if (!R[a].s) continue;
++                CK(cudaGraphLaunch(R[a].s, st));
++                CK(cudaGraphLaunch(R[a].s, st));
++                CK(cudaStreamSynchronize(st));
++                const std::vector<u64> h = host(stamps, (size_t)NL * (NSEG + 1));
++                for (int k = 0; k < NSEG; ++k)
++                {
++                    double sum = 0;
++                    for (int l = 0; l < NL; ++l) sum += (double)(h[(size_t)l * (NSEG + 1) + k + 1] - h[(size_t)l * (NSEG + 1) + k]);
++                    R[a].seg[k].push_back((float)(sum / NL / 1000.0));
++                }
++            }
++        const float t0 = med(R[0].t);
++        for (size_t a = 0; a < arms.size(); ++a)
++        {
++            const float ta = med(R[a].t);
++            const l2pf::Cfg& c = arms[a];
++            printf("TIME M=%d arm %-14s", M, names[a].c_str());
++            if (a) printf(" (win %2d targets 0x%02x %3.0f GB/s wave %2d o_proj <= %4.1f MB)", c.win, c.tmask, c.gbps, c.wave, c.opmb);
++            else printf(" %51s", "");
++            printf(": layer %.1f us (%+.1f) = %+.3f ms over 78 layers%s\n", ta, ta - t0, (ta - t0) * 78 / 1e3, a ? "" : "   <- off");
++        }
++        if (SEGT)
++        {
++            printf("SEG M=%d us per layer (stamped graph; the stamps add ~1 us a segment) %-6s", M, "arm");
++            for (int k = 0; k < NSEG; ++k) printf(" %7s", SEG[k]);
++            printf("\n");
++            for (size_t a = 0; a < arms.size(); ++a)
++            {
++                printf("SEG M=%d %-14s", M, names[a].c_str());
++                for (int k = 0; k < NSEG; ++k) printf(" %7.1f", med(R[a].seg[k]));
++                if (a)
++                {
++                    printf("  | vs off:");
++                    for (int k = 0; k < NSEG; ++k) printf(" %+6.1f", med(R[a].seg[k]) - med(R[0].seg[k]));
++                }
++                printf("\n");
++            }
++        }
++        for (auto& r : R) { CK(cudaGraphExecDestroy(r.g)); if (r.s) CK(cudaGraphExecDestroy(r.s)); }
++        set_arm(0);
++    }
++    printf("\nfull-index layers %d of %d; kill criterion: < 15 us per layer saved at M=3, 1K context\n", nfull, NL);
++    return 0;
++}
+diff --git a/engine/runtime/g6m4.cu b/engine/runtime/g6m4.cu
+index cfce4a9..ca19f8d 100644
+--- a/engine/runtime/g6m4.cu
++++ b/engine/runtime/g6m4.cu
+@@ -610,6 +610,7 @@ int main(int argc, char** argv)
+     auto cp_error = [&]() -> unsigned { return qs_err(); };   // the G6_QA_SPLIT proxy
+ #endif
+     G6RT_CK(bind::init());
++    G6RT_CK(l2pf::init_env());     // G6_L2PF (kernels/l2pf.cuh); unset = off
+     pf_prof().on = getenv("G6_PF_PROF") != nullptr;
+     if (getenv("G6_DEC_PROF") && graph) die("G6_DEC_PROF needs plain launches (no --graph)");
+     cudaStream_t st;
+diff --git a/engine/runtime/rank.cuh b/engine/runtime/rank.cuh
+index 696aab2..df8cdb9 100644
+--- a/engine/runtime/rank.cuh
++++ b/engine/runtime/rank.cuh
+@@ -38,6 +38,7 @@
+ #include "host_reclaim.h"
+ #include "../kernels/glue.cuh"
+ #include "../kernels/bind.cuh"
++#include "../kernels/l2pf.cuh"
+ #include "../kernels/head_i4.cuh"
+ #include "../attn/bind.h"
+ #if defined(G6_CP) && G6_CP
+@@ -925,6 +926,18 @@ inline void qs_get(Model& m, int c, int M, cudaStream_t st)
+ {
+     k_qs_get<<<M <= 8 ? 1 : 4, 256, 0, st>>>(m.qs.geo[c], m.qs.g, m.stepp, c, M, (size_t)M * m.qs.geo[c].wmax * 2);
+ }
++// G6_L2PF (kernels/l2pf.cuh): window w of layer i's prefetch queue, from target `from`, ending when collective c of f has
++// arrived (f = nullptr: the attention window, its budget only). Only between l2pf::arm and l2pf::join (launch_step).
++inline void l2pf_window(Model& m, int w, int from, int i, int M, const g6::FabricDev* f, int c, size_t payload, cudaStream_t st)
++{
++    if (!l2pf::cfg().armed) return;
++    const Layer& y = m.layers[i];
++    l2pf::Stop s;
++    if (f) { s.f = *f; s.c = c; s.payload = payload; }
++    s.stepp = m.stepp;
++    l2pf::window(w, from, i, l2pf::plan_layer(layer_for(m, i, M), y.ab.args.uk, y.ab.args.uv), s, st);
++}
++
+ // G6_QA_SPLIT: this rank's tiles of the input GEMVs, publish, (mode 2: kv_a / idx in full,) gather, q_a norm
+ inline void launch_layer_in_qs(Model& m, int i, const Layer& y, const bind::Layer& b, int M, cudaStream_t st)
+ {
+@@ -944,6 +957,7 @@ inline void launch_layer_in_qs(Model& m, int i, const Layer& y, const bind::Laye
+         else { bind::launch(b.kv_a, st); bind::launch(b.idx_k, st); bind::launch(b.idx_w, st); }
+     }
+     dmark(DP_IDXKW, st);
++    l2pf_window(m, l2pf::W_Q, l2pf::T_IDXQ, i, M, &Q.g, c, (size_t)M * Q.geo[c].wmax * 2, st);
+     qs_get(m, c, M, st);
+     glue::k_rmsnorm_rows<__half><<<M, 256, 0, st>>>(m.q_a, QA, QA, y.q_a_norm, glue::RMS_EPS, m.q_a_n, QA);
+     dmark(DP_QAG, st);
+@@ -964,6 +978,7 @@ inline void launch_qb_idxq(Model& m, int i, const bind::Layer& b, int M, cudaStr
+     bind::launch(b.idx_q, st);
+     qs_put(m, c, M, st);
+     bind::launch_q_b(b, st);
++    l2pf_window(m, l2pf::W_Q, l2pf::T_UK, i, M, &m.qs.g, c, (size_t)M * m.qs.geo[c].wmax * 2, st);
+     qs_get(m, c, M, st);
+ }
+ 
+@@ -1131,6 +1146,7 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t
+     launch_layer_in(m, i, y, b, M, st);
+     launch_qb_idxq(m, i, b, M, st);
+     dmark(DP_QB, st);
++    l2pf_window(m, l2pf::W_T, l2pf::T_UK, i, M, nullptr, 0, 0, st);
+ #ifdef DEC_S2
+     if (m.s2on) s2_attention(m, i, M, st);
+     else
+@@ -1175,6 +1191,9 @@ inline void launch_consume(Model& m, int c, int M, const __nv_bfloat16* w, __hal
+         if (c % 2 == 0) bind::warm_mlp(layer_for(m, c / 2, M), st);
+         else if (c / 2 + 1 < m.nl) bind::warm_proj(layer_for(m, c / 2 + 1, M), st, warm >= 2);
+     }
++    // G6_L2PF: this layer's router and shared expert (2i), the next layer's front (2i+1) while this rank waits
++    if (c % 2 == 0) l2pf_window(m, l2pf::W_A, l2pf::T_ROUTER, c / 2, M, &m.f, c, (size_t)M * HID * 2, st);
++    else if (c / 2 + 1 < m.nl) l2pf_window(m, l2pf::W_M, l2pf::T_XIN, c / 2 + 1, M, &m.f, c, (size_t)M * HID * 2, st);
+     glue::k_wait_peers<<<1, 32, 0, st>>>(m.f, m.stepp, c, (size_t)M * HID * 2, glue::ERR_AR);
+     dmark(c % 2 == 0 ? DP_WAIT_A : DP_WAIT_M, st);
+     glue::k_ar_add_norm<<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(a);
+@@ -1436,6 +1455,7 @@ inline void launch_step(Model& m, int M, int context, cudaStream_t st, int part
+     if (part != 1) ep.n = 0;
+     ep.rec = ep.every > 0;
+     if (ep.rec || getenv("G6_DEC_PROF")) g6_attn_mark = attn_mark;
++    l2pf::arm();                      // G6_L2PF: the windows below may fork; joined at the end of this part
+     if (part != 1)
+     {
+         dmark(DP_OTHER, st);
+@@ -1459,6 +1479,7 @@ inline void launch_step(Model& m, int M, int context, cudaStream_t st, int part
+         launch_step_out(m, M, st);
+         dmark(DP_STEP, st);
+     }
++    l2pf::join(st);
+     ep.rec = false;
+ }
+ 
+diff --git a/scripts/build.sh b/scripts/build.sh
+index 6a28fc0..31d7fe5 100755
+--- a/scripts/build.sh
++++ b/scripts/build.sh
+@@ -79,6 +79,12 @@ nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K
+ # + bench on a synthetic TP layer; build only (needs an idle GPU and ~2.5 GB): $OUT/k1_ovl_test (file header)
+ nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} $S2_FLAG \
+   -I "$REPO/engine/kernels" -o "$OUT/k1_ovl_test" "$REPO/engine/kernels/tests/k1_ovl_test.cu"
++# G6_L2PF (paced side-stream L2 prefetch in the step's idle-DRAM windows): byte-exact check + per-layer timing of the
++# decode layer sequence (real attention, x_in / q_b / o_proj / router GEMVs, wait and MoE stand-ins); build only (needs
++# an idle GPU and ~3-5 GB): $OUT/l2pf_bench (file header)
++nvcc -O3 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} $S2_FLAG \
++  -I "$REPO/engine/kernels" -o "$OUT/l2pf_bench" "$REPO/engine/kernels/tests/l2pf_bench.cu" "$REPO/engine/attn/attn.cu" \
++  "$REPO/engine/attn/bind.cu" -lcublas
+ if nvidia-smi -L > /dev/null 2>&1; then
+   t=$("$OUT/tr3_e4m3_test") || { echo "$t"; echo "tr3_e4m3_test FAILED"; exit 1; }
+   echo "tr3_e4m3_test: $(echo "$t" | tail -1)"

@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.5 — 2026-10-16
+
+v0.4 plus four patches, twenty-six in all, and one upstream launcher option. Upstream base (`6448a16`) unchanged;
+patches 0001–0022 differ only in the series count of their subject lines.
+
+- Paced L2 prefetch (0023), `G6_L2PF=15`: in the windows where DRAM is idle (the two all-reduce waits, the column
+  gathers, the latency-bound attention) one warp on a side stream prefetches the layer's next weights into L2 in small
+  chunks at a set rate, the pacing of [dsgx10](https://github.com/blaesus/dsgx10). Bit-exact.
+- MoE decode kernel (0026): a split table per step row count, `G6_K1_SPLIT=1:/4,3:2x1,4-32:/4` (fc1 CTA shape and fc2
+  n-split with the same summation order), and a translation prefetch at the start of each expert's fc1,
+  `G6_K1_TLBW=2048`: a step's routed experts touch about 5,300 2 MB pages per rank, more than the GPU's translation
+  cache covers (about 4 GB), and the kernel ran at 85 % of a plain read of the same bytes. Also in the patch, off:
+  `G6_IMG_VMM` and the `k1_audit` bench. Bit-exact.
+- Two experiments in the series, off: the all-reduce wait folded into the norm kernel (0024, measured level) and the
+  MTP first form without its head on DFlash2 rounds (0025, measured slower on prose).
+- `SPEC_ACCEPT=rejection` (upstream launcher option): drafts at temperature > 0 are accepted by rejection sampling
+  instead of coupled sampling. The output distribution is the target's in both; a seed's text now depends on the
+  drafting configuration. Temperature 0 is unchanged.
+- `docker/env.example`: `G6ENV_X` gains `G6_L2PF=15 G6_K1_SPLIT=1:/4,3:2x1,4-32:/4 G6_K1_TLBW=2048`, plus
+  `SPEC_ACCEPT=rejection`; image tag `gr8-glm53-recipe:v0.5`.
+- README: the results are RigMark's (decode by workload, concurrency, prefill); the `bench/conc.py` table moved to
+  [docs/history.md](docs/history.md).
+
+Measured against v0.4 on the same machines:
+
+v0.5 vs v0.4: RigMark full run prose 37.8 / code 57.9 / structured 70.2 (v0.4 36.4 / 55.9 / 71.1), C1/C2/C4 aggregate
+46.1 / 57.4 / 72.5 (v0.4 43.6 / 56.1 / 68.6); a second run after a warm-up request, without the concurrency section:
+prose 38.0 / code 59.1 / structured 70.2. `bench/decset.py` (24 prompts, c1, T=0; three runs each of v0.5's
+levers, interleaved): prose 43.35 vs 41.38 (+4.8 %), code 55.30 vs 53.14 (+4.1 %), structured 60.02 vs 57.57
+(+4.3 %); of that, `G6_L2PF=15` alone +2.7 % prose and the K1 split table plus translation prefetch +2.0 % on top (detail in
+[docs/history.md](docs/history.md#decode-over-24-prompts-v05-levers)). At
+T=1.0, top_p 0.95 (two runs each): `SPEC_ACCEPT=rejection` vs coupled prose +0.2 %, code +2.4 %, structured +6.2 %.
+Decode table (`bench/conc.py`, aggregate, median of three boots, c1 / c2 / c4): prose 37.4 / 51.5 / 66.3 (v0.4 35.3 / 48.9 / 63.3), code
+48.9 / 61.7 / 78.9 (v0.4 46.7 / 59.1 / 75.1), structured 74.9 / 68.3 / 88.7 (v0.4 72.1 / 65.6 / 84.9). Cold prefill
+(warm-up run) 1359 / 1383 / 1316 / 1154 tok/s (8K-128K; v0.4 1375 / 1378 / 1313 / 1160); the full run's first prefill
+after boot read 1299 at 8K, and cold TTFT at 8K / 32K on our own prompts was level (two boots each). T=0 top-20 logprobs on the 75 qeval prompts, each configuration from a fresh boot: `G6_L2PF=15` vs v0.4, and the K1 split table and translation prefetch on top of it, 75/75 prompts identical, KL 0. Sampled qeval 577/600 (T=1.0 with rejection sampling; v0.4 578/600 with coupled
+sampling, standard error 0.8 pp); T=0 qeval 72/75; 96K needle correct.
+
 ## v0.4 — 2026-10-16
 
 v0.3 plus one patch, twenty-two in all. Upstream base (`6448a16`) unchanged; patches 0001–0021 differ only in the series count of their subject lines.

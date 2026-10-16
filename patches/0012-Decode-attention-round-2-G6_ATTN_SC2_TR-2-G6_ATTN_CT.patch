@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Thu, 15 Oct 2026 16:01:29 +0200
-Subject: [PATCH 12/22] Decode attention round 2: G6_ATTN_SC2_TR=2,
+Subject: [PATCH 12/26] Decode attention round 2: G6_ATTN_SC2_TR=2,
  G6_ATTN_CTX3, G6_ATTN_SEL2, G6_IDX_GRP (exact, default off); attnk bench vs
  round 1
 

@@ -18,11 +18,15 @@ v0.1 was measured with the v0.2 `G6ENV_X` line without `G6_DFL_REUSE=2`. v0.2's 
 
 [`bench/conc.py`](../bench/conc.py): aggregate tok/s **[per-stream tok/s]**, RigMark's prose, code and structured
 prompts, 256 output tokens, temperature 0, `reasoning_effort: low`, medians of three rounds per cell, c identical
-requests sent at once. v0.4: median per cell over three boots, against three v0.3 boots, two of each interleaved in one session (v0.3's three-boot
-medians: prose 36.2 / 49.3 / 63.3, code 46.3 / 59.2 / 75.5, structured 70.6 / 65.7 / 85.0). Earlier rows: one boot per release.
+requests sent at once. v0.5 and v0.4: median per cell over three boots (v0.5's three boots are within 0.3 tok/s of each
+other). v0.4 was measured against three v0.3 boots, two of each interleaved in one session (v0.3's three-boot medians:
+prose 36.2 / 49.3 / 63.3, code 46.3 / 59.2 / 75.5, structured 70.6 / 65.7 / 85.0). Earlier rows: one boot per release.
 
 | Release | Prompt type | c1 | c2 | c4 |
 |---|---|---:|---:|---:|
+| v0.5 (median of three boots) | prose | 37.4 [38.5] | 51.5 [27.4] | 66.3 [18.5] |
+| v0.5 (median of three boots) | code | 48.9 [50.1] | 61.7 [32.8] | 78.9 [22.4] |
+| v0.5 (median of three boots) | structured | 74.9 [77.7] | 68.3 [37.2] | 88.7 [26.0] |
 | v0.4 (median of three boots) | prose | 35.3 [36.2] | 48.9 [26.1] | 63.3 [17.7] |
 | v0.4 (median of three boots) | code | 46.7 [47.8] | 59.1 [31.5] | 75.1 [21.4] |
 | v0.4 (median of three boots) | structured | 72.1 [74.8] | 65.6 [35.7] | 84.9 [24.9] |
@@ -47,6 +51,18 @@ Two runs per release, alternating, fresh boot each.
 v0.4 is faster on 8 of the 12 prose prompts. Most of the code difference is one prompt (63.8 → 53.0 tok/s); the median
 over the six code prompts is 52.6 vs 53.1.
 
+## Decode over 24 prompts: v0.5 levers
+
+`bench/decset.py`, c1, T=0, fresh boot per run, one session (2026-10-16). v0.4 controls: prose 40.97 / 40.94 / 41.82 /
+41.79, code 53.24 / 53.25 / 53.04 / 53.02, structured 57.21 / 57.33 / 57.87 / 57.87 (two of them on the v0.5 image with
+its flags off).
+
+| Configuration | prose | code | structured |
+|---|---:|---:|---:|
+| v0.4 (mean of four) | 41.38 | 53.14 | 57.57 |
+| + `G6_L2PF=15` (mean of three) | 42.48 | 54.38 | 59.12 |
+| + `G6_K1_SPLIT` + `G6_K1_TLBW` = v0.5 (mean of three) | 43.35 | 55.30 | 60.02 |
+
 ## RigMark: releases and baseline
 
 [RigMark](https://github.com/alexellis/rigmark) 1.0.0, thinking on, `reasoning_effort: low`, decode tok/s; settings in
@@ -54,19 +70,26 @@ the README's Reproducing section. RigMark sends single-turn requests.
 
 | c1 decode | prose | code | structured |
 |---|---:|---:|---:|
+| v0.5, full run | 37.8 | 57.9 | 70.2 |
+| v0.5, run after a warm-up request (no concurrency section) | 38.0 | 59.1 | 70.2 |
+| v0.4, full run | 36.4 | 55.9 | 71.1 |
 | v0.2, full run | 35.5 | 54.8 | 66.6 |
 | v0.1, full run | 35.4 | 54.9 | 66.7 |
 | v0.1, decode screens (two runs) | 35.76 / 35.74 | 52.51 / 52.56 | 67.51 / 67.36 |
 | baseline (`d9188e3` + MTU fix), full run | 29.0 | 48.1 | 60.6 |
 
-| Concurrency, aggregate decode tok/s | C1 | C2 | C4 |
+| Concurrency, aggregate end-to-end tok/s | C1 | C2 | C4 |
 |---|---:|---:|---:|
+| v0.5 | 46.1 | 57.4 | 72.5 |
+| v0.4 | 43.6 | 56.1 | 68.6 |
 | v0.2 | 38.8 | 54.3 | 67.6 |
 | v0.1 | 39.4 | 55.7 | 67.5 |
 | baseline (`d9188e3` + MTU fix) | 34.7 | 50.0 | 63.7 |
 
 | Prefill, cold, tok/s | 8K | 32K | 64K | 128K |
 |---|---:|---:|---:|---:|
+| v0.5 (after a warm-up request) | 1359 | 1383 | 1316 | 1154 |
+| v0.5 (full run, first prefill after boot) | 1299 | 1374 | 1306 | 1160 |
 | v0.4 | 1375 | 1378 | 1313 | 1160 |
 | v0.3 | 1367 | 1380 | 1311 | 1174 |
 | v0.2 | 1369 | 1370 | 1312 | 1157 |
@@ -100,6 +123,11 @@ v0.2's `G6_S2_DSEL_MCOST=2.9`, which it replaces.
 | 0017 | off (`G6_S2_TIMELINE=N` when measuring the DSel table) | diagnostics only |
 | 0018–0020 | `G6_S2_DSEL_MODEL=1` `G6_S2_DSEL_TABLE=…` (with `r:0.95`) | vs `G6_S2_DSEL_MCOST=2.9`: prose +1.8 %, code +3.0 %, structured −3.6 % (two runs each). Without key `r` (0018 alone) a structured request that a dip moved to MTP stayed there: structured −21 % on the cluster; `r` (0020) brings it back to DFlash2 |
 | 0022 | `G6_DFL_BODY_I4=1` (with v0.3's DSel table) | prose +0.3 %, code +2.6 %, structured +5.2 % (three runs each, interleaved with v0.3). With a DSel table re-measured on it (`d:5.726`): prose +0.4 %, code +3.9 %, structured −1.0 % (two runs each); v0.3's table is kept |
+| 0023 | `G6_L2PF=15` | `bench/decset.py` (24 prompts, c1, three runs vs four controls): prose +2.7 %, code +2.3 %, structured +2.7 %; one-GPU bench of 78 decode layers: -10.1 us per layer at 3 rows, -38.6 at 12 rows |
+| 0024 | off (`G6_AR_WAITFOLD=1` measured) | decset: level (+0.3 % prose, within noise); one-GPU bench -0.18 ms per step |
+| 0025 | off (`G6_MTP_HEAD_SKIP=4` measured) | decset: prose -1.0 %, code +4.2 % from one prompt whose text changed, structured -1 % |
+| 0026 | `G6_K1_SPLIT=1:/4,3:2x1,4-32:/4` `G6_K1_TLBW=2048` (on top of 0023) | decset: prose +2.0 %, code +1.7 %, structured +1.5 % (three runs each); `k1_audit` at served routes: split table -11 us per MoE call at 3 rows (-2.9 %), translation prefetch -8.5 us per call with the route overlap; the MoE kernel reaches 85 % of a plain read of the same bytes with all 75 layers resident, 91 % with 8 |
+| — | `SPEC_ACCEPT=rejection` (upstream option) | decset at T=1.0, top_p 0.95 (two runs each): prose +0.2 %, code +2.4 %, structured +6.2 %; T=0 unchanged |
 
 ## Multi-turn (prefix-cache hits)
 
@@ -134,6 +162,8 @@ Mean of the per-turn ratios (`bench/multiturn.py compare`): prefix-hit turns (A2
 
 | Check | Result |
 |---|---|
+| T=0 identity / KL, v0.5 | the same check, rerun on v0.5: 34/75 identical, mean KL 2.7e-3 on the common prefix (noise scale 5.0e-3) |
+| Sampled qeval / T=0 qeval / needle, v0.5 | 577/600 sampled with `SPEC_ACCEPT=rejection`; 72/75 T=0; 96K needle correct |
 | T=0 identity / KL, v0.4 | the same check: 34/75 identical, mean KL 2.7e-3 on the common prefix (noise scale 5.0e-3, as below) |
 | Sampled qeval / T=0 qeval / needle, v0.4 | 578/600 sampled, identical per seed; 72/75 T=0; 96K needle correct |
 | T=0 identity / KL, v0.3 | top-20 logprobs on the 75 qeval prompts vs an earlier configuration (GEMV split + INT4 draft heads + DSel probe 32), prefix-cached pass: 34/75 identical, mean KL 2.7e-3 on the common prefix; for scale, one configuration at concurrency 1 vs 4: 30/75 identical, mean KL 5.0e-3 |

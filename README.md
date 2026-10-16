@@ -1,7 +1,7 @@
 # Full GLM-5.3 on 4× NVIDIA DGX Spark with gr8 (TP4)
 
 A recipe for serving full [GLM-5.3](https://huggingface.co/zai-org/GLM-5.3) on four DGX Sparks with tensor parallelism
-4, using the [gr8](https://github.com/kindlingai/gr8) engine by kindlingai at a pinned upstream commit, plus twenty-two
+4, using the [gr8](https://github.com/kindlingai/gr8) engine by kindlingai at a pinned upstream commit, plus twenty-six
 small patches. The weights are kindlingai's EXLR8 quantization
 [kindlingai/glm-5.3-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4) (width manifest `home`),
 with GLM-5.3's own MTP layer and the [incoai/GLM-5.3-DFlash2](https://huggingface.co/incoai/GLM-5.3-DFlash2) drafter.
@@ -11,37 +11,37 @@ fork, no weights and no images: the engine comes from upstream at `6448a16`, the
 image from upstream's registry. Every patch except the fabric MTU fix (0001, always on) is behind a flag that defaults
 to off, so the patched engine behaves as upstream until `G6ENV_X` turns the levers on.
 
-Release **v0.4**, 2026-10-16. The tables below are this release's measurements. What changed in each release, and by
+Release **v0.5**, 2026-10-16. The tables below are this release's measurements. What changed in each release, and by
 how much, is in [CHANGELOG.md](CHANGELOG.md); A/B measurements against earlier releases and the upstream baseline are
 in [docs/history.md](docs/history.md).
 
-## Decode by prompt type and concurrency — thinking on, effort low
+## RigMark — thinking on, effort low
 
-Measured 2026-10-16 on the v0.4 configuration: each cell is the median over three boots.
+Measured 2026-10-16 on the v0.5 configuration with [RigMark](https://github.com/alexellis/rigmark) 1.0.0 (settings in
+[Reproducing](#reproducing)), temperature 0, `reasoning_effort: low` (the model's chat template has no thinking-off
+mode). Each cell is RigMark's median for that workload. c1 decode and prefill: a run without the concurrency section,
+after one unrelated 8K warm-up request; concurrency: a full run.
 
-Decode, aggregate tok/s **[per-stream tok/s]**, RigMark's prose, code and structured prompts, 256 output tokens,
-temperature 0, `reasoning_effort: low` (the model's chat template has no thinking-off mode), medians of three rounds per
-cell; c identical requests sent at once. Measured with [`bench/conc.py`](bench/conc.py).
-
-At c ≥ 2 the sessions share verify steps and draft with MTP (the DFlash2 drafter serves a session that is alone), so
-structured and code, where DFlash2 drafts long blocks, gain less from concurrency than prose.
-
-| Prompt type | c1 | c2 | c4 |
+| c1 decode | prose | code | structured |
 |---|---:|---:|---:|
-| prose | 35.3 [36.2] | 48.9 [26.1] | 63.3 [17.7] |
-| code | 46.7 [47.8] | 59.1 [31.5] | 75.1 [21.4] |
-| structured | 72.1 [74.8] | 65.6 [35.7] | 84.9 [24.9] |
+| tok/s | 38.0 | 59.1 | 70.2 |
 
-## Prefill
+Concurrency, aggregate end-to-end tok/s **[per-stream decode tok/s]**. At c ≥ 2 the sessions share verify steps and
+draft with MTP (the DFlash2 drafter serves a session that is alone), so code and structured, where DFlash2 drafts long
+blocks, gain less from concurrency than prose.
 
-Cold prefill, input tok/s, measured with [RigMark](https://github.com/alexellis/rigmark) 1.0.0 (unique prompts, no
-prefix reuse). A 96K-token needle prompt: correct answer.
+| Concurrency | C1 | C2 | C4 |
+|---|---:|---:|---:|
+| aggregate [per-stream] | 46.1 [51.5] | 57.4 [33.1] | 72.5 [22.0] |
+
+Cold prefill, input tok/s (unique prompts, no prefix reuse). A 96K-token needle prompt: correct answer.
 
 | Prompt length | 8K | 32K | 64K | 128K |
 |---|---:|---:|---:|---:|
-| cold prefill tok/s | 1375 | 1378 | 1313 | 1160 |
+| cold prefill tok/s | 1359 | 1383 | 1316 | 1154 |
 
-RigMark decode results (used to measure each lever) are in [docs/history.md](docs/history.md).
+The decode table by prompt type and concurrency from [`bench/conc.py`](bench/conc.py) and every release's results are
+in [docs/history.md](docs/history.md).
 
 ## Multi-turn conversations
 
@@ -57,6 +57,7 @@ is in [docs/history.md](docs/history.md#multi-turn-prefix-cache-hits).
 | 0002, 0003 | Split the replicated GEMVs every rank holds in full (layer input q_a / kv_a / indexer k and weights; the indexer's wq_b; the MTP draft layer's eh_proj, q_a, kv_a, indexer) by 16-output tiles across the four ranks, then all-gather the columns per layer on a fabric of their own | `G6_QA_SPLIT=1` `G6_IDXQ_SPLIT=1` `G6_MTP_SPLIT=1` | bit-exact | knapcio |
 | 0004, 0005 | MTP draft head and DFlash2 drafter head on INT4 g32 records made at boot from the target's MXFP8 head (45 % fewer head bytes per draft step); the target head and verify are unchanged | `G6_DRAFT_HEAD_I4=1` `G6_DFL_HEAD_I4=1` | drafting | knapcio; DFlash2 by incoai |
 | — | DSel probe interval (upstream knob, no patch): while a request drafts with MTP, DFlash2 drafts a scoring probe every 32nd round instead of every 4th | `G6_S2_DSEL_PROBE=32` | drafting | DSel by kindlingai; setting by knapcio |
+| — | Draft acceptance at temperature > 0 (upstream launcher option, no patch): rejection sampling instead of coupled sampling. Both give the target's output distribution; rejection keeps more drafts here. A seed's text then depends on the drafting configuration. Temperature 0 is unchanged | `SPEC_ACCEPT=rejection` | sampling: same distribution | upstream gr8; setting by knapcio |
 | 0006–0008 | DSel experiments: start DFlash2 requests on MTP, a selector-walk correction coefficient, per-position observation clocks | off | — | knapcio |
 | 0009 | Overrides for DSel's drafting-cost constants (ms per round). Not used in serving since v0.3: the cost table of 0018 replaces these constants | off | drafting | knapcio; DSel by kindlingai |
 | 0010 | MoE: run the trellis shared expert on a forked stream during the router GEMV and plan kernel, so its weight reads fill idle DRAM time | `G6_ROUTE_OVL=1` | bit-exact | knapcio |
@@ -72,6 +73,10 @@ is in [docs/history.md](docs/history.md#multi-turn-prefix-cache-hits).
 | 0020 | DSel cost model, table key `r`: price DFlash2 from the request's DFlash2 rounds and scored probes as they ran (committed tokens over their table cost, aged by `r` per MTP round) instead of its position-rate estimate, so a request that a dip moved to MTP can come back to DFlash2 | `r:0.95` in `G6_S2_DSEL_TABLE` | drafting | knapcio; DSel by kindlingai |
 | 0021 | `tools/s2_dsel_table.py` usage text: the measurement boot removes the model and `G6_DRAFT_PAR` and appends the diagnostics | — | tool docs | knapcio |
 | 0022 | DFlash2 drafter body on INT4 g32 records made at boot from its MXFP8 records (fc and, per layer, kv / aconv / q / o / mconv / gu / down, same splits): the drafter body's records take 382 MB instead of 701 MB. Also in the patch, off: the MTP draft's eh_proj on INT4 (`G6_MTP_EHPROJ_I4`) | `G6_DFL_BODY_I4=1` | drafting | knapcio; DFlash2 by incoai |
+| 0023 | Decode: paced L2 prefetch of the layer's next weights (input projections, q_b, the attention's absorb and value-projection weights, o_proj, router, shared expert) from one warp on a side stream, in the windows where DRAM is idle: the two all-reduce waits, the column gathers and the latency-bound attention. Small chunks at a set rate (after [dsgx10](https://github.com/blaesus/dsgx10)) instead of a burst, stopped when the collective arrives; a prefetch writes nothing | `G6_L2PF=15` | bit-exact | knapcio; pacing after blaesus/dsgx10 |
+| 0024 | Decode all-reduce: the wait for the peers folded into the norm kernel. Measured level with the serving flags; off | off | — | knapcio |
+| 0025 | MTP first form without its head on DFlash2 rounds that stay on DFlash2. Measured slower on prose; off | off | — | knapcio |
+| 0026 | MoE decode kernel: a split table per step row count (`G6_K1_SPLIT`: fc1 CTA shape and fc2 n-split, same summation order), and a translation prefetch at the start of each expert's fc1 (`G6_K1_TLBW`), because a step's routed experts touch about 5,300 2 MB pages per rank, more than the GPU's translation cache covers (about 4 GB). Also in the patch, off: the weight image from `cuMemCreate` chunks (`G6_IMG_VMM`) and the `k1_audit` bench | `G6_K1_SPLIT=1:/4,3:2x1,4-32:/4` `G6_K1_TLBW=2048` | bit-exact | knapcio |
 
 The measured contribution of each lever is in [docs/history.md](docs/history.md#per-lever-contributions).
 
@@ -83,7 +88,9 @@ gave identical T=0 output on the four-box cluster (and is byte-compared by its o
 8K / 32K × 1 / 3 / 8 / 12 rows and gave identical T=0 output on the cluster; round 3's serving flags (`G6_ATTN_QT=1`,
 `G6_ATTN_FRONT=1`) are byte-identical in the attnk bench and gave identical T=0 output on the cluster; the parallel
 drafter step (`G6_DRAFT_PAR=1`) runs the same graphs on the same inputs, gives the same tokens, steps and statistics as
-serial in its host test (`batch_draftpar_test`) and gave identical T=0 output on the cluster. Exactness covers these
+serial in its host test (`batch_draftpar_test`) and gave identical T=0 output on the cluster. The paced L2 prefetch (0023) and the MoE split table and translation prefetch (0026) gave
+byte-identical outputs in their one-GPU benches (`l2pf_bench`, `k1_audit`) and identical T=0 top-20 logprobs on the 75
+qeval prompts on the cluster (75/75, KL 0, each configuration from a fresh boot). Exactness covers these
 flags only: patch 0011 also contains `G6_ATTN_CTX2=9`, an experimental mode that changes the summation order, and patch
 0015 also contains `G6_ATTN_ABS2`, `G6_ATTN_VP2` and `G6_ATTN_CTX4`; they are off and not part of this recipe.
 
@@ -100,8 +107,8 @@ not guaranteed byte-identical to upstream over long generations.
 
 | Check | Result |
 |---|---|
-| T=0 identity / KL | top-20 logprobs on the 75 qeval prompts vs an earlier configuration (GEMV split + INT4 draft heads + DSel probe 32), prefix-cached pass: mean KL 2.7e-3 on the common prefix, below the batching-noise scale (details in [docs/history.md](docs/history.md)) |
-| Sampled qeval | 578/600 (T=1.0, top_p 0.95, 8 seeds × 75 tasks), identical per seed to earlier configurations |
+| T=0 identity / KL | v0.5, top-20 logprobs on the 75 qeval prompts vs an earlier configuration (GEMV split + INT4 draft heads + DSel probe 32), prefix-cached pass: mean KL 2.7e-3 on the common prefix, below the batching-noise scale (details in [docs/history.md](docs/history.md)) |
+| Sampled qeval | 577/600 (T=1.0, top_p 0.95, 8 seeds × 75 tasks, rejection sampling: `SPEC_ACCEPT=rejection`) |
 | T=0 qeval | 72/75, single run |
 | Needle | 96K-token needle: correct answer |
 | GEMV split exactness, m4sim | every combination of `G6_QA_SPLIT` / `G6_IDXQ_SPLIT` / `G6_MTP_SPLIT` byte-identical to flags off on the plain, graph, MTP, S2 and CP paths: 30/30 |
@@ -109,6 +116,7 @@ not guaranteed byte-identical to upstream over long generations.
 | Attention exactness, round 3 (`G6_ATTN_QT=1` `G6_ATTN_FRONT=1`) | byte-identical to stock in the attnk bench; identical T=0 output on the four-box cluster |
 | Parallel drafter step (`G6_DRAFT_PAR=1`) | same tokens, steps and statistics as serial in `batch_draftpar_test`; identical T=0 output on the four-box cluster |
 | Route overlap exactness | identical T=0 output on the four-box cluster; byte-compared by `engine/kernels/tests/k1_ovl_test.cu` |
+| L2 prefetch and MoE split / translation prefetch exactness (`G6_L2PF`, `G6_K1_SPLIT`, `G6_K1_TLBW`) | byte-identical in `l2pf_bench` and `k1_audit`; T=0 top-20 logprobs on the 75 qeval prompts identical to the configuration without them, 75/75 prompts, KL 0 (fresh boot each) |
 
 qeval is the 75-task quality screen from the earlier
 [GLM-5.3 recipe](https://github.com/knapcio/GLM-5.3-4x-DGX-Spark-TP4) (`bench/qeval.py`). The m4sim exactness runs used
@@ -117,10 +125,11 @@ and KL checks against earlier configurations are in [docs/history.md](docs/histo
 
 ## Reproducing
 
-- **Engine flags** (serving): `G6ENV_X` in [docker/env.example](docker/env.example), the same line on every box:
+- **Engine flags** (serving): `G6ENV_X` and `SPEC_ACCEPT` in [docker/env.example](docker/env.example), the same lines on every box:
 
   ```bash
-  G6ENV_X="G6_QA_SPLIT=1 G6_IDXQ_SPLIT=1 G6_MTP_SPLIT=1 G6_DRAFT_HEAD_I4=1 G6_DFL_HEAD_I4=1 G6_S2_DSEL_PROBE=32 G6_ROUTE_OVL=1 G6_ATTN_SC2=4 G6_ATTN_SC2_TR=2 G6_ATTN_CTX2=4 G6_ATTN_CTX3=2 G6_ATTN_SEL2=16 G6_IDX_GRP=16 G6_MTP_KSTOP=1 G6_MTP_KSTOP_KMAX=3 G6_MTP_KSTOP_TAU=0,0.5,0.75 G6_DFL_REUSE=2 G6_ATTN_QT=1 G6_ATTN_FRONT=1 G6_DRAFT_PAR=1 G6_S2_DSEL_MODEL=1 G6_S2_DSEL_TABLE=v2:46.63,v3:54.71,v4:63.99,v5:71.54,v6:79.37,v7:88.23,v8:96.82,d:7.285,m:2.039,e:1.155,p:5.026,g:1.107,k:2.177,n:2.486,w:1,r:0.95 G6_DFL_BODY_I4=1"
+  G6ENV_X="G6_QA_SPLIT=1 G6_IDXQ_SPLIT=1 G6_MTP_SPLIT=1 G6_DRAFT_HEAD_I4=1 G6_DFL_HEAD_I4=1 G6_S2_DSEL_PROBE=32 G6_ROUTE_OVL=1 G6_ATTN_SC2=4 G6_ATTN_SC2_TR=2 G6_ATTN_CTX2=4 G6_ATTN_CTX3=2 G6_ATTN_SEL2=16 G6_IDX_GRP=16 G6_MTP_KSTOP=1 G6_MTP_KSTOP_KMAX=3 G6_MTP_KSTOP_TAU=0,0.5,0.75 G6_DFL_REUSE=2 G6_ATTN_QT=1 G6_ATTN_FRONT=1 G6_DRAFT_PAR=1 G6_S2_DSEL_MODEL=1 G6_S2_DSEL_TABLE=v2:46.63,v3:54.71,v4:63.99,v5:71.54,v6:79.37,v7:88.23,v8:96.82,d:7.285,m:2.039,e:1.155,p:5.026,g:1.107,k:2.177,n:2.486,w:1,r:0.95 G6_DFL_BODY_I4=1 G6_L2PF=15 G6_K1_SPLIT=1:/4,3:2x1,4-32:/4 G6_K1_TLBW=2048"
+  SPEC_ACCEPT=rejection
   ```
 
   `G6_S2_DSEL_MCOST` is no longer set: with `G6_S2_DSEL_MODEL=1` the drafter choice prices both drafters from
@@ -130,7 +139,8 @@ and KL checks against earlier configurations are in [docs/history.md](docs/histo
   in the patched tree (added by patches 0018 and 0019; its usage text has the procedure). The values are milliseconds
   on this hardware (GB10, this fabric, the stock clock cap, these kernels): on other hardware, or after changing the
   kernels or the K-stop settings, measure it again, because a table from other machines misprices the drafters.
-  The served table above was measured with `G6_DFL_BODY_I4` off (the comparison with a table measured with it on is in
+  The served table above was measured on the v0.3 configuration, before `G6_DFL_BODY_I4`, `G6_L2PF` and the MoE
+  levers of 0026, which shorten the steps it prices (the comparison with a table measured with `G6_DFL_BODY_I4` on is in
   [CHANGELOG.md](CHANGELOG.md)). Measurement boot:
 
   1. Boot the serving configuration being priced with the model off and the timeline on: the `G6ENV_X` line above
@@ -195,6 +205,12 @@ and KL checks against earlier configurations are in [docs/history.md](docs/histo
 - **Verify numerics are not row-count invariant in upstream gr8.** A step that verifies 3 rows and one that verifies 8
   can sum in a different order. T=0 output in upstream also depends on prefix-cache state (a cold prompt and a cached
   one can differ). Compare T=0 runs only under the same cache state.
+- **T=0 output depends on what the server ran before** (upstream behaviour): the same configuration gave identical
+  top-20 logprobs on 39 of the 75 qeval prompts from a fresh boot and after a full RigMark run, whose concurrency
+  section leaves timing-dependent state. Compare T=0 runs only from the same state.
+- **`SPEC_ACCEPT=rejection` ties a seed's text to the drafting configuration.** The output distribution is the
+  target's, as with upstream's default coupled sampling, but a fixed seed gives other text when the drafters, their
+  weights or the drafter choice change (coupled sampling gives the same text with or without speculation).
 - **Only the TP=4 engine with the FP8 KV latent (`bin/g6m4`) is rebuilt.** TP=3, TP=6 and `--kv-format int4` keep
   upstream's binaries and were not tested with these flags.
 - **Same flags on every box.** `G6ENV_X` is a cluster-wide launcher option, so use one `docker/.env` everywhere. The
@@ -225,7 +241,7 @@ gr8 expects, and about 90 GB of disk per box for its part of the model.
    engine and places it in the pinned upstream image:
 
    ```bash
-   docker buildx build --platform linux/arm64 -t gr8-glm53-recipe:v0.4 --load .
+   docker buildx build --platform linux/arm64 -t gr8-glm53-recipe:v0.5 --load .
    ```
 
    Use the same image on all four boxes (build it on each, or `docker save` / `docker load`).

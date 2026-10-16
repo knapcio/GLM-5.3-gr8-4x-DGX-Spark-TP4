@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Thu, 15 Oct 2026 19:47:47 +0200
-Subject: [PATCH 16/22] S2: DFlash2 drafter step under the MTP first form on
+Subject: [PATCH 16/26] S2: DFlash2 drafter step under the MTP first form on
  its own stream behind G6_DRAFT_PAR=1|2
 
 A solo DFlash2 round makes the drafter choice before the first form (it reads nothing the first form writes),
