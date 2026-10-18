@@ -24,11 +24,14 @@
 - **NVIDIA**: the CUDA images and toolchain the image is built from.
 - **blaesus**: [dsgx10](https://github.com/blaesus/dsgx10) (MIT), from-scratch inference engines for GB10 boxes, whose
   paced side-stream L2 prefetch (small chunks from a token bucket instead of a burst) patch 0023 follows.
-- **knapcio**: the thirty patches (fabric MTU negotiation, replicated-GEMV splits, INT4 draft heads and drafter
+- **spectra-kindling** (kindlingai): upstream gr8's open PR [#98](https://github.com/kindlingai/gr8/pull/98), kv_b as
+  the release's block FP8 (`G6_KVB=fp8`), carried here as patches 0034–0036 with authorship kept; MIT like the rest of gr8.
+- **knapcio**: the other thirty-six patches (fabric MTU negotiation, replicated-GEMV splits, INT4 draft heads and drafter
   body, DSel experiments and cost overrides, the shared-expert stream overlap, three rounds of decode attention kernels,
   the MTP confidence stop, DFlash2 after prefix reuse, the parallel DFlash2 drafter step, the decode step timeline, the
   DSel cost model and its table tool, the paced L2 prefetch, the MoE split table and translation prefetch, the launch
   share-limit rule and the ninth decode bucket, the one-chain CP attention call, the K-stop cap for promoted sessions,
-  and two experiments that are off), the serving configuration, the measured DSel cost table, the measurements and the
+  the per-session confidence stop in shared rounds, the drafter-shape fixes, the SELX default, the L2 prefetch's FP8
+  targets and kvb8_test's extra widths, and two experiments that are off), the serving configuration, the measured DSel cost table, the measurements and the
   quality checks (m4sim and attnk exactness runs, T=0 identity, qeval). qeval comes from the earlier
   [GLM-5.3 recipe](https://github.com/knapcio/GLM-5.3-4x-DGX-Spark-TP4).

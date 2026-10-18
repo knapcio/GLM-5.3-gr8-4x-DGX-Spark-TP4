@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Sun, 18 Oct 2026 19:46:29 +0200
+Subject: [PATCH 38/39] L2PF: report a range dropped by a full queue instead of
+ dropping it silently
+
+---
+ engine/kernels/l2pf.cuh | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/engine/kernels/l2pf.cuh b/engine/kernels/l2pf.cuh
+index d442ae6..dc1cbdf 100644
+--- a/engine/kernels/l2pf.cuh
++++ b/engine/kernels/l2pf.cuh
+@@ -221,8 +221,9 @@ inline Queue queue(const Plan& P, unsigned tmask)
+     {
+         q.from[t] = c;
+         if (!(tmask >> t & 1)) continue;
+-        for (int k = 0; k < 4 && P.n[t][k] && q.count < MAXR; ++k)
++        for (int k = 0; k < 4 && P.n[t][k]; ++k)
+         {
++            if (q.count == MAXR) { fprintf(stderr, "l2pf: queue full (%d ranges), target %d range %d dropped\n", MAXR, t, k); break; }
+             const uintptr_t b = reinterpret_cast<uintptr_t>(P.p[t][k]), lo = (b + 15) & ~static_cast<uintptr_t>(15),
+                             hi = (b + P.n[t][k]) & ~static_cast<uintptr_t>(15);
+             if (hi <= lo) continue;

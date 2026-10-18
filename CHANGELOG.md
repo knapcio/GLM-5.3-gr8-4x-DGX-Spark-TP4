@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.8 — 2026-10-19
+
+v0.7 plus six patches, thirty-nine in all, and one step in the serving procedure. Upstream base (`6448a16`) unchanged;
+patches 0001–0033 differ only in the series count of their subject lines.
+
+- kv_b as the release's block FP8 (0034–0036, `G6_KVB=fp8`): upstream's open PR
+  [#98](https://github.com/kindlingai/gr8/pull/98) by spectra-kindling, its three commits as published. The attention's
+  UK / UV weights are read as E4M3 with one f32 scale per 128 × 128 block instead of the BF16 copy the loader makes
+  (half the bytes every decode step); each weight is rounded to the same BF16 value the BF16 loader stores, so the
+  products are the same. One conflict with 0015 resolved here: 0015's ABS2 / VP2 widths read FP8 too.
+- 0023's L2 prefetch reads kv_b at its stored width under `G6_KVB=fp8` (0037; E4M3 bytes plus the block scales;
+  queue ranges 16 → 20) and reports a range dropped by a full queue instead of dropping it silently (0038).
+- `kvb8_test` covers 0015's widths, alone and under QT (0039).
+- Serving procedure: compact the host memory on every box before each start
+  (`sudo sh -c 'sync; echo 1 > /proc/sys/vm/compact_memory'`). No setting changes; GB10's GPU allocates from host
+  memory, and on a fragmented box it gets small physical pages.
+- `docker/env.example`: `G6ENV_X` gains `G6_KVB=fp8`; image tag `gr8-glm53-recipe:v0.8`.
+
+Exactness: `kvb8_test` 155/155 byte-identical (decode and prefill, every absorb / value-projection variant, under QT);
+identical T=0 output on seven fresh boots of the cluster; KL vs the dh32f configuration 2.734e-03, the same as v0.7;
+sampled qeval 573/600 and T=0 qeval 72/75 on each of the three full runs.
+
+Where the gain comes from (RigMark prose c1, all from fresh, compacted boots on 2026-10-18/19): v0.7 38.3 as released
+(no compaction) → v0.7 39.4 with compaction (+2.9 %) → v0.8 40.6 (+3.0 % from 0034–0038). The interleaved A/B of
+the FP8 kv_b alone (`bench/decset.py`, three fresh-boot pairs, same image) gave prose +2.3 %, code +1.8 %, structured
++1.9 %, 3 of 3 pairs in every class.
+
+Measured (medians of three full runs, 2026-10-18/19): RigMark prose 40.6 / code 61.2 / structured 73.4 (v0.7 38.3 /
+58.4 / 70.2); concurrency C1 48.2 / C2 61.7 / C4 76.2 aggregate (v0.7 46.4 / 58.8 / 73.5); prefill after a warm-up
+8K 1341 / 32K 1362 / 64K 1308 / 128K 1205 (v0.7 1371 / 1368 / 1317 / 1202; within the boot-to-boot spread).
+`bench/conc.py` medians of three boots in [docs/history.md](docs/history.md).
+
 ## v0.7 — 2026-10-18
 
 v0.6 plus three patches, thirty-three in all. Upstream base (`6448a16`) unchanged; patches 0001–0030 differ only in the

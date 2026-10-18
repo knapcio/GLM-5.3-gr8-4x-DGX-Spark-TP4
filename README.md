@@ -1,8 +1,8 @@
 # Full GLM-5.3 on 4× NVIDIA DGX Spark with gr8 (TP4)
 
 A recipe for serving full [GLM-5.3](https://huggingface.co/zai-org/GLM-5.3) on four DGX Sparks with tensor parallelism
-4, using the [gr8](https://github.com/kindlingai/gr8) engine by kindlingai at a pinned upstream commit, plus thirty-three
-small patches. The weights are kindlingai's EXLR8 quantization
+4, using the [gr8](https://github.com/kindlingai/gr8) engine by kindlingai at a pinned upstream commit, plus thirty-nine
+small patches (three of them are upstream's own open PR [#98](https://github.com/kindlingai/gr8/pull/98), backported). The weights are kindlingai's EXLR8 quantization
 [kindlingai/glm-5.3-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4) (width manifest `home`),
 with GLM-5.3's own MTP layer and the [incoai/GLM-5.3-DFlash2](https://huggingface.co/incoai/GLM-5.3-DFlash2) drafter.
 
@@ -13,22 +13,24 @@ to off, so the patched engine behaves as upstream until `G6ENV_X` turns the leve
 MTU fix (0001, always on), the launcher's share-limit rule (0027, part of the launcher), the K-stop cap (0030,
 active wherever the K-stop is on), the S2 drafter-shape fixes (0032, always on but invisible to the B=8 drafter:
 they only add capture shapes and row headroom), and 0033, which turns SELX prefill selection on by default from
-53248-token contexts; 0028 changes the buckets only when `SHARE_LIMIT` is set.
+53248-token contexts; 0028 changes the buckets only when `SHARE_LIMIT` is set. The serving setup also compacts the
+host memory on every box before each start ([Build and run](#build-and-run), step 5).
 
-Release **v0.7**, 2026-10-18. The tables below are this release's measurements. What changed in each release, and by
+Release **v0.8**, 2026-10-19. The tables below are this release's measurements. What changed in each release, and by
 how much, is in [CHANGELOG.md](CHANGELOG.md); A/B measurements against earlier releases and the upstream baseline are
 in [docs/history.md](docs/history.md).
 
 ## RigMark — thinking on, effort low
 
-Measured 2026-10-18 on the v0.7 configuration with [RigMark](https://github.com/alexellis/rigmark) 1.0.0 (settings in
+Measured 2026-10-18/19 on the v0.8 configuration with [RigMark](https://github.com/alexellis/rigmark) 1.0.0 (settings in
 [Reproducing](#reproducing)), temperature 0, `reasoning_effort: low` (the model's chat template has no thinking-off
-mode). Each cell is RigMark's median for that workload; the v0.7 numbers are from one full run (c1 decode, prefill and
-concurrency together).
+mode). Each cell is RigMark's median for that workload; the v0.8 decode and concurrency numbers are the medians of three
+full runs, each from a fresh boot with the host memory compacted first. The three runs agree within 0.4 tok/s on c1
+decode.
 
 | c1 decode | prose | code | structured |
 |---|---:|---:|---:|
-| tok/s | 38.3 | 58.4 | 70.2 |
+| tok/s | 40.6 | 61.2 | 73.4 |
 
 Concurrency, aggregate end-to-end tok/s **[per-stream decode tok/s]**. At c ≥ 2 the sessions share verify steps and
 draft with MTP (the DFlash2 drafter serves a session that is alone), so code and structured, where DFlash2 drafts long
@@ -36,13 +38,14 @@ blocks, gain less from concurrency than prose.
 
 | Concurrency | C1 | C2 | C4 |
 |---|---:|---:|---:|
-| aggregate [per-stream] | 46.4 [51.4] | 58.8 [33.3] | 73.5 [22.7] |
+| aggregate [per-stream] | 48.2 [54.0] | 61.7 [35.5] | 76.2 [23.0] |
 
-Cold prefill, input tok/s (unique prompts, no prefix reuse). A 96K-token needle prompt: correct answer.
+Cold prefill, input tok/s (unique prompts, no prefix reuse; one boot, after a warm-up prefill). A 96K-token needle
+prompt: correct answer.
 
 | Prompt length | 8K | 32K | 64K | 128K |
 |---|---:|---:|---:|---:|
-| cold prefill tok/s | 1371 | 1368 | 1317 | 1202 |
+| cold prefill tok/s | 1341 | 1362 | 1308 | 1205 |
 
 The decode table by prompt type and concurrency from [`bench/conc.py`](bench/conc.py) and every release's results are
 in [docs/history.md](docs/history.md).
@@ -88,6 +91,10 @@ is in [docs/history.md](docs/history.md#multi-turn-prefix-cache-hits).
 | 0031 | S2 per-session MTP confidence stop for shared rounds (KStopB): the shared chain still drafts K drafts; each session verifies its own, usually smaller, count of them — the most j with the running product of draft probabilities past the per-position thresholds. Thresholds are per active session count (`G6_MTP_KSTOPB_TAU_S<n>`, frozen values measured 2026-10-17); `G6_MTP_LPLOG=1` logs every shared round's verification and timing. Extra boot cost: additional main widths captured (~115 MiB per extra width per rank) | `G6_MTP_KSTOPB=1` `G6_MTP_LPLOG=1` `G6_MTP_KSTOPB_TAU_S1..S4` | drafting | knapcio |
 | 0032 | S2 drafter-shape fixes for B=12 drafters (measured with the AlayaNeW DFlash2 drafter): boot captures every DFlash2 first-form row count (1..dfl_k+1, not just the prompt chunk), the per-step row budget includes the verify width, and the acceptance histogram ceiling is widened to 16 entries, past anything a 12-block round can produce. With the B=8 drafter this changes nothing observable: the shapes were already covered by the prompt chunk | always on (no flag) | bit-exact for the B=8 drafter | knapcio; AlayaNeW drafter MIT |
 | 0033 | Prefill index-tile selection (SELX) turns on by default from 53248-token contexts (was env-only, default off). `G6_PF_SELX_CTX` still overrides; values 32769..1048576 | default on (set `G6_PF_SELX_CTX` to override) | prefill (kernel selection; below the threshold identical to the flag off) | knapcio |
+| 0034–0036 | kv_b (the attention's UK / UV absorb and value-projection weights) read as the release's own block FP8 (E4M3 + one f32 scale per 128 × 128 block) instead of the BF16 copy the loader makes: half the bytes on every decode step. The kernels take FP8 as a template parameter and round each weight to the same BF16 value the BF16 loader stores, so the products are the same. Upstream's open PR [#98](https://github.com/kindlingai/gr8/pull/98), its three commits as published; one conflict with 0015 resolved here (0015's ABS2 / VP2 widths also read FP8) | `G6_KVB=fp8` | bit-exact | spectra-kindling ([#98](https://github.com/kindlingai/gr8/pull/98)) |
+| 0037 | 0023's L2 prefetch reads kv_b at its stored width under `G6_KVB=fp8` (the E4M3 bytes plus the f32 block scales, not BF16-sized ranges); prefetch queue ranges 16 → 20 so the scales do not push the router or shared-expert ranges out | with `G6_L2PF` and `G6_KVB=fp8` | prefetch only (no arithmetic) | knapcio |
+| 0038 | 0023's L2 prefetch reports a range dropped by a full queue instead of dropping it silently | with `G6_L2PF` | prefetch only | knapcio |
+| 0039 | `kvb8_test` (from #98) also covers 0015's ABS2 widths 1/2/4/8 and VP2 widths 1/2/4, alone and under QT: FP8 output = BF16 output, byte for byte | — (test) | test only | knapcio |
 
 The measured contribution of each lever is in [docs/history.md](docs/history.md#per-lever-contributions).
 
@@ -118,9 +125,10 @@ not guaranteed byte-identical to upstream over long generations.
 
 | Check | Result |
 |---|---|
-| T=0 identity / KL | v0.7, top-20 logprobs on the 75 qeval prompts vs the dh32f configuration, prefix-cached pass: mean KL 2.734e-03 on the 3,590 common positions, the same value as v0.6 measured the same way (details in [docs/history.md](docs/history.md)) |
-| Sampled qeval | 573/600 (T=1.0, top_p 0.95, 8 seeds × 75 tasks, rejection sampling: `SPEC_ACCEPT=rejection`; the dh32f reference scored 578/600, ~1 standard error apart) |
-| T=0 qeval | 72/75, single run (74/75 on the first full run; 71–74 across the release's boots) |
+| T=0 identity / KL | v0.8, top-20 logprobs on the 75 qeval prompts vs the dh32f configuration, prefix-cached pass: mean KL 2.734e-03 on the 3,590 common positions, the same value as v0.7 and v0.6 measured the same way; the T=0 identity probe gives the same output as v0.7 on every v0.8 boot (details in [docs/history.md](docs/history.md)) |
+| kv_b FP8 exactness (`G6_KVB=fp8`, 0034–0039) | `kvb8_test` on one GB10: 155/155 decode and prefill cases byte-identical to the BF16 form of the same weights (every absorb / value-projection variant, incl. 0015's widths, alone and under QT); identical T=0 output on the four-box cluster on seven fresh boots |
+| Sampled qeval | 573/600, each of the three v0.8 runs (T=1.0, top_p 0.95, 8 seeds × 75 tasks, rejection sampling: `SPEC_ACCEPT=rejection`; the dh32f reference scored 578/600, ~1 standard error apart) |
+| T=0 qeval | 72/75 on each of the three v0.8 runs |
 | Needle | 96K-token needle: correct answer |
 | GEMV split exactness, m4sim | every combination of `G6_QA_SPLIT` / `G6_IDXQ_SPLIT` / `G6_MTP_SPLIT` byte-identical to flags off on the plain, graph, MTP, S2 and CP paths: 30/30 |
 | Attention exactness, attnk bench (rounds 1 and 2, serving flags) | byte-identical to stock at T 2K / 8K / 32K × M 1 / 3 / 8 / 12 |
@@ -258,7 +266,7 @@ gr8 expects, and about 90 GB of disk per box for its part of the model.
    engine and places it in the pinned upstream image:
 
    ```bash
-   docker buildx build --platform linux/arm64 -t gr8-glm53-recipe:v0.7 --load .
+   docker buildx build --platform linux/arm64 -t gr8-glm53-recipe:v0.8 --load .
    ```
 
    Use the same image on all four boxes (build it on each, or `docker save` / `docker load`).
@@ -290,11 +298,17 @@ gr8 expects, and about 90 GB of disk per box for its part of the model.
 5. **Before starting, restrict the network.** The container uses host networking and the head's OpenAI-compatible
    front end listens on `0.0.0.0:8100` with no authentication. Run it only on a trusted network, firewall port 8100
    (and the cluster's control ports) to the machines that need it, and use Tailscale or a VPN for remote access.
-   Never forward these ports on a public router. Then start:
+   Never forward these ports on a public router. Then, on every box, compact the host memory and start:
 
    ```bash
+   sudo sh -c 'sync; echo 1 > /proc/sys/vm/compact_memory'
    docker compose -f gr8/docker/compose.yaml up -d
    ```
+
+   Compaction is a one-shot request to the kernel (no setting changes, no cache dropped). GB10's GPU allocates from
+   host memory, and on a fragmented box its allocations get small physical pages; RigMark prose c1 measured 38.3 tok/s
+   on v0.7 as previously served and 39.4 with compaction before the boot (same release, same day; see
+   [docs/history.md](docs/history.md#v08-compaction-and-kv_b-fp8)). Repeat it before every restart of the engine.
 
 The head (first address in `PEERS`) serves the API. `scripts/apply.sh DIR` on its own produces the patched source tree
 for reading or for a bare-metal build; `scripts/make-patches.sh` documents how `patches/` was made.

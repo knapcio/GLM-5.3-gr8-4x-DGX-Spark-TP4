@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Fri, 16 Oct 2026 15:17:21 +0200
-Subject: [PATCH 30/30] S2 K-stop: verify at most kmax drafts (a session
+Subject: [PATCH 30/39] S2 K-stop: verify at most kmax drafts (a session
  G6_DFL_REUSE promoted keeps the shared chain's K)
 
 ---

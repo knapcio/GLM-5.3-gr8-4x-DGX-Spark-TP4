@@ -7,7 +7,7 @@ set -euo pipefail
 
 GR8_URL=${GR8_URL:-https://github.com/kindlingai/gr8}
 GR8_COMMIT=6448a16661abd81e9540bc073b3cfa92d7234565      # upstream main, 2026-10-14
-EXPECTED_TREE=be4496db2ea043cbea7dc5a0acb49e084784dccf   # git tree id after the 33 patches; differs from the built tree (bec488b62de9ec852dbf2a49eda566f4ef9005b3, branch v07) only in 4 test/tool files where upstream main drifted past the pin (engine/attn/tests/attnk.cu, engine/kernels/tests/k1_audit.cu, engine/runtime/s2/tests/batch_dselmodel_test.cpp, tools/s2_dsel_table.py) - no runtime files differ
+EXPECTED_TREE=37f4c95b2a32faba04e03b8017c508e5d7484c44   # git tree id after the 39 patches (branch recipe-v0.8); the serving engine is built from this tree minus patch 0039 (a test only)
 
 here=$(cd "$(dirname "$0")/.." && pwd)
 dir=${1:-gr8}

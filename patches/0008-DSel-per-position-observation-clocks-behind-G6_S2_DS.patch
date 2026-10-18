@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Thu, 15 Oct 2026 08:16:05 +0200
-Subject: [PATCH 08/30] DSel: per-position observation clocks behind
+Subject: [PATCH 08/39] DSel: per-position observation clocks behind
  G6_S2_DSEL_POSCLK=1
 
 A round decays only the positions it observes (1..min(k, a+1)), so DFlash2

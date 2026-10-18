@@ -25,6 +25,9 @@ prose 36.2 / 49.3 / 63.3, code 46.3 / 59.2 / 75.5, structured 70.6 / 65.7 / 85.0
 
 | Release | Prompt type | c1 | c2 | c4 |
 |---|---|---:|---:|---:|
+| v0.8 (median of three boots, compacted memory) | prose | 39.0 [40.1] | 57.3 [30.9] | 75.1 [20.9] |
+| v0.8 (median of three boots, compacted memory) | code | 50.9 [52.2] | 68.4 [36.9] | 85.8 [24.2] |
+| v0.8 (median of three boots, compacted memory) | structured | 77.8 [80.8] | 71.6 [39.0] | 92.1 [27.1] |
 | v0.7 (median of three boots) | prose | 37.4 [38.5] | 54.8 [29.6] | 72.2 [20.1] |
 | v0.7 (median of three boots) | code | 48.9 [50.1] | 65.3 [35.2] | 82.7 [23.3] |
 | v0.7 (median of three boots) | structured | 74.8 [77.7] | 68.2 [37.1] | 88.8 [26.0] |
@@ -43,6 +46,34 @@ prose 36.2 / 49.3 / 63.3, code 46.3 / 59.2 / 75.5, structured 70.6 / 65.7 / 85.0
 | v0.2 (2026-10-15) | prose | 34.9 [35.8] | 48.9 [25.9] | 62.8 [17.6] |
 | v0.2 (2026-10-15) | code | 43.4 [44.3] | 58.8 [31.2] | 74.8 [21.3] |
 | v0.2 (2026-10-15) | structured | 69.5 [72.0] | 65.2 [35.4] | 84.3 [24.8] |
+
+## v0.8: compaction and kv_b FP8
+
+All runs on 2026-10-18/19, the four boxes power-cycled at 21:40 and the host memory compacted before every later boot
+(`sudo sh -c 'sync; echo 1 > /proc/sys/vm/compact_memory'` on each box).
+
+RigMark full runs (c1 decode; prefill as measured inside the full run, whose 8K cell is the first prefill after the
+boot):
+
+| Run | prose | code | structured | C1 / C2 / C4 aggregate | T=0 qeval | sampled qeval |
+|---|---:|---:|---:|---|---:|---:|
+| v0.7 as released (README, no compaction) | 38.3 | 58.4 | 70.2 | 46.4 / 58.8 / 73.5 | 72/75 | 573/600 |
+| v0.7, compacted boot | 39.4 | 60.0 | 72.0 | 47.4 / 60.6 / 75.0 | 72/75 | 573/600 |
+| v0.8 run 1 (first boot after the power cycle) | 40.6 | 61.4 | 73.6 | 48.9 / 60.2 / 75.6 | 72/75 | 573/600 |
+| v0.8 run 2 | 40.6 | 61.2 | 73.2 | 48.2 / 62.1 / 76.2 | 72/75 | 573/600 |
+| v0.8 run 3 | 40.5 | 61.0 | 73.4 | 48.2 / 61.7 / 76.5 | 72/75 | 573/600 |
+
+The FP8 kv_b alone, interleaved fresh-boot pairs on one image (`bench/decset.py`, 24 prompts, c1, T=0; BF16 = the
+same image with `G6_KVB` unset):
+
+| Pair | BF16 prose / code / structured | FP8 prose / code / structured |
+|---|---|---|
+| 1 | 42.72 / 55.52 / 59.79 | 43.72 / 56.44 / 60.88 |
+| 2 | 42.73 / 55.46 / 59.76 | 43.42 / 56.56 / 60.78 |
+| 3 | 42.46 / 55.57 / 59.55 | 43.71 / 56.56 / 60.83 |
+
+`kvb8_test --bench` on one GB10 (cold L2): absorb + value projection per layer at M=3 91.6 → 76.2 µs upstream's
+figure; here, on the recipe's QT path, absorb_m2 31.5 → 27.4 µs and value_project_m 54.0 → 41.7 µs.
 
 ## Decode over 24 prompts: v0.4 vs v0.3
 

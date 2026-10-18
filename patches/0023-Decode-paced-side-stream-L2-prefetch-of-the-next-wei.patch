@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Fri, 16 Oct 2026 08:03:02 +0200
-Subject: [PATCH 23/30] Decode: paced side-stream L2 prefetch of the next
+Subject: [PATCH 23/39] Decode: paced side-stream L2 prefetch of the next
  weights in the step's idle-DRAM windows (G6_L2PF)
 
 The decode step leaves DRAM idle in its collective waits (the two all-reduces, the

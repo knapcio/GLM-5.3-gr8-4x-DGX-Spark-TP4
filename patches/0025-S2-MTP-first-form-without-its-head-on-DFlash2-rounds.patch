@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Fri, 16 Oct 2026 04:42:40 +0200
-Subject: [PATCH 25/30] S2: MTP first form without its head on DFlash2 rounds
+Subject: [PATCH 25/39] S2: MTP first form without its head on DFlash2 rounds
  that stay on DFlash2 behind G6_MTP_HEAD_SKIP=P
 
 A solo DFlash2 round whose next round drafts with DFlash2 again (no switch, probe, warm-up or insert) runs the MTP

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Fri, 16 Oct 2026 04:33:44 +0200
-Subject: [PATCH 29/30] CP decode: the remote head groups as one attention call
+Subject: [PATCH 29/39] CP decode: the remote head groups as one attention call
  behind G6_CP_ONECHAIN=1
 
 Past R each rank runs the other ranks' head groups over its own keys: today one k_vget, cp_group (scores, cp_softmax,

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Fri, 16 Oct 2026 10:08:15 +0200
-Subject: [PATCH 26/30] K1: split table G6_K1_SPLIT (exact), translation
+Subject: [PATCH 26/39] K1: split table G6_K1_SPLIT (exact), translation
  prefetch G6_K1_TLBW, VMM weight image G6_IMG_VMM; k1_audit
  --tab/--alloc/--hold/--window/--tlb
 

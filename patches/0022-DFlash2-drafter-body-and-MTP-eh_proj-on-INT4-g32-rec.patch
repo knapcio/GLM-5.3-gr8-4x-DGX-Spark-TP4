@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Thu, 15 Oct 2026 21:31:19 +0200
-Subject: [PATCH 22/30] DFlash2 drafter body and MTP eh_proj on INT4 g32
+Subject: [PATCH 22/39] DFlash2 drafter body and MTP eh_proj on INT4 g32
  records behind G6_DFL_BODY_I4 / G6_MTP_EHPROJ_I4
 
 The drafter's body GEMVs (fc, per layer kv / aconv / q / o / mconv / gu / down) and the MTP draft's eh_proj

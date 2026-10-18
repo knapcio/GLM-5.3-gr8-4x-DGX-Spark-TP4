@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Thu, 15 Oct 2026 03:46:44 +0200
-Subject: [PATCH 05/30] DFlash2 drafter head on the INT4 records behind
+Subject: [PATCH 05/39] DFlash2 drafter head on the INT4 records behind
  G6_DFL_HEAD_I4
 
 G6_DFL_HEAD_I4=1 (default 0, needs --dflash-manifest): the DFlash2 drafter's
