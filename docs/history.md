@@ -18,12 +18,16 @@ v0.1 was measured with the v0.2 `G6ENV_X` line without `G6_DFL_REUSE=2`. v0.2's 
 
 [`bench/conc.py`](../bench/conc.py): aggregate tok/s **[per-stream tok/s]**, RigMark's prose, code and structured
 prompts, 256 output tokens, temperature 0, `reasoning_effort: low`, medians of three rounds per cell, c identical
-requests sent at once. v0.6, v0.5 and v0.4: median per cell over three boots (v0.6's three boots are within 2 tok/s
-of each other, most cells within 1.3; v0.5's within 0.3). v0.4 was measured against three v0.3 boots, two of each interleaved in one session (v0.3's three-boot medians:
+requests sent at once. v0.7, v0.6, v0.5 and v0.4: median per cell over three boots (v0.7's three boots are within
+0.5 tok/s of each other in every cell; v0.6's three boots are within 2 tok/s of each other, most cells within 1.3;
+v0.5's within 0.3). v0.4 was measured against three v0.3 boots, two of each interleaved in one session (v0.3's three-boot medians:
 prose 36.2 / 49.3 / 63.3, code 46.3 / 59.2 / 75.5, structured 70.6 / 65.7 / 85.0). Earlier rows: one boot per release.
 
 | Release | Prompt type | c1 | c2 | c4 |
 |---|---|---:|---:|---:|
+| v0.7 (median of three boots) | prose | 37.4 [38.5] | 54.8 [29.6] | 72.2 [20.1] |
+| v0.7 (median of three boots) | code | 48.9 [50.1] | 65.3 [35.2] | 82.7 [23.3] |
+| v0.7 (median of three boots) | structured | 74.8 [77.7] | 68.2 [37.1] | 88.8 [26.0] |
 | v0.6 (median of three boots) | prose | 37.3 [38.4] | 51.3 [27.4] | 66.2 [18.5] |
 | v0.6 (median of three boots) | code | 48.8 [50.0] | 61.6 [32.9] | 78.9 [22.4] |
 | v0.6 (median of three boots) | structured | 75.0 [77.9] | 68.3 [37.1] | 88.7 [26.1] |
@@ -73,6 +77,7 @@ the README's Reproducing section. RigMark sends single-turn requests.
 
 | c1 decode | prose | code | structured |
 |---|---:|---:|---:|
+| v0.7, full run (median of three) | 38.3 | 58.4 | 70.2 |
 | v0.6, full run | 38.5 | 58.3 | 70.2 |
 | v0.5, full run | 37.8 | 57.9 | 70.2 |
 | v0.5, run after a warm-up request (no concurrency section) | 38.0 | 59.1 | 70.2 |
@@ -93,6 +98,7 @@ the README's Reproducing section. RigMark sends single-turn requests.
 
 | Prefill, cold, tok/s | 8K | 32K | 64K | 128K |
 |---|---:|---:|---:|---:|
+| v0.7 (median of three full runs) | 1371 | 1368 | 1317 | 1202 |
 | v0.6 (full run) | 1375 | 1381 | 1306 | 1157 |
 | v0.5 (after a warm-up request) | 1359 | 1383 | 1316 | 1154 |
 | v0.5 (full run, first prefill after boot) | 1299 | 1374 | 1306 | 1160 |
@@ -137,6 +143,9 @@ v0.2's `G6_S2_DSEL_MCOST=2.9`, which it replaces.
 | 0028 | off (`SHARE_LIMIT=98304` measured) | long-context decode below (one chain and the ninth bucket); with no limit the buckets, graphs and outputs are unchanged |
 | 0029 | `G6_CP_ONECHAIN=1` | long-context decode (below): 70K / 80K / 90K-token prompts 35.96 / 37.23 / 36.92 vs 34.71 / 36.32 / 36.29 tok/s flags-off (one run each, T=0, same output SHA); a 120K-prompt decode screen 37.0 vs 33.8 tok/s. Short prompts: level |
 | 0030 | (with `G6_MTP_KSTOP=1`) | correctness: a `G6_DFL_REUSE`-promoted session verifies at most `kmax` of the shared chain's drafts; no speed effect measured beyond the K-stop's own |
+| 0031 | `G6_MTP_KSTOPB=1` `G6_MTP_LPLOG=1` `G6_MTP_KSTOPB_TAU_S1..S4` (with 0013's solo stop on) | ABBA, six blocks (2026-10-17, 07:54–19:21, control interleaved with candidate): c2 +1.50 %, c4 +3.70 % (geometric mean over paired blocks; per-block c4 +3.5 to +3.8 %); a held-out combined workload set +2.44 %; short-context decode (c1) unchanged. The shared chain still drafts K drafts; each session verifies its own fewer count, the most j with the running product of draft probabilities past the per-position thresholds. Thresholds frozen per active session count (S1 0.7/0.7, S2 0.7/0.8, S3 0.7/0.88, S4 0.7/0.75); `G6_MTP_LPLOG=1` logs every shared round's verification and timing. Extra boot cost: additional main widths captured (~115 MiB per extra width per rank) |
+| 0032 | always on | correctness only for the recipe's drafter: with the B=8 incoai drafter every captured shape was already covered, outputs unchanged. Built and verified with the AlayaNeW DFlash2 B=12 drafter (MIT), which then lost the A/B (below) and is not shipped; the fixes stay because they make a wider drafter servable at all |
+| 0033 | default on (`G6_PF_SELX_CTX` overrides) | ABBA, four runs (2026-10-17, 19:51–20:37, v0.6 flags-off control interleaved). Caveat: the ABBA's prefill screens ran 8K/32K prompts, below the 53248 threshold, so SELX never activated in them — those runs measure boot-to-boot variance, not a SELX cost (C1 −2.3 %, C4 −2.3 % against a same-code control). The prefill effect shows in the prefill table (median of the release's three full runs): 64K +0.8 %, 128K +3.9 % vs v0.6 (1371/1368/1317/1202 vs 1375/1381/1306/1157 tok/s at 8K–128K; the three runs span 1323–1377 / 1366–1378 / 1316–1324 / 1194–1216, so the 128K gain is the stable one and the short columns sit within boot-to-boot spread). Accepted as the release default by owner decision (long-context prefill-select gain, short contexts unaffected: below 53248 the selection path is identical with the flag off) |
 | — | `SPEC_ACCEPT=rejection` (upstream option) | decset at T=1.0, top_p 0.95 (two runs each): prose +0.2 %, code +2.4 %, structured +6.2 %; T=0 unchanged |
 
 ## Long context: one chain and the ninth bucket (v0.6)
@@ -192,10 +201,30 @@ Mean of the per-turn ratios (`bench/multiturn.py compare`): prefix-hit turns (A2
 - 0014 is a drafting lever: T=0 text on these turns differs between v0.1 and v0.2 (see the exactness classes in the
   README).
 
+## Wider drafters: the AlayaNeW DFlash2 A/B (v0.7)
+
+The recipe's drafter is incoai's DFlash2, which drafts up to B=8 tokens per round. AlayaNeW's
+[GLM-5.3-DFlash2](https://huggingface.co/AlayaNeW/GLM-5.3-DFlash2) (MIT) drafts B=12 with a different draft head
+layout. Patch 0032 makes B=12 drafters servable at all; this A/B measured whether the wider drafter is worth serving.
+
+RigMark c1 decode (medians; the control ran twice, 22:0x and 22:2x, with matching results) and `bench/conc.py` at c4:
+
+| Configuration | prose | code | structured | drafts | draft tok/round | accepted/round | C1 | C2 | C4 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| v0.6 drafter (B=8 incoai) | 35.17 | 56.72 | 70.46 | 5496 | 3.34 | 2.46 | 40.8 | 58.5 | 72.6 |
+| AlayaNeW DFlash2 (B=12) | 18.36 | 44.66 | 71.69 | 4880 | 11.00 | 3.08 | 28.3 | 55.9 | 70.2 |
+
+The Alaya drafter accepts more per round (+25 %) but proposes 3.3× more draft tokens per round (11.0 vs 3.34): the
+verify cost of the wide blocks outweighs the acceptance gain everywhere except structured, where it is level. Per the
+release acceptance rule (win per workload) it loses and is not shipped; the B=8 incoai drafter stays. The S2 fixes
+(0032) remain because they are what makes any wider drafter servable. Measured 2026-10-18 00:16–00:37.
+
 ## Quality checks against earlier configurations
 
 | Check | Result |
 |---|---|
+| T=0 identity / KL, v0.7 | top-20 logprobs on the 75 qeval prompts vs the dh32f reference configuration, prefix-cached pass: 34/75 identical, mean KL 2.734e-03 on the 3,590 common positions (noise scale 5.0e-3, as below; the c1-vs-c4 scale run gave 30/75, KL 4.994e-03). The same value v0.6 measured the same way |
+| Sampled qeval / T=0 qeval / needle, v0.7 | 573/600 sampled with `SPEC_ACCEPT=rejection` (the dh32f reference 578/600, standard error 0.85 pp, ~1 se apart; identical in both full runs); 72/75 T=0 (74/75 on the first full run; 71–74 across the release's boots); 96K needle correct |
 | T=0 identity / KL, v0.6 | top-20 logprobs on the 75 qeval prompts vs the v0.5 configuration, prefix-cached pass: 34/75 identical, mean KL 2.7e-3 on the 3,590 common positions (noise scale 5.0e-3) |
 | Sampled qeval / T=0 qeval / needle, v0.6 | 577/600 sampled with `SPEC_ACCEPT=rejection` (v0.5 577/600; the dh32f reference 578/600, standard error 0.8 pp); 71/75 T=0; 96K needle correct |
 | T=0 identity / KL, v0.5 | the same check, rerun on v0.5: 34/75 identical, mean KL 2.7e-3 on the common prefix (noise scale 5.0e-3) |

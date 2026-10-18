@@ -1,6 +1,6 @@
 # The serving image for this recipe: GB10 (DGX Spark), linux/arm64, CUDA 13, sm_121a, TP=4.
 #
-#   docker buildx build --platform linux/arm64 -t gr8-glm53-recipe:v0.6 --load .
+#   docker buildx build --platform linux/arm64 -t gr8-glm53-recipe:v0.7 --load .
 #
 # It is the measured setup: the published upstream gr8 image, pinned by digest, with its TP=4 engine binary
 # (/opt/gr8/bin/g6m4) replaced by one built from kindlingai/gr8 at the pinned commit plus patches/, and the

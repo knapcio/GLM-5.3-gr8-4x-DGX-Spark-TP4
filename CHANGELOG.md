@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.7 — 2026-10-18
+
+v0.6 plus three patches, thirty-three in all. Upstream base (`6448a16`) unchanged; patches 0001–0030 differ only in the
+series count of their subject lines.
+
+- S2 per-session MTP confidence stop for shared rounds (0031, KStopB): the shared chain still drafts K drafts for the
+  round; 0031 lets each session verify fewer of them than the others (the most j with p_1 * .. * p_j >= tau for every
+  i <= j). Thresholds are set per active session count (`G6_MTP_KSTOPB_TAU_S<n>`, frozen values measured 2026-10-17)
+  and `G6_MTP_LPLOG=1` logs every shared round's verification and timing. Supplied entries replace the defaults in
+  order (the defaults are 0.6 / 0.88 / 0.95 for positions 1–3, so two supplied entries leave position 3 at 0.95); past
+  position 3 there is no stop (tau 0), and the runtime signature carries all seven positions so every rank agrees.
+  Enabling it captures additional main widths at boot (~115 MiB per extra width per rank) — the memory cost rides with
+  the throughput gain. An ABBA A/B (6 blocks, 07:54–19:21) against v0.6 measured c2 +1.50 % and c4 +3.70 % (geometric
+  mean over paired blocks; the C/B isolation runs the same pattern), with no short-context change. Shared rounds
+  verify at most `--mtp` drafts per session (the recipe serves `--mtp 2`), within the seven threshold positions.
+- S2 drafter-shape fixes for block-12 drafters (0032, always on): boot now captures every DFlash2 first-form row count
+  up to the verify width, the per-step row budget includes the verify width, and the acceptance histogram ceiling is
+  widened to 16 entries, past anything a 12-block round can produce. Built and verified with the AlayaNeW/GLM-5.3-DFlash2
+  drafter (MIT): with the recipe's
+  B=8 incoai drafter the shapes were already covered and nothing observable changes. The Alaya drafter itself lost the
+  A/B (decode code −21 %, prose −48 %, C1 −31 % at c1/c4) and is not shipped; the fixes stay because they are what
+  makes a wider drafter servable at all. Note the scope: actually serving a B=12 drafter also took experimental engine
+  changes (the drafter binary, the v2 pack format) that this recipe deliberately does not ship — 0032 only removes the
+  S2-side ceilings so the engine can host such a drafter.
+- SELX prefill selection on by default (0033): `G6_PF_SELX_CTX` now defaults to 53248 (was env-only, default off).
+  Below 53248 tokens the selection path is identical with the flag off, so short contexts are unaffected; the ABBA
+  measured against v0.6 (4 runs) ran its prefill screens below the threshold, so its C1/C4 spread (−2.3 %) is
+  boot-to-boot variance, not a SELX cost. The final-image prefill table shows the select effect: 64K +0.8 %, 128K
+  +5.1 % vs v0.6 (an earlier full run on the same owner decision showed 64K +1.4 %, 128K +3.9 % — boot-to-boot spread
+  on the same lever). Accepted as the release default by owner decision, with the numbers in
+  [docs/history.md](docs/history.md).
+- `docker/env.example`: `G6ENV_X` gains the KStopB flags; image tag `gr8-glm53-recipe:v0.7`.
+
+Measured against v0.6 on the same machines (medians of the release's three fullq runs, 2026-10-18): RigMark full run
+prose 38.3 / code 58.4 / structured 70.2 (v0.6 38.5 / 58.3 / 70.2), concurrency C1 46.4 / C2 58.8 / C4 73.5 aggregate
+(v0.6 46.3 / 56.7 / 73.3), prefill 8K 1371 / 32K 1368 / 64K 1317 / 128K 1202 (v0.6 1375 / 1381 / 1306 / 1157; across
+the three runs prefill spans 1323–1377 / 1366–1378 / 1316–1324 / 1194–1216). The decode table (3 × `conctabx.sh`
+medians) put the c2/c4 lifts where KStopB predicts: code c2 +5.7 %, c4 +4.8 %; prose c2 +6.4 %, c4 +9.1 %; c1 and
+structured level with v0.6 (across the release's full runs structured c1 spans 70.0–74.2). Quality gate: T=0 KL vs the
+dh32f reference 2.734e-03, the same value v0.6 measured the same
+way; sampled qeval 573/600 vs the reference 578/600 (~1 standard error apart, identical in all three full runs); T=0
+qeval 72/75; 96K needle correct.
+
 ## v0.6 — 2026-10-16
 
 v0.5 plus four patches, thirty in all. Upstream base (`6448a16`) unchanged; patches 0001–0026 differ only in the series

@@ -1,32 +1,34 @@
 # Full GLM-5.3 on 4× NVIDIA DGX Spark with gr8 (TP4)
 
 A recipe for serving full [GLM-5.3](https://huggingface.co/zai-org/GLM-5.3) on four DGX Sparks with tensor parallelism
-4, using the [gr8](https://github.com/kindlingai/gr8) engine by kindlingai at a pinned upstream commit, plus thirty
+4, using the [gr8](https://github.com/kindlingai/gr8) engine by kindlingai at a pinned upstream commit, plus thirty-three
 small patches. The weights are kindlingai's EXLR8 quantization
 [kindlingai/glm-5.3-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4) (width manifest `home`),
 with GLM-5.3's own MTP layer and the [incoai/GLM-5.3-DFlash2](https://huggingface.co/incoai/GLM-5.3-DFlash2) drafter.
 
 This repository holds only the patches, the build, an example configuration and the results. It contains no engine
 fork, no weights and no images: the engine comes from upstream at `6448a16`, the weights from Hugging Face, the base
-image from upstream's registry. Every patch except the fabric MTU fix (0001, always on) is behind a flag that defaults
+image from upstream's registry. Every patch except the fabric MTU fix (0001) is behind a flag that defaults
 to off, so the patched engine behaves as upstream until `G6ENV_X` turns the levers on. The exceptions are the fabric
-MTU fix (0001, always on), the launcher's share-limit rule (0027, part of the launcher), and the K-stop cap (0030,
-active wherever the K-stop is on); 0028 changes the buckets only when `SHARE_LIMIT` is set.
+MTU fix (0001, always on), the launcher's share-limit rule (0027, part of the launcher), the K-stop cap (0030,
+active wherever the K-stop is on), the S2 drafter-shape fixes (0032, always on but invisible to the B=8 drafter:
+they only add capture shapes and row headroom), and 0033, which turns SELX prefill selection on by default from
+53248-token contexts; 0028 changes the buckets only when `SHARE_LIMIT` is set.
 
-Release **v0.6**, 2026-10-16. The tables below are this release's measurements. What changed in each release, and by
+Release **v0.7**, 2026-10-18. The tables below are this release's measurements. What changed in each release, and by
 how much, is in [CHANGELOG.md](CHANGELOG.md); A/B measurements against earlier releases and the upstream baseline are
 in [docs/history.md](docs/history.md).
 
 ## RigMark — thinking on, effort low
 
-Measured 2026-10-16 on the v0.6 configuration with [RigMark](https://github.com/alexellis/rigmark) 1.0.0 (settings in
+Measured 2026-10-18 on the v0.7 configuration with [RigMark](https://github.com/alexellis/rigmark) 1.0.0 (settings in
 [Reproducing](#reproducing)), temperature 0, `reasoning_effort: low` (the model's chat template has no thinking-off
-mode). Each cell is RigMark's median for that workload; the v0.6 numbers are from one full run (c1 decode, prefill and
+mode). Each cell is RigMark's median for that workload; the v0.7 numbers are from one full run (c1 decode, prefill and
 concurrency together).
 
 | c1 decode | prose | code | structured |
 |---|---:|---:|---:|
-| tok/s | 38.5 | 58.3 | 70.2 |
+| tok/s | 38.3 | 58.4 | 70.2 |
 
 Concurrency, aggregate end-to-end tok/s **[per-stream decode tok/s]**. At c ≥ 2 the sessions share verify steps and
 draft with MTP (the DFlash2 drafter serves a session that is alone), so code and structured, where DFlash2 drafts long
@@ -34,13 +36,13 @@ blocks, gain less from concurrency than prose.
 
 | Concurrency | C1 | C2 | C4 |
 |---|---:|---:|---:|
-| aggregate [per-stream] | 46.3 [51.7] | 56.7 [33.0] | 73.3 [22.3] |
+| aggregate [per-stream] | 46.4 [51.4] | 58.8 [33.3] | 73.5 [22.7] |
 
 Cold prefill, input tok/s (unique prompts, no prefix reuse). A 96K-token needle prompt: correct answer.
 
 | Prompt length | 8K | 32K | 64K | 128K |
 |---|---:|---:|---:|---:|
-| cold prefill tok/s | 1375 | 1381 | 1306 | 1157 |
+| cold prefill tok/s | 1371 | 1368 | 1317 | 1202 |
 
 The decode table by prompt type and concurrency from [`bench/conc.py`](bench/conc.py) and every release's results are
 in [docs/history.md](docs/history.md).
@@ -83,6 +85,9 @@ is in [docs/history.md](docs/history.md#multi-turn-prefix-cache-hits).
 | 0028 | Decode buckets: nine slots instead of eight, so a share limit off the power-of-two doublings (98304) no longer merges the 2048 bucket away and short-context steps keep their own graph. With no limit, or a power-of-two limit, the bucket list, the graphs and the outputs are those of before | off (`SHARE_LIMIT=…` when wanted) | bit-exact with the defaults; a ninth-bucket configuration regroups verify rows and can change T=0 output | knapcio |
 | 0029 | CP decode: past R, the other ranks' head groups run as one 48-head attention call (one `k_vget`, one call whose merge writes each group's partial, the three puts in the S1 order) instead of three separate chains: 8 launches a layer instead of 18. TP=4 only, and not with `G6_ATTN_FLIP` | `G6_CP_ONECHAIN=1` | bit-exact | knapcio |
 | 0030 | S2 K-stop: a session that `G6_DFL_REUSE` promoted keeps the shared chain's K drafts; at most `kmax` of them are verified (the confidence stop's `tau` has `kmax` + 1 entries). No new flag: it tightens 0013 wherever the K-stop is on | (with `G6_MTP_KSTOP=1`) | drafting | knapcio |
+| 0031 | S2 per-session MTP confidence stop for shared rounds (KStopB): the shared chain still drafts K drafts; each session verifies its own, usually smaller, count of them — the most j with the running product of draft probabilities past the per-position thresholds. Thresholds are per active session count (`G6_MTP_KSTOPB_TAU_S<n>`, frozen values measured 2026-10-17); `G6_MTP_LPLOG=1` logs every shared round's verification and timing. Extra boot cost: additional main widths captured (~115 MiB per extra width per rank) | `G6_MTP_KSTOPB=1` `G6_MTP_LPLOG=1` `G6_MTP_KSTOPB_TAU_S1..S4` | drafting | knapcio |
+| 0032 | S2 drafter-shape fixes for B=12 drafters (measured with the AlayaNeW DFlash2 drafter): boot captures every DFlash2 first-form row count (1..dfl_k+1, not just the prompt chunk), the per-step row budget includes the verify width, and the acceptance histogram ceiling is widened to 16 entries, past anything a 12-block round can produce. With the B=8 drafter this changes nothing observable: the shapes were already covered by the prompt chunk | always on (no flag) | bit-exact for the B=8 drafter | knapcio; AlayaNeW drafter MIT |
+| 0033 | Prefill index-tile selection (SELX) turns on by default from 53248-token contexts (was env-only, default off). `G6_PF_SELX_CTX` still overrides; values 32769..1048576 | default on (set `G6_PF_SELX_CTX` to override) | prefill (kernel selection; below the threshold identical to the flag off) | knapcio |
 
 The measured contribution of each lever is in [docs/history.md](docs/history.md#per-lever-contributions).
 
@@ -113,9 +118,9 @@ not guaranteed byte-identical to upstream over long generations.
 
 | Check | Result |
 |---|---|
-| T=0 identity / KL | v0.6, top-20 logprobs on the 75 qeval prompts vs the v0.5 configuration, prefix-cached pass: mean KL 2.7e-3 on the 3,590 common positions, below the batching-noise scale (details in [docs/history.md](docs/history.md)) |
-| Sampled qeval | 577/600 (T=1.0, top_p 0.95, 8 seeds × 75 tasks, rejection sampling: `SPEC_ACCEPT=rejection`) |
-| T=0 qeval | 71/75, single run |
+| T=0 identity / KL | v0.7, top-20 logprobs on the 75 qeval prompts vs the dh32f configuration, prefix-cached pass: mean KL 2.734e-03 on the 3,590 common positions, the same value as v0.6 measured the same way (details in [docs/history.md](docs/history.md)) |
+| Sampled qeval | 573/600 (T=1.0, top_p 0.95, 8 seeds × 75 tasks, rejection sampling: `SPEC_ACCEPT=rejection`; the dh32f reference scored 578/600, ~1 standard error apart) |
+| T=0 qeval | 72/75, single run (74/75 on the first full run; 71–74 across the release's boots) |
 | Needle | 96K-token needle: correct answer |
 | GEMV split exactness, m4sim | every combination of `G6_QA_SPLIT` / `G6_IDXQ_SPLIT` / `G6_MTP_SPLIT` byte-identical to flags off on the plain, graph, MTP, S2 and CP paths: 30/30 |
 | Attention exactness, attnk bench (rounds 1 and 2, serving flags) | byte-identical to stock at T 2K / 8K / 32K × M 1 / 3 / 8 / 12 |
@@ -136,7 +141,7 @@ and KL checks against earlier configurations are in [docs/history.md](docs/histo
 - **Engine flags** (serving): `G6ENV_X` and `SPEC_ACCEPT` in [docker/env.example](docker/env.example), the same lines on every box:
 
   ```bash
-  G6ENV_X="G6_QA_SPLIT=1 G6_IDXQ_SPLIT=1 G6_MTP_SPLIT=1 G6_DRAFT_HEAD_I4=1 G6_DFL_HEAD_I4=1 G6_S2_DSEL_PROBE=32 G6_ROUTE_OVL=1 G6_ATTN_SC2=4 G6_ATTN_SC2_TR=2 G6_ATTN_CTX2=4 G6_ATTN_CTX3=2 G6_ATTN_SEL2=16 G6_IDX_GRP=16 G6_MTP_KSTOP=1 G6_MTP_KSTOP_KMAX=3 G6_MTP_KSTOP_TAU=0,0.5,0.75 G6_DFL_REUSE=2 G6_ATTN_QT=1 G6_ATTN_FRONT=1 G6_DRAFT_PAR=1 G6_S2_DSEL_MODEL=1 G6_S2_DSEL_TABLE=v2:46.63,v3:54.71,v4:63.99,v5:71.54,v6:79.37,v7:88.23,v8:96.82,d:7.285,m:2.039,e:1.155,p:5.026,g:1.107,k:2.177,n:2.486,w:1,r:0.95 G6_DFL_BODY_I4=1 G6_L2PF=15 G6_K1_SPLIT=1:/4,3:2x1,4-32:/4 G6_K1_TLBW=2048 G6_CP_ONECHAIN=1"
+  G6ENV_X="G6_QA_SPLIT=1 G6_IDXQ_SPLIT=1 G6_MTP_SPLIT=1 G6_DRAFT_HEAD_I4=1 G6_DFL_HEAD_I4=1 G6_S2_DSEL_PROBE=32 G6_ROUTE_OVL=1 G6_ATTN_SC2=4 G6_ATTN_SC2_TR=2 G6_ATTN_CTX2=4 G6_ATTN_CTX3=2 G6_ATTN_SEL2=16 G6_IDX_GRP=16 G6_MTP_KSTOP=1 G6_MTP_KSTOP_KMAX=3 G6_MTP_KSTOP_TAU=0,0.5,0.75 G6_MTP_KSTOPB=1 G6_MTP_LPLOG=1 G6_MTP_KSTOPB_TAU_S1=0.7,0.7 G6_MTP_KSTOPB_TAU_S2=0.7,0.8 G6_MTP_KSTOPB_TAU_S3=0.7,0.88 G6_MTP_KSTOPB_TAU_S4=0.7,0.75 G6_DFL_REUSE=2 G6_ATTN_QT=1 G6_ATTN_FRONT=1 G6_DRAFT_PAR=1 G6_S2_DSEL_MODEL=1 G6_S2_DSEL_TABLE=v2:46.63,v3:54.71,v4:63.99,v5:71.54,v6:79.37,v7:88.23,v8:96.82,d:7.285,m:2.039,e:1.155,p:5.026,g:1.107,k:2.177,n:2.486,w:1,r:0.95 G6_DFL_BODY_I4=1 G6_L2PF=15 G6_K1_SPLIT=1:/4,3:2x1,4-32:/4 G6_K1_TLBW=2048 G6_CP_ONECHAIN=1"
   SPEC_ACCEPT=rejection
   ```
 
@@ -253,7 +258,7 @@ gr8 expects, and about 90 GB of disk per box for its part of the model.
    engine and places it in the pinned upstream image:
 
    ```bash
-   docker buildx build --platform linux/arm64 -t gr8-glm53-recipe:v0.6 --load .
+   docker buildx build --platform linux/arm64 -t gr8-glm53-recipe:v0.7 --load .
    ```
 
    Use the same image on all four boxes (build it on each, or `docker save` / `docker load`).
