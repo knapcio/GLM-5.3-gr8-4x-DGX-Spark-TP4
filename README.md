@@ -33,24 +33,15 @@ in [docs/history.md](docs/history.md).
 
 [speedbench](https://github.com/knapcio/speedbench) 0.2, full mode: 73 frozen prompts in six categories (prose, code,
 structured, agentic with tools, multilingual, long documents of a few thousand tokens; prompt set speedbench-v1), c1,
-temperature 0, 256 output tokens, `reasoning_effort: low`, each arm from fresh boots with the host memory compacted first (v0.8, v0.9, v0.9, v0.8), the
-change paired per prompt. Decode tok/s, median per category (first run of each arm), change with 95 % confidence
-interval:
+temperature 0, 256 output tokens, `reasoning_effort: low`, from a fresh boot with the host memory compacted first.
+Decode tok/s, geometric mean over the prompts of each category:
 
-| Category | v0.8 | v0.9 | change [95 % CI] |
-|---|---:|---:|---:|
-| prose | 43.6 | 42.9 | +0.5 % [−3.3, +4.5] |
-| code | 53.7 | 54.1 | +1.3 % [−3.9, +6.7] |
-| structured | 55.6 | 57.7 | +3.5 % [+0.1, +7.0] |
-| agentic | 51.3 | 50.0 | −1.0 % [−5.5, +3.7] |
-| multilingual | 43.5 | 45.4 | +2.9 % [−1.0, +7.0] |
-| long context | 45.9 | 48.1 | +0.6 % [−2.1, +3.4] |
-| all 73 prompts | 47.8 | 48.6 | +1.2 % [−1.2, +3.6] |
+| Category | prose | code | structured | agentic | multilingual | long context | all 73 prompts |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| tok/s | 42.9 | 53.4 | 58.2 | 50.3 | 45.4 | 48.9 | 49.4 |
 
-v0.9 is about 1 % faster than v0.8 overall, which is below what this design can resolve (detectable effect at 80 %
-power: 3.5 %). The per-category medians and the paired changes can point in different directions because v0.9's
-POSIDX and two-stage draft head change the generated text: each prompt's speed then also depends on its new text.
-v0.9's main changes are the upstream rebase and the host-memory headroom (`G6_CP_STEP_ROWS`), not speed.
+Median time to first token 175 ms. Paired A/B measurements against earlier releases are in
+[docs/history.md](docs/history.md).
 
 ## RigMark — thinking on, effort low
 
@@ -92,7 +83,7 @@ measured A/B is in [docs/history.md](docs/history.md#multi-turn-prefix-cache-hit
 ## Levers
 
 Rows marked "upstream (#NN)" are levers this recipe contributed that are now part of upstream gr8 at the pinned commit;
-the recipe still serves them with the flags shown. Patch numbers are those of this release; the v0.8 numbering is
+the recipe still serves them with the flags shown. Patch numbers are those of this release; earlier releases' numbering is
 mapped in [CHANGELOG.md](CHANGELOG.md).
 
 | Patch | What it does | Flags (serving) | Exactness | Credit |
@@ -177,13 +168,13 @@ upstream's; engaged, the sessions take turns, which changes which rows share a s
 
 | Check | Result |
 |---|---|
-| T=0 identity / KL | v0.9, top-20 logprobs on the 75 qeval prompts vs the dh32f configuration, prefix-cached pass: 35/75 prompts identical, mean KL 2.830e-03 on the 3,622 common positions (max 0.465), against v0.8's 2.734e-03 measured the same way; for scale, one configuration run at concurrency 1 vs 4 differs by about 5.0e-03 (details in [docs/history.md](docs/history.md)) |
+| T=0 identity / KL | v0.9, top-20 logprobs on the 75 qeval prompts vs the dh32f configuration, prefix-cached pass: 35/75 prompts identical, mean KL 2.830e-03 on the 3,622 common positions (max 0.465); for scale, one configuration run at concurrency 1 vs 4 differs by about 5.0e-03 (details in [docs/history.md](docs/history.md)) |
 | Positional index (`G6_ATTN_POSIDX=1`, E1), attnk bench | deterministic (repeated calls byte-identical); error vs stock within the fp summation reorder; byte-identical to stock past 2048 keys, where it is inert (`attnk_r10a.sh` sweep: every check passed) |
 | Sampled qeval | v0.9 578/600 on each of the three runs (T=1.0, top_p 0.95, 8 seeds × 75 tasks, rejection sampling: `SPEC_ACCEPT=rejection`; the dh32f reference scored 578/600) |
-| T=0 qeval | v0.9 71, 71 and 70/75 on the three runs (v0.8 72/75 on each of its three) |
+| T=0 qeval | v0.9 71, 71 and 70/75 on the three runs |
 | Needle | 96K-token needle: correct answer |
 | CP step rows (`G6_CP_STEP_ROWS=8`) | host test `cp_rows_test`: random requests (past R from the start, crossing R, insert rules, grow stalls) at n = 8 and 12: every request emits its solo tokens, no step past R wider than n, waits bounded, two ranks agree on every step; the T=0 identity probe on the cluster gives the same output with the cap as without |
-| kv_b FP8 exactness (`G6_KVB=fp8`, 0017–0021) | `kvb8_test` on one GB10 (v0.8): every decode and prefill case byte-identical to the BF16 form of the same weights (every absorb / value-projection variant, alone and under QT); identical T=0 output on the four-box cluster on seven fresh boots. The three commits are unchanged in v0.9 |
+| kv_b FP8 exactness (`G6_KVB=fp8`, 0017–0021) | `kvb8_test` on one GB10 (when the patches were added): every decode and prefill case byte-identical to the BF16 form of the same weights (every absorb / value-projection variant, alone and under QT); identical T=0 output on the four-box cluster on seven fresh boots. The three commits are unchanged in v0.9 |
 | GEMV split exactness, m4sim | every combination of `G6_QA_SPLIT` / `G6_IDXQ_SPLIT` / `G6_MTP_SPLIT` byte-identical to flags off on the plain, graph, MTP, S2 and CP paths: 30/30 |
 | Attention exactness, attnk bench (rounds 1 and 2, serving flags) | byte-identical to stock at T 2K / 8K / 32K × M 1 / 3 / 8 / 12 |
 | Attention exactness, round 3 (`G6_ATTN_QT=1` `G6_ATTN_FRONT=1`) | byte-identical to stock in the attnk bench; identical T=0 output on the four-box cluster |
