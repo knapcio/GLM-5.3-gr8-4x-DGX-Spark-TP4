@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Thu, 15 Oct 2026 19:52:42 +0200
+Subject: [PATCH 06/30] s2_dsel_table.py: --w, and the measurement boot in the
+ usage
+
+---
+ tools/s2_dsel_table.py | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/tools/s2_dsel_table.py b/tools/s2_dsel_table.py
+index 2ce1e03..0dff346 100755
+--- a/tools/s2_dsel_table.py
++++ b/tools/s2_dsel_table.py
+@@ -18,7 +18,12 @@ A step costs its GPU span plus the mean GPU idle before a step of its kind (the
+   g k n from the MTP rounds (at least --min-n): drafts accepted after the first when the first is, verified, drafted.
+ The table goes to stdout (one line, for G6ENV_X), the derivation to stderr.
+ 
+-  s2_dsel_table.py LOG [LOG ...] [--min-n 30] [--roundlog] [--no-prior]
++Measurement boot: the serving configuration being priced (its K-stop policy, DSel settings and kernels; the model off),
++plus G6ENV_X="G6_S2_TIMELINE=200 G6_MTP_LPLOG=1" (no G6_S2_ROUNDLOG: its route copies lengthen the main steps). Run
++solo decode that visits both drafters (RigMark c1 prose, code and structured), then pass every rank's log. Check the
++derivation: each v<M> the drafters reach (2..4 MTP, 2..8 DFlash2) from enough steps, and enough MTP rounds for g k n.
++
++  s2_dsel_table.py LOG [LOG ...] [--min-n 30] [--roundlog] [--no-prior] [--w W]
+   s2_dsel_table.py --selftest
+ """
+ import argparse
+@@ -158,6 +163,7 @@ def main(argv=None):
+     ap.add_argument('--min-n', type=int, default=30, help='steps (rounds) a cell needs')
+     ap.add_argument('--roundlog', action='store_true', help='fill verify rows from "# s2_round" lines (launch+fence)')
+     ap.add_argument('--no-prior', action='store_true', help='leave out g, k, n')
++    ap.add_argument('--w', type=float, default=None, help="the acceptance estimates' prior weight in rounds (engine default 4)")
+     ap.add_argument('--selftest', action='store_true')
+     a = ap.parse_args(argv)
+     if a.selftest:
+@@ -165,6 +171,8 @@ def main(argv=None):
+     if not a.logs:
+         ap.error('no log')
+     t, why = table(read(a.logs, a.roundlog), a.min_n, not a.no_prior)
++    if a.w is not None:
++        t['w'] = a.w
+     for w in why:
+         print('# ' + w, file=sys.stderr)
+     print(fmt(t))

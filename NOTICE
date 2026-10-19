@@ -3,7 +3,7 @@ GLM-5.3 with gr8 on four DGX Sparks (TP4)
 Repository-authored patches, scripts, configuration and documentation: MIT, see LICENSE.
 
 patches/ modifies kindlingai/gr8 (https://github.com/kindlingai/gr8) at
-6448a16661abd81e9540bc073b3cfa92d7234565. gr8 is MIT, Copyright (c) 2026 gr8 engine
+c53b5b869818950a96a9b72c647d4b156b057127. gr8 is MIT, Copyright (c) 2026 gr8 engine
 contributors; its licence is retained in LICENSES/MIT-gr8.txt and applies to the
 upstream code the patches touch. The patches do not remove or alter any upstream
 copyright or licence notice.

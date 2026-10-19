@@ -1,5 +1,56 @@
 # Changelog
 
+## v0.9 — 2026-10-19
+
+Rebased onto upstream `c53b5b8` (2026-10-18; was `6448a16`). Upstream merged fifteen of v0.8's thirty-nine patches
+(upstream PRs #82–#90), three were dropped (two off-by-default experiments and a test), and nine patches are new:
+thirty in all, renumbered.
+
+- Upstream now carries, with the same flags: the fabric MTU fix (v0.8 0001 → #82), the replicated-GEMV splits (0002,
+  0003 → #84), the INT4 draft heads and DFlash2 drafter body (0004, 0005, 0022 → #85), the route overlap (0010 → #86),
+  the three rounds of decode attention kernels (0011, 0012, 0015 → #87), the MTP confidence stop with the K-stop cap
+  for promoted sessions (0013, 0030 → #88), DFlash2 after prefix reuse (0014 → #83), the parallel drafter step (0016 →
+  #89) and the decode step timeline (0017 → #90). Their off-by-default side experiments were not merged and are gone:
+  `G6_ATTN_CTX2=9`, `G6_ATTN_ABS2`, `G6_ATTN_VP2`, `G6_ATTN_CTX4` and `G6_MTP_EHPROJ_I4`.
+- Dropped: v0.8 0024 (`G6_AR_WAITFOLD`, measured level), 0025 (`G6_MTP_HEAD_SKIP`, measured slower) and 0039
+  (`kvb8_test` cases for the ABS2 / VP2 widths, which no longer exist).
+- Carried, renumbered (v0.8 → v0.9): 0006–0009 → 0001–0004, 0018–0021 → 0005–0008, 0023 → 0009, 0026–0029 →
+  0010–0013, 0031–0033 → 0014–0016, 0034–0036 (upstream's open PR #98) → 0017–0019, 0037, 0038 → 0020, 0021.
+- From upstream between the two pins: steering support (#69–#81, #45; not used or measured here), several sessions
+  past R resident together with CP batch views (#94), one engine binary for every TP width (#53), the decode-perf flags
+  on by default when serving (#96; the recipe sets its own values explicitly), and fabric and KV pool work (EL4–EL6).
+- CP step rows (0023, `G6_CP_STEP_ROWS=8`): #94 sizes the CP fabric for the widest S2 step, 24 rows at 8 sessions and
+  MTP 2 (1.358 GB pinned per rank, 0.453 GB before). On the recipe's configuration that left the head box at about
+  0.5 GiB of available memory, and boxes hung with `NV_ERR_NO_MEMORY`. The cap sizes the fabric for 8 rows: available
+  memory after boot 3.3 GiB on the head, 2.5–2.8 GiB on the others. Cost: only while a session past `SHARE_LIMIT`
+  decodes alongside others whose rows do not fit, when they take turns. Proposed upstream as #106.
+- Positional index (0026, 0028, `G6_ATTN_POSIDX=1`), **on by default, not bit-exact**: at decode buckets up to 2048
+  keys the attention lists the keys by position and skips the indexer's scores, the selector and the idx_q GEMV. The
+  same keys and scores, summed in position order instead of the indexer's order: deterministic, but not byte-identical
+  to upstream (new exactness class E1). Remove `G6_ATTN_POSIDX=1` from `G6ENV_X` to get upstream's order.
+- MTP first form, last row only (0029, `G6_MTP_LASTROW=1`, bit-exact): only each session's last row goes through layer
+  78's routed experts.
+- MTP draft head in two stages (0030, `G6_DRAFT_HEAD2=1`, drafting): a 2-bit screen of the vocab slice, then the exact
+  MXFP8 logits of its 64 best rows; 74.5 MB more device memory per rank.
+- Also in the series, off: `G6_ATTN_CTX3_SP` (0025, E1, measured no gain), `G6_ROUTER_TPC` (0022, bit-exact, not used),
+  the attnk round-10 arms and their sweep script (0027), and a `batch_dsel_test` fix (0024).
+- `docker/env.example`: `G6ENV_X` gains `G6_CP_STEP_ROWS=8 G6_ATTN_POSIDX=1 G6_DRAFT_HEAD2=1 G6_MTP_LASTROW=1`;
+  `SHARE_LIMIT=65536` written out (the launcher's default at TP=4; no context cost); image tag
+  `gr8-glm53-recipe:v0.9`.
+- Dockerfile: base image upstream's `sha-c53b5b8`, pinned by digest; the engine stage builds with `G6_WIDTHS=4`
+  (upstream's build now makes one binary for every TP width; the recipe's runs TP=4 only); the Rust stages drop
+  `target/` as upstream's do.
+
+Quality: T=0 KL vs the dh32f configuration (top-20 logprobs, 75 qeval prompts, prefix-cached pass) 35/75
+identical, mean 2.830e-03, max 0.465 (v0.8 2.734e-03, same method); sampled qeval 578/600 in each of three runs (the dh32f reference 578/600); T=0 qeval 71, 71 and 70/75.
+
+Measured: speedbench (73 prompts, c1, paired against v0.8 over four alternated fresh boots) +1.2 % overall
+[−1.2, +3.6], structured +3.5 % [+0.1, +7.0], other categories within noise; RigMark (median of three full runs) prose
+/ code / structured 40.6 / 60.6 / 75.5 tok/s (v0.8 40.6 / 61.2 / 73.4), concurrency C1 / C2 / C4 aggregate 47.0 / 59.9
+/ 76.6 (v0.8 48.2 / 61.7 / 76.2), cold prefill 8K / 32K / 64K / 128K 1381 / 1382 / 1327 / 1226 tok/s. Speed is level
+with v0.8 within about 1 %; the release is for the upstream rebase and the host-memory headroom. Per-lever screens in
+[docs/history.md](docs/history.md).
+
 ## v0.8 — 2026-10-19
 
 v0.7 plus six patches, thirty-nine in all, and one step in the serving procedure. Upstream base (`6448a16`) unchanged;

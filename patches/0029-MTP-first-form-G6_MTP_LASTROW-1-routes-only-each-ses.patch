@@ -1,0 +1,908 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Mon, 19 Oct 2026 02:30:48 +0200
+Subject: [PATCH 29/30] MTP first form: G6_MTP_LASTROW=1 routes only each
+ session's last row through layer 78's experts (default off)
+
+A first-form draft step of a+1 rows exists to write layer 78's caches for rows 0..a-1; only the last row's
+token, log-probability and hidden are read. The caches are written in the attention block from the layer
+input, before the MoE, so the other rows' routed experts are skipped: k_router_plan takes a keep mask
+(by value on the solo graphs, from S2In on the S2 path via k_s2_last_rows) and gives the other rows no slot.
+A routed row's K1 bytes do not depend on the other rows' routes (the S2 A1 property), so the caches and the
+last row are the bytes of the full step. In the S2 runtime signature.
+
+Tests: kernels/tests/mtp_lastrow_test.cu (synthetic exlr8 v2 layer, one GB10: kept rows byte for byte vs the
+full plan, fuse 0/1, ROUTE_OVL 0/1/2, plain and graph, M 1..32; bench of the saving); m4sim
+G6_MTP_LASTROW_CHECK=1 + scripts/mtp_lastrow_check.sh (caches, last rows, every target line, flag off vs on).
+---
+ docs/SETTINGS.md                         |   1 +
+ engine/kernels/glue.cuh                  |  12 +-
+ engine/kernels/tests/mtp_lastrow_test.cu | 496 +++++++++++++++++++++++
+ engine/runtime/g6m4.cu                   |   7 +
+ engine/runtime/m4sim.cu                  |  44 ++
+ engine/runtime/rank.cuh                  |  33 +-
+ engine/runtime/s2.cuh                    |  19 +
+ scripts/mtp_lastrow_check.sh             |  84 ++++
+ 8 files changed, 693 insertions(+), 3 deletions(-)
+ create mode 100644 engine/kernels/tests/mtp_lastrow_test.cu
+ create mode 100755 scripts/mtp_lastrow_check.sh
+
+diff --git a/docs/SETTINGS.md b/docs/SETTINGS.md
+index 57599e7..eaf63c2 100644
+--- a/docs/SETTINGS.md
++++ b/docs/SETTINGS.md
+@@ -102,6 +102,7 @@ the short version.
+ | `G6_IDXQ_SPLIT` | 1 when TP>1 (else 0) | decode: the indexer's wq_b (idx_q, 4096 outputs, replicated) split by output tiles the same way on the same fabric, on the indexer layers: each rank's tiles are published, q_b runs while the gather is on the wire, then the gather. Same bits as 0. Independent of `G6_QA_SPLIT` |
+ | `G6_MTP_SPLIT` | 1 when TP>1 + --mtp (else 0) | MTP draft steps (needs `--mtp`): eh_proj (6144 outputs, 78 MB replicated), then layer 78's q_a / kv_a / indexer k and weights (as `G6_QA_SPLIT=1`) and idx_q (as `G6_IDXQ_SPLIT=1`), split by output tiles and gathered on a draft gather fabric (port + 72). Same bits as 0 |
+ | `G6_DRAFT_HEAD_I4` | 0 | MTP draft steps (needs `--mtp`): the draft's lm_head GEMV reads INT4 g32 records of the rank's vocab slice, made at boot on the GPU from its MXFP8 records (134 MB more per rank at TP4), instead of the MXFP8 records: 45% fewer head bytes per draft step. The target's head and the verify steps are unchanged, so the committed tokens are the target's; drafts (and their log-probabilities, which `--spec-adaptive` reads) can differ from the MXFP8 head's. Same on every rank. `G6_DRAFT_HEAD_KS` (32, 2..32) / `G6_DRAFT_HEAD_TPC` (1) = the GEMV's k parts per tile and tiles per CTA; every rank must set the same values |
++| `G6_MTP_LASTROW` | 0 | MTP draft steps (needs `--mtp`): a first-form draft step routes only each session's last row through the MTP layer's routed experts (the step's last row on the solo path, every session's last row on the S2 path; a chain step routes all its rows). The rows before it are in the step only to write layer 78's caches, which the attention block writes from the layer input, before the experts; no reader takes their outputs. Their experts are skipped (the router plan gives them no slot; the shared expert still runs). Same caches, drafts and log-probabilities as without it (`kernels/tests/mtp_lastrow_test.cu`, `scripts/mtp_lastrow_check.sh`); a first form of a + 1 rows reads one row's routed experts instead of a + 1 rows'. Every rank must set the same value |
+ | `G6_DFL_HEAD_I4` | 0 | DFlash2 drafter (needs `--dflash-manifest`): its lm_head GEMV reads the same INT4 g32 records as `G6_DRAFT_HEAD_I4` (the MTP draft's copy when that is on, else one made the same way; same `G6_DRAFT_HEAD_KS` / `_TPC`). In selector mode the head's raw logits choose each row's top-16 candidates and enter their walk scores, so INT4 can change both. The target's head and the verify steps are unchanged. Every rank must set the same value |
+ | `G6_DFL_BODY_I4` | 0 | DFlash2 drafter (needs `--dflash-manifest`): its body GEMVs (fc, and per layer kv, aconv, q, o, mconv, gu, down) read INT4 g32 copies of their MXFP8 records, made at boot on the GPU by the `G6_DRAFT_HEAD_I4` arithmetic, with the same splits: 382 MB instead of 701 MB per draft step's reads (the pack image keeps the MXFP8 records: +382 MB per rank). The selector's hproj and the head (`G6_DFL_HEAD_I4`) are not touched. Drafts only: the target and the verify steps are unchanged; drafts and their log-probabilities can differ (`engine/runtime/dflreplay.cu` compares both drafters on a `G6_DFL_DUMP`). The drafter choice's drafting cost (`G6_SPEC_DRAFT`) is not changed with it. Every rank must set the same value |
+ | `G6_KVB` | bf16 | loader (`--v2-dense` boots): `fp8` = every layer's kv_b (UK / UV) as the release's block FP8, the E4M3 bytes as stored plus each row's 128 x 128 block scales (`L%03d.kv_b.uk` / `.uv` u8, `.uk.scale` / `.uv.scale` f32), instead of their BF16. The decode absorb and value-projection kernels read a weight as BF16(e4m3 x scale), the value the BF16 form stores, and the prefill and QO / pair-owner paths build their FP16 and BF16 copies from the same values, so every output byte is unchanged (`kvb8_test`). Halves the UK / UV bytes a decode step reads (TP=4: 7.3 MB a layer a rank in BF16). `bf16` or unset: as before. Any other value stops the boot (#50) |
+diff --git a/engine/kernels/glue.cuh b/engine/kernels/glue.cuh
+index 303ad0e..51aa82b 100644
+--- a/engine/kernels/glue.cuh
++++ b/engine/kernels/glue.cuh
+@@ -488,7 +488,13 @@ struct RoutePlan
+ // grid 1, block 256 (warp w = tokens w, w + 8, ...; M <= MMAX). logits [M][256] fp32, bias [256] fp32 (e_score_correction_bias).
+ // Selection key = sigmoid(logit) + bias, ties -> lowest expert id. Weights = unbiased sigmoid of the
+ // selected experts / their sum * 2.5 (FACTS-M0 2(c)).
+-__global__ void __launch_bounds__(256) k_router_plan(const float* logits, const float* bias, int M, RoutePlan* P)
++// keep / keep_dev (G6_MTP_LASTROW, rank.cuh launch_mlp_block): bit m = token m is routed; a token outside the mask takes no
++// route (no expert slot, tok_slot -1, as tokens m >= M), so the finalize gives it the shared expert only. keep_dev (device
++// word, read at launch) wins over keep; both 0 / nullptr = every token, today's plan. A routed token's selection, weights,
++// slot order (ascending expert id) and column (M <= 8: column m; above: its rank among the expert's routed tokens) do not
++// depend on the other tokens, and an mma column depends only on its own token: its K1 output bytes are the same.
++__global__ void __launch_bounds__(256) k_router_plan(const float* logits, const float* bias, int M, RoutePlan* P, unsigned keep = 0u,
++                                                     const unsigned* keep_dev = nullptr)
+ {
+     __shared__ unsigned emask[NEXP];              // bit m = token m selected the expert
+     __shared__ int sel_e[MMAX][TOPK];
+@@ -497,6 +503,7 @@ __global__ void __launch_bounds__(256) k_router_plan(const float* logits, const
+     __shared__ int wcount[8];
+     const int t = threadIdx.x, w = t >> 5, l = t & 31;
+     const bool dense = M > 8;
++    const unsigned on = keep_dev ? *keep_dev : keep ? keep : 0xffffffffu;
+     emask[t] = 0u;
+     for (int i = t; i < SMAX * 8; i += 256)
+     {
+@@ -506,6 +513,7 @@ __global__ void __launch_bounds__(256) k_router_plan(const float* logits, const
+     __syncthreads();
+     for (int m = w; m < M; m += 8)
+     {
++        if (!(on >> m & 1u)) continue;            // the whole warp (m depends on w only)
+         float s[8], key[8];
+         #pragma unroll
+         for (int i = 0; i < 8; ++i)
+@@ -580,7 +588,7 @@ __global__ void __launch_bounds__(256) k_router_plan(const float* logits, const
+     for (int i = t; i < MMAX * TOPK; i += 256)
+     {
+         const int m = i >> 3, k = i & 7;
+-        if (m < M)
++        if (m < M && (on >> m & 1u))
+         {
+             const int e = sel_e[m][k];
+             const int r = __popc(emask[e] & ((1u << m) - 1u));      // rank of token m among the expert's tokens
+diff --git a/engine/kernels/tests/mtp_lastrow_test.cu b/engine/kernels/tests/mtp_lastrow_test.cu
+new file mode 100644
+index 0000000..4c85f5d
+--- /dev/null
++++ b/engine/kernels/tests/mtp_lastrow_test.cu
+@@ -0,0 +1,496 @@
++// mtp_lastrow_test: G6_MTP_LASTROW (rank.cuh launch_mlp_block; glue.cuh k_router_plan keep / keep_dev) against the full
++// MoE layer call. One GB10, no pack files, no fabric. The MTP draft's MoE layer call as launch_mlp_block runs it: x2 ->
++// fragment tables (k_xfrag), router GEMV (BF16 records, tpc 2 x ks 16, as make_layer binds it) -> k_router_plan -> K1
++// (fc1, fc2, finalize), on the synthetic exlr8 v2 layer of k1_ovl_test (GLM-5.3 TP4 rank shape: 256 routed experts x 4
++// blocks of 128 columns, widths 4 / 3, trellis shared expert, block-scale vectors, K3 tiles in the wide order).
++// Routing comes from the router itself: x2 row m = corr * row 0 + (1 - corr) * noise (the rows of a first form share
++// experts).
++//
++//   mtp_lastrow_test [--M 1,2,3,4,5,6,7,8,12,16,24,32] [--bench-M 2,3,4,5,8] [--sets 48] [--layers 2] [--reps 300]
++//                    [--corr 0.6] [--k4mod 4] [--shbits 4] [--check-only] [--bench-only]
++//
++// Check (the claim: the rows a draft step's readers take are the same bytes): for every M, fuse 1 (the engine's policy:
++// fused at M = 1, separate above) and fuse 0, G6_ROUTE_OVL off / 1 / 2, every routing set:
++//   last   keep = 1 << (M - 1) (today's path: the step's last row), by value as the S=1 draft graphs capture it
++//   s2     keep_dev = the last rows of a session layout (S2: every session's last row; one layout per set, 1..min(M, 8)
++//          sessions of random sizes), read from device memory at launch as k_s2_last_rows writes it
++// against the full plan: the kept rows of out (BF16 [M][6144], the engine's mlp_part) byte for byte, as plain stream
++// launches and as one CUDA graph over all sets (replayed twice, the second replay compared). The other rows (unread by
++// the engine) must be finite. keep = 0 and keep = all ones must be the full plan byte for byte (flag off = today). The
++// plan itself: the kept rows' tok_slot / tok_col / tok_w / tok_expert as the full plan's (tok_slot / tok_col through
++// slot_expert: the same expert and column), the other rows -1.
++// Bench (idle GPU, after the check): per M, a CUDA graph of reps x the layer call (sets and layers in turn, so nothing
++// stays in L2), median of 5 interleaved timings: full plan, last row only, M = 1 (for reference), with the mean distinct
++// experts and this rank's trellis bytes per call. The saving is the draft step's: layer 78 is its one MoE layer.
++// Exit code: 0 all PASS, 1 any FAIL, 2 CUDA error / usage.
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <string>
++#include <vector>
++#include <cuda_runtime.h>
++#include "../glue.cuh"
++#include "../bind.cuh"
++
++#define CK(x)                                                                                                   \
++    do                                                                                                          \
++    {                                                                                                           \
++        const cudaError_t e_ = (x);                                                                             \
++        if (e_ != cudaSuccess)                                                                                  \
++        {                                                                                                       \
++            printf("CUDA error %s at %s:%d: %s\n", #x, __FILE__, __LINE__, cudaGetErrorString(e_));             \
++            exit(2);                                                                                            \
++        }                                                                                                       \
++    } while (0)
++
++static int g_pass = 0, g_fail = 0;
++
++__device__ __forceinline__ uint32_t trnd(size_t i, uint32_t seed)
++{
++    uint32_t x = static_cast<uint32_t>(i) ^ ((static_cast<uint32_t>(i >> 32) + seed) * 0x9e3779b9u) ^ (seed * 0x85ebca6bu);
++    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
++    return x;
++}
++__device__ __forceinline__ float trnd_u(size_t i, uint32_t seed) { return 2.f * ((trnd(i, seed) >> 8) * (1.f / 16777216.f)) - 1.f; }
++__global__ void k_fill_words(uint32_t* p, size_t n, uint32_t seed)
++{
++    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n; i += static_cast<size_t>(gridDim.x) * blockDim.x)
++        p[i] = trnd(i, seed);
++}
++__global__ void k_fill_f16(__half* p, size_t n, float amp, uint32_t seed)
++{
++    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n; i += static_cast<size_t>(gridDim.x) * blockDim.x)
++        p[i] = __float2half(trnd_u(i, seed) * amp);
++}
++__global__ void k_fill_bf16(__nv_bfloat16* p, size_t n, float amp, uint32_t seed)
++{
++    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n; i += static_cast<size_t>(gridDim.x) * blockDim.x)
++        p[i] = __float2bfloat16(trnd_u(i, seed) * amp);
++}
++// x2 sets [sets][G6_MX][HID]: row 0 noise, row m = corr * row 0 + (1 - corr) * noise
++__global__ void k_fill_x2(__half* p, int sets, float corr, uint32_t seed)
++{
++    const size_t n = static_cast<size_t>(sets) * G6_MX * HID;
++    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n; i += static_cast<size_t>(gridDim.x) * blockDim.x)
++    {
++        const size_t s = i / (static_cast<size_t>(G6_MX) * HID), m = (i / HID) % G6_MX, k = i % HID;
++        const float r0 = trnd_u(s * G6_MX * HID + k, seed);
++        p[i] = __float2half(m == 0 ? r0 : corr * r0 + (1.f - corr) * trnd_u(i, seed + 1));
++    }
++}
++static void fill_words(void* p, size_t bytes, uint32_t seed)
++{
++    k_fill_words<<<4096, 256>>>(static_cast<uint32_t*>(p), bytes / 4, seed);
++    CK(cudaGetLastError());
++}
++static void fill_f16(__half* p, size_t n, float amp, uint32_t seed)
++{
++    k_fill_f16<<<1024, 256>>>(p, n, amp, seed);
++    CK(cudaGetLastError());
++}
++
++static bind::Tensor mk(const void* p, int nd, long long a, long long b = 0, long long c = 0)
++{
++    bind::Tensor t;
++    t.p = p; t.nd = nd; t.shape[0] = a; t.shape[1] = b; t.shape[2] = c;
++    return t;
++}
++
++struct SynLayer
++{
++    bind::LayerTensors T;
++    std::vector<long long> tab;      // host copy [257][6]
++    double ebytes[257];              // trellis bytes of each expert on this rank (fc1 + fc2)
++    bind::Tensor router;             // BF16 records [16][384][512]
++    float* bias = nullptr;           // [256]
++};
++
++// as k1_ovl_test build_layer
++static void build_layer(SynLayer& L, int k4mod, int shbits, uint32_t seed, std::vector<void*>& mem)
++{
++    L.tab.assign(257 * 6, 0);
++    size_t o1 = 0, o2 = 0;
++    int row = 0;
++    for (int e = 0; e < 257; ++e)
++    {
++        const int bits = e == 256 ? shbits : e % k4mod == 0 ? 4 : 3, nb = g6nr::EB;
++        long long* r = &L.tab[static_cast<size_t>(e) * 6];
++        r[0] = static_cast<long long>(o1); r[1] = static_cast<long long>(o2); r[2] = row; r[3] = nb; r[4] = bits; r[5] = 0;
++        o1 += static_cast<size_t>(nb) * 2 * KSH * 8 * 32 * bits;
++        o2 += static_cast<size_t>(nb) * KSH * 8 * 32 * bits;
++        L.ebytes[e] = 3.0 * nb * KSH * 8 * 32 * bits;
++        row += nb;
++    }
++    auto alloc = [&](size_t n) { void* p; CK(cudaMalloc(&p, n)); mem.push_back(p); return p; };
++    long long* tab = static_cast<long long*>(alloc(L.tab.size() * 8));
++    CK(cudaMemcpy(tab, L.tab.data(), L.tab.size() * 8, cudaMemcpyHostToDevice));
++    uint8_t* fc1 = static_cast<uint8_t*>(alloc(o1));
++    uint8_t* fc2 = static_cast<uint8_t*>(alloc(o2));
++    fill_words(fc1, o1, seed + 1);
++    fill_words(fc2, o2, seed + 2);
++    __half* v2 = static_cast<__half*>(alloc(static_cast<size_t>(row) * 3 * 128 * 2));
++    fill_f16(v2, static_cast<size_t>(row) * 3 * 128, 0.5f, seed + 3);
++    std::vector<__half> sgh(2 * HID);
++    for (int i = 0; i < 2 * HID; ++i) sgh[i] = __float2half(((i * 2654435761u + seed) >> 13) & 1 ? 1.f : -1.f);
++    __half* sg = static_cast<__half*>(alloc(sgh.size() * 2));
++    CK(cudaMemcpy(sg, sgh.data(), sgh.size() * 2, cudaMemcpyHostToDevice));
++    __half* v1b = static_cast<__half*>(alloc(static_cast<size_t>(row) * 2 * (HID / 128) * 2));
++    fill_f16(v1b, static_cast<size_t>(row) * 2 * (HID / 128), 0.05f, seed + 4);
++    __half* v3b = static_cast<__half*>(alloc(static_cast<size_t>(row) * (HID / 128) * 2));
++    fill_f16(v3b, static_cast<size_t>(row) * (HID / 128), 0.5f, seed + 5);
++    bind::LayerTensors& T = L.T;
++    T.t[bind::T_TR3_TAB] = mk(tab, 2, 257, 6);
++    T.t[bind::T_TR3_FC1] = mk(fc1, 1, static_cast<long long>(o1));
++    T.t[bind::T_TR3_FC2] = mk(fc2, 1, static_cast<long long>(o2));
++    T.t[bind::T_TR3_V2] = mk(v2, 3, row, 3, 128);
++    T.t[bind::T_TR3_SG] = mk(sg, 2, 2, HID);
++    T.t[bind::T_TR3_V1B] = mk(v1b, 3, row, 2, HID / 128);
++    T.t[bind::T_TR3_V3B] = mk(v3b, 2, row, HID / 128);
++    for (int i : {bind::T_TR3_TAB, bind::T_TR3_FC1, bind::T_TR3_FC2, bind::T_TR3_V2}) T.t[i].fmt = bind::FMT_EXLR8_E4M3;
++    T.e4m3 = 1;
++    if (const char* e = bind::scan_widths(T)) { printf("scan_widths: %s\n", e); exit(2); }
++    if (!T.sh_trellis) { printf("no trellis shared expert after scan_widths\n"); exit(2); }
++    bind::widen_fc1(T, nullptr);
++    bind::widen_fc2(T, nullptr);
++    const size_t rn = static_cast<size_t>(16) * 384 * 256;
++    __nv_bfloat16* rw = static_cast<__nv_bfloat16*>(alloc(rn * 2));
++    k_fill_bf16<<<1024, 256>>>(rw, rn, 0.02f, seed + 6);
++    CK(cudaGetLastError());
++    L.router = mk(rw, 3, 16, 384, 512);
++    std::vector<float> bh(256);
++    for (int e = 0; e < 256; ++e) bh[e] = 0.01f * static_cast<float>(((e * 2654435761u + seed) >> 9) % 201) / 100.f - 0.01f;
++    L.bias = static_cast<float*>(alloc(256 * 4));
++    CK(cudaMemcpy(L.bias, bh.data(), 256 * 4, cudaMemcpyHostToDevice));
++    CK(cudaDeviceSynchronize());
++}
++
++static std::vector<int> parse_list(const char* s)
++{
++    std::vector<int> v;
++    for (const char* p = s; *p;)
++    {
++        v.push_back(atoi(p));
++        while (*p && *p != ',') ++p;
++        if (*p == ',') ++p;
++    }
++    return v;
++}
++
++// a session layout of M rows (1..min(M, 8) sessions, random sizes, in order): bit = each session's last row
++static unsigned layout_mask(int M, std::mt19937& g)
++{
++    const int S = 1 + static_cast<int>(g() % static_cast<unsigned>(std::min(M, 8)));
++    std::vector<int> cut;                     // S - 1 distinct cut points in 1..M-1
++    std::vector<int> all;
++    for (int i = 1; i < M; ++i) all.push_back(i);
++    std::shuffle(all.begin(), all.end(), g);
++    cut.assign(all.begin(), all.begin() + (S - 1));
++    cut.push_back(M);
++    unsigned b = 0;
++    for (int c : cut) b |= 1u << (c - 1);
++    return b;
++}
++
++int main(int argc, char** argv)
++{
++    std::vector<int> Ms = {1, 2, 3, 4, 5, 6, 7, 8}, BMs = {2, 3, 4, 5, 8};
++    for (int M : {12, 16, 24, 32}) if (M <= G6_MX) Ms.push_back(M);
++    int sets = 48, nlay = 2, reps = 300, k4mod = 4, shbits = 4, check = 1, bench = 1;
++    float corr = 0.6f;
++    for (int i = 1; i < argc; ++i)
++    {
++        const std::string a = argv[i];
++        auto nx = [&]() { if (i + 1 >= argc) { printf("missing value for %s\n", a.c_str()); exit(2); } return argv[++i]; };
++        if (a == "--M") Ms = parse_list(nx());
++        else if (a == "--bench-M") BMs = parse_list(nx());
++        else if (a == "--sets") sets = atoi(nx());
++        else if (a == "--layers") nlay = atoi(nx());
++        else if (a == "--reps") reps = atoi(nx());
++        else if (a == "--k4mod") k4mod = atoi(nx());
++        else if (a == "--shbits") shbits = atoi(nx());
++        else if (a == "--corr") corr = static_cast<float>(atof(nx()));
++        else if (a == "--check-only") bench = 0;
++        else if (a == "--bench-only") check = 0;
++        else { printf("unknown arg %s (see the file header)\n", a.c_str()); return 2; }
++    }
++    for (int M : Ms) if (M < 1 || M > G6_MX) { printf("M=%d outside 1..%d\n", M, G6_MX); return 2; }
++    for (int M : BMs) if (M < 1 || M > G6_MX) { printf("M=%d outside 1..%d\n", M, G6_MX); return 2; }
++    if (sets < 1 || nlay < 1 || reps < 1 || k4mod < 1 || (shbits != 3 && shbits != 4)) { printf("bad --sets / --layers / --reps / --k4mod / --shbits\n"); return 2; }
++
++    CK(cudaSetDevice(0));
++    CK(bind::init());
++    cudaDeviceProp pr;
++    CK(cudaGetDeviceProperties(&pr, 0));
++    printf("mtp_lastrow_test: %s sm_%d%d %d SMs, G6_NR=%d EB=%d G6_MX=%d, layers %d, sets %d, corr %.2f, K4 = experts %% %d == 0, shared width %d\n",
++           pr.name, pr.major, pr.minor, pr.multiProcessorCount, g6nr::NR, g6nr::EB, G6_MX, nlay, sets, corr, k4mod, shbits);
++
++    std::vector<void*> mem;
++    std::vector<SynLayer> Ls(nlay);
++    for (int l = 0; l < nlay; ++l) build_layer(Ls[l], k4mod, shbits, 1000u + 17u * l, mem);
++    auto alloc = [&](size_t n) { void* p; CK(cudaMalloc(&p, n)); mem.push_back(p); return p; };
++    const size_t xb = static_cast<size_t>(G6_MX) * HID * 2;
++    __half* x2 = static_cast<__half*>(alloc(xb));
++    __half* x2sets = static_cast<__half*>(alloc(xb * sets));
++    k_fill_x2<<<1024, 256>>>(x2sets, sets, corr, 41u);
++    CK(cudaGetLastError());
++    float* logits = static_cast<float*>(alloc(static_cast<size_t>(G6_MX) * 256 * 4));
++    glue::RoutePlan* dplan = static_cast<glue::RoutePlan*>(alloc(sizeof(glue::RoutePlan)));
++    CK(cudaMemset(dplan, 0, sizeof(glue::RoutePlan)));
++    unsigned* keeps = static_cast<unsigned*>(alloc(static_cast<size_t>(sets) * 4));    // per set: the S2 layout's last rows
++    const size_t sb = bind::scratch_bytes();
++    void* blk = alloc(sb);
++    CK(cudaMemset(blk, 0, sb));
++    const bind::Scratch sc = bind::scratch_at(blk);
++    const size_t obytes = static_cast<size_t>(G6_MX) * HID * 2;
++    uint8_t* out = static_cast<uint8_t*>(alloc(obytes));
++    uint8_t* outs = static_cast<uint8_t*>(alloc(obytes * sets));      // per routing set (graph check)
++    cudaStream_t st;
++    CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
++    bind::K1Ovl O[3];                                                // [variant]: 0 = off, 1 / 2 = G6_ROUTE_OVL mode
++    for (int v = 1; v < 3; ++v)
++    {
++        O[v].mode = v;
++        CK(cudaStreamCreateWithFlags(&O[v].side, cudaStreamNonBlocking));
++        CK(cudaEventCreateWithFlags(&O[v].fork, cudaEventDisableTiming));
++        CK(cudaEventCreateWithFlags(&O[v].join, cudaEventDisableTiming));
++    }
++    CK(cudaDeviceSynchronize());
++
++    struct Bound { bind::K1 k1; bind::Gv router; };
++    auto make = [&](int M, int fuse, std::vector<Bound>& bs) -> const char* {
++        bs.assign(nlay, Bound());
++        for (int l = 0; l < nlay; ++l)
++        {
++            bind::Tensor sh[3];
++            if (const char* e = bind::make_k1(Ls[l].T, M, sc, x2, sc.xf_x2, bind::plan_ptrs(dplan), out, 1, bs[l].k1, sh, fuse, 0)) return e;
++            if (const char* e = bind::make_gv(Ls[l].router, bind::BF16W, 2, 16, M, sc.xb_x2, logits, gv::O_F32, bs[l].router)) return e;
++        }
++        return nullptr;
++    };
++    // one layer call (rank.cuh launch_mlp_block): set s, layer l, ovl variant v; keep / keep_dev as k_router_plan takes them
++    auto call = [&](const std::vector<Bound>& bs, int v, int M, int s, int l, unsigned keep, const unsigned* keep_dev, bool k1 = true) {
++        CK(cudaMemcpyAsync(x2, x2sets + static_cast<size_t>(s) * G6_MX * HID, static_cast<size_t>(M) * HID * 2, cudaMemcpyDeviceToDevice, st));
++        bind::Xfrag xf;
++        xf.on = 1; xf.src = x2; xf.ld = HID; xf.K = HID; xf.M = M; xf.f16 = sc.xf_x2; xf.bf16 = sc.xb_x2;
++        bind::launch(xf, st);
++        const bool ovl = k1 && bind::k1_ovl_on(bs[l].k1, O[v]);
++        if (ovl) bind::k1_ovl_fork(bs[l].k1, O[v], st);
++        bind::launch(bs[l].router, st);
++        glue::k_router_plan<<<1, 256, 0, st>>>(logits, Ls[l].bias, M, dplan, keep, keep_dev);
++        if (!k1) return;
++        if (ovl) bind::launch_k1_ovl(bs[l].k1, O[v], st);
++        else bind::launch_k1(bs[l].k1, st);
++    };
++
++    // ---------------------------------------------------------------- exactness
++    if (check)
++    {
++        std::mt19937 g(7);
++        std::vector<unsigned> hkeep(sets);
++        for (int M : Ms)
++            for (int fuse : {1, 0})
++            {
++                std::vector<Bound> bs;
++                if (const char* e = make(M, fuse, bs)) { printf("FAIL M=%d fuse=%d make: %s\n", M, fuse, e); ++g_fail; continue; }
++                for (int s = 0; s < sets; ++s) hkeep[s] = layout_mask(M, g);
++                CK(cudaMemcpy(keeps, hkeep.data(), sets * 4, cudaMemcpyHostToDevice));
++                const unsigned last = 1u << (M - 1), all = M == 32 ? 0xffffffffu : (1u << M) - 1u;
++                const size_t ob = static_cast<size_t>(M) * HID * 2, rb = HID * 2;
++                std::vector<uint8_t> ref(ob * sets), got(ob * sets);
++                // mode: 0 full (keep 0), 1 keep = all rows, 2 last row, 3 S2 layout (keep_dev)
++                auto kp = [&](int mode, int s) { return mode == 1 ? all : mode == 2 ? last : 0u; };
++                auto kd = [&](int mode, int s) { return mode == 3 ? keeps + s : nullptr; };
++                auto plain = [&](int v, int mode, std::vector<uint8_t>& h) {
++                    for (int s = 0; s < sets; ++s)
++                    {
++                        CK(cudaMemsetAsync(out, 0xff, obytes, st));
++                        call(bs, v, M, s, s % nlay, kp(mode, s), kd(mode, s));
++                        CK(cudaMemcpyAsync(h.data() + ob * s, out, ob, cudaMemcpyDeviceToHost, st));
++                    }
++                    CK(cudaStreamSynchronize(st));
++                    CK(cudaGetLastError());
++                };
++                auto graph = [&](int v, int mode, std::vector<uint8_t>& h) {
++                    cudaGraph_t gr;
++                    cudaGraphExec_t ge;
++                    CK(cudaMemsetAsync(outs, 0xff, obytes * sets, st));
++                    CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));   // as g6m4
++                    for (int s = 0; s < sets; ++s)
++                    {
++                        call(bs, v, M, s, s % nlay, kp(mode, s), kd(mode, s));
++                        CK(cudaMemcpyAsync(outs + ob * s, out, ob, cudaMemcpyDeviceToDevice, st));
++                    }
++                    CK(cudaStreamEndCapture(st, &gr));
++                    CK(cudaGraphInstantiate(&ge, gr, 0));
++                    for (int r = 0; r < 2; ++r) CK(cudaGraphLaunch(ge, st));    // twice: the second replay is compared
++                    CK(cudaMemcpyAsync(h.data(), outs, ob * sets, cudaMemcpyDeviceToHost, st));
++                    CK(cudaStreamSynchronize(st));
++                    CK(cudaGetLastError());
++                    CK(cudaGraphExecDestroy(ge));
++                    CK(cudaGraphDestroy(gr));
++                };
++                // the rows of mask b in every set equal ref's; the other rows finite (BF16)
++                auto cmp = [&](const char* what, int v, int mode, const std::vector<uint8_t>& b) {
++                    size_t nbad = 0, nonfin = 0, rows = 0;
++                    long first = -1;
++                    for (int s = 0; s < sets; ++s)
++                    {
++                        const unsigned want = mode == 0 || mode == 1 ? all : mode == 2 ? last : hkeep[s];
++                        for (int m = 0; m < M; ++m)
++                        {
++                            const uint8_t* x = b.data() + ob * s + rb * m;
++                            if (want >> m & 1u)
++                            {
++                                ++rows;
++                                if (memcmp(x, ref.data() + ob * s + rb * m, rb)) { if (first < 0) first = s * 64 + m; ++nbad; }
++                            }
++                            else
++                                for (int i = 0; i < HID; ++i) nonfin += ((x[2 * i] | (x[2 * i + 1] << 8)) & 0x7f80) == 0x7f80;
++                        }
++                    }
++                    const bool ok = nbad == 0 && nonfin == 0;
++                    printf("%s M=%d fuse=%d(%s) ovl=%d %s: %zu kept rows over %d sets%s", ok ? "PASS" : "FAIL", M, fuse,
++                           bs[0].k1.fuse ? "fused" : "separate", v, what, rows, sets, ok ? "\n" : "");
++                    if (!ok) printf(", %zu rows differ (first set %ld row %ld), %zu non-finite values in the other rows\n", nbad,
++                                    first < 0 ? -1 : first / 64, first < 0 ? -1 : first % 64, nonfin);
++                    (ok ? g_pass : g_fail)++;
++                };
++                plain(0, 0, ref);
++                {   // sanity of the reference: finite, not all zero
++                    size_t nz = 0, nonfin = 0;
++                    for (size_t i = 0; i < ref.size(); i += 2)
++                    {
++                        const uint16_t b = static_cast<uint16_t>(ref[i] | (ref[i + 1] << 8));
++                        nz += (b & 0x7fff) != 0;
++                        nonfin += (b & 0x7f80) == 0x7f80;
++                    }
++                    const bool ok = nonfin == 0 && nz > ref.size() / 4;
++                    printf("%s M=%d fuse=%d reference output: %zu non-finite, %.1f%% nonzero\n", ok ? "PASS" : "FAIL", M, fuse, nonfin,
++                           200.0 * nz / ref.size());
++                    (ok ? g_pass : g_fail)++;
++                }
++                {   // the plan: kept rows as the full plan's, the others empty (last-row and S2 masks, set 0..sets-1, layer 0)
++                    size_t bad = 0;
++                    for (int s = 0; s < sets; ++s)
++                        for (int mode : {2, 3})
++                        {
++                            glue::RoutePlan F, P;
++                            call(bs, 0, M, s, 0, 0u, nullptr, false);
++                            CK(cudaMemcpyAsync(&F, dplan, sizeof F, cudaMemcpyDeviceToHost, st));
++                            call(bs, 0, M, s, 0, kp(mode, s), kd(mode, s), false);
++                            CK(cudaMemcpyAsync(&P, dplan, sizeof P, cudaMemcpyDeviceToHost, st));
++                            CK(cudaStreamSynchronize(st));
++                            const unsigned want = mode == 2 ? last : hkeep[s];
++                            for (int m = 0; m < M; ++m)
++                                for (int k = 0; k < 8; ++k)
++                                {
++                                    if (want >> m & 1u)
++                                    {
++                                        const int fs = F.tok_slot[m][k], ps = P.tok_slot[m][k];
++                                        bad += ps < 0 || P.slot_expert[ps] != F.slot_expert[fs] || P.tok_expert[m][k] != F.tok_expert[m][k] ||
++                                               memcmp(&P.tok_w[m][k], &F.tok_w[m][k], 4) || P.slot_tok[ps][P.tok_col[m][k]] != m ||
++                                               (M <= 8 && P.tok_col[m][k] != F.tok_col[m][k]);
++                                    }
++                                    else bad += P.tok_slot[m][k] != -1 || P.tok_expert[m][k] != -1;
++                                }
++                        }
++                    printf("%s M=%d fuse=%d plan: kept rows as the full plan, the others without routes (%zu entries differ)\n", bad ? "FAIL" : "PASS",
++                           M, fuse, bad);
++                    (bad ? g_fail : g_pass)++;
++                }
++                plain(0, 0, got);  cmp("full run twice (plain)", 0, 0, got);
++                plain(0, 1, got);  cmp("keep = all rows == full (plain)", 0, 1, got);
++                for (int v = 0; v < 3; ++v)
++                {
++                    if (v && !bind::k1_ovl_on(bs[0].k1, O[v])) continue;   // the fork applies only to separate launches
++                    plain(v, 2, got);  cmp("last row (plain)", v, 2, got);
++                    plain(v, 3, got);  cmp("S2 layout's last rows, keep_dev (plain)", v, 3, got);
++                    graph(v, 2, got);  cmp("last row (graph)", v, 2, got);
++                    graph(v, 3, got);  cmp("S2 layout's last rows, keep_dev (graph)", v, 3, got);
++                }
++                graph(0, 0, got);  cmp("full (graph) == full (plain)", 0, 0, got);
++            }
++    }
++
++    // ---------------------------------------------------------------- bench
++    if (bench)
++    {
++        cudaEvent_t e0, e1;
++        CK(cudaEventCreate(&e0));
++        CK(cudaEventCreate(&e1));
++        printf("bench: us per MoE layer call = graph of reps x [x2 copy, xfrag, router GEMV, plan, K1] / reps, median of 5\n");
++        for (int M : BMs)
++        {
++            std::vector<Bound> bs, b1;
++            if (const char* e = make(M, 1, bs)) { printf("M=%d make: %s\n", M, e); continue; }
++            if (const char* e = make(1, 1, b1)) { printf("M=1 make: %s\n", e); continue; }
++            double nex[2] = {0, 0}, bytes[2] = {0, 0};      // full, last row
++            for (int s = 0; s < sets; ++s)
++                for (int k = 0; k < 2; ++k)
++                {
++                    call(bs, 0, M, s, 0, k ? 1u << (M - 1) : 0u, nullptr, false);
++                    glue::RoutePlan P;
++                    CK(cudaMemcpyAsync(&P, dplan, sizeof P, cudaMemcpyDeviceToHost, st));
++                    CK(cudaStreamSynchronize(st));
++                    std::vector<int> ex(P.slot_expert, P.slot_expert + P.n_slots);
++                    ex.erase(std::unique(ex.begin(), ex.end()), ex.end());
++                    nex[k] += ex.size();
++                    bytes[k] += Ls[0].ebytes[256];
++                    for (int e : ex) bytes[k] += Ls[0].ebytes[e];
++                }
++            for (int k = 0; k < 2; ++k) { nex[k] /= sets; bytes[k] /= sets; }
++            const int NV = 3;
++            const char* name[NV] = {"full", "last row", "M=1 step"};
++            auto capture = [&](int r) {
++                cudaGraph_t gr;
++                cudaGraphExec_t ge;
++                CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
++                for (int i = 0; i < reps; ++i)
++                {
++                    const int s = i % sets, l = (i / sets + i) % nlay;
++                    if (r == 2) call(b1, 0, 1, s, l, 0u, nullptr);
++                    else call(bs, 0, M, s, l, r ? 1u << (M - 1) : 0u, nullptr);
++                }
++                CK(cudaStreamEndCapture(st, &gr));
++                CK(cudaGraphInstantiate(&ge, gr, 0));
++                CK(cudaGraphDestroy(gr));
++                return ge;
++            };
++            auto time = [&](cudaGraphExec_t ge) {
++                CK(cudaGraphLaunch(ge, st));
++                CK(cudaStreamSynchronize(st));
++                float ms = 0;
++                CK(cudaEventRecord(e0, st));
++                CK(cudaGraphLaunch(ge, st));
++                CK(cudaEventRecord(e1, st));
++                CK(cudaEventSynchronize(e1));
++                CK(cudaEventElapsedTime(&ms, e0, e1));
++                return 1000.0 * ms / reps;
++            };
++            cudaGraphExec_t ge[NV];
++            for (int r = 0; r < NV; ++r) ge[r] = capture(r);
++            std::vector<double> t[NV];
++            for (int rep = 0; rep < 5; ++rep)
++                for (int r = 0; r < NV; ++r) t[r].push_back(time(ge[r]));
++            double med[NV];
++            for (int r = 0; r < NV; ++r)
++            {
++                std::sort(t[r].begin(), t[r].end());
++                med[r] = t[r][2];
++                CK(cudaGraphExecDestroy(ge[r]));
++            }
++            CK(cudaGetLastError());
++            for (int r = 0; r < NV; ++r)
++                printf("bench M=%d %-9s form=%s experts=%.1f MB=%.2f us/call=%7.1f (min %7.1f max %7.1f)  vs full %+6.1f us (%+5.1f%%)\n", M, name[r],
++                       bs[0].k1.fuse ? "fused" : "separate", r == 2 ? 8.0 : nex[r], (r == 2 ? bytes[1] : bytes[r]) / 1e6, med[r], t[r][0], t[r][4],
++                       med[r] - med[0], 100 * (med[r] - med[0]) / med[0]);
++            fflush(stdout);
++        }
++    }
++    for (void* p : mem) cudaFree(p);
++    if (check) printf("%s: %d passed, %d failed\n", g_fail ? "FAILED" : "OK", g_pass, g_fail);
++    return g_fail ? 1 : 0;
++}
+diff --git a/engine/runtime/g6m4.cu b/engine/runtime/g6m4.cu
+index 33cf11a..141d09c 100644
+--- a/engine/runtime/g6m4.cu
++++ b/engine/runtime/g6m4.cu
+@@ -603,6 +603,11 @@ int main(int argc, char** argv)
+     // rank's vocab slice; the target's head is unchanged. In the S2 runtime signature.
+     const DraftHeadI4 dhead = draft_head_i4_env();
+     if (dhead.on && !mtp) die("G6_DRAFT_HEAD_I4=1 needs --mtp");
++    // G6_MTP_LASTROW=1 (rank.cuh mtp_lastrow_env; default 0): a first-form draft step routes only each session's last
++    // row (the rows before it only write layer 78's caches). Same caches, drafts and log-probabilities. In the S2 runtime
++    // signature
++    const bool mtp_last = mtp_lastrow_env();
++    if (mtp_last && !mtp) die("G6_MTP_LASTROW=1 needs --mtp");
+     // G6_DFL_HEAD_I4=1 (dflash.cuh dfl_head_i4; default 0): the DFlash2 drafter's head reads the same INT4 records (the MTP
+     // draft's copy when there is one), with G6_DRAFT_HEAD_KS / _TPC. In the S2 runtime signature.
+     std::string dfe;
+@@ -843,6 +848,7 @@ int main(int argc, char** argv)
+             qs_attach(D.d, fabdg.dev(), fd.error);   // the draft fabric's error word, which the draft step checks
+         }
+         build_draft_head_i4(D, dhead, st);
++        D.d.route_last = mtp_last;
+         D.d.graph = graph; D.d.in = in_d; D.d.out = out_d;
+         DQ.P.attn_rows = pf_attn_rows(MP);
+         if (MP) build_draft_prefill(DQ, D, find, MP, fp, pfv2, st, &P);
+@@ -1520,6 +1526,7 @@ int main(int argc, char** argv)
+                 (qs_mode ? " qasplit " + std::to_string(qs_mode) : "") +
+                 (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "") +
+                 (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
++                (mtp_last ? " mtplast 1" : "") +
+                 (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
+                 (dfl_body_i4_on ? " dflbodyi4 1" : "") +
+                 (dsel_start_mtp ? " dselstart mtp" : "") +
+diff --git a/engine/runtime/m4sim.cu b/engine/runtime/m4sim.cu
+index 0301be5..ad95456 100644
+--- a/engine/runtime/m4sim.cu
++++ b/engine/runtime/m4sim.cu
+@@ -47,6 +47,10 @@
+ //        "row q<seq> pos <p> M <M> s <step> | in <token fed> tok <sampled> lp <bits> lpt <bits> resid <fnv of the row's
+ //        residual> logits <fnv of the row's logits, the ranks' slices in rank order>". The part after "|" must not depend
+ //        on the step's row count or on the other rows of the step (scripts/m4sim_split_check.sh compares it).
++// G6_MTP_LASTROW=1 (needs --mtp): as g6m4, a draft step routes only each session's last row (rank.cuh launch_mlp_block).
++// G6_MTP_LASTROW_CHECK=1: after each draft step one "check" line per session: its last row's token, log-probability,
++//        head-input and residual rows, and a hash of every rank's whole layer-78 caches. With and without G6_MTP_LASTROW
++//        every line but the first-form "draft" lines (their other rows) must be the same (scripts/mtp_lastrow_check.sh).
+ // [--minv B] [--minv-rows 1,2,..]: per --prompt, rows 0..B-1 in --chunk steps, then for every row count M of the list
+ //        (default 1..MX then MX-1..1, each <= prompt - B) one step over prompt rows B..B+M-1 (teacher-forced) from that same
+ //        state, with its row lines. Row B + j must print the same line at every M > j. No --mtp / --s2 / --serve / --prefill.
+@@ -245,6 +249,7 @@ int main(int argc, char** argv)
+     setvbuf(stdout, nullptr, _IOLBF, 0);
+     pf_env_check();                    // strict G6_PF_* choices (envparse.h): a bad value exits before any work
+     const DraftHeadI4 dhead = draft_head_i4_env();   // G6_DRAFT_HEAD_I4 (rank.cuh), as g6m4: the MTP draft's INT4 head
++    const bool mtp_last = mtp_lastrow_env();         // G6_MTP_LASTROW (rank.cuh), as g6m4: draft steps route only last rows
+     std::string packs;
+     V2Src v2src;                        // --v2-dense: every rank's image from the exlr8 release (no packs)
+     g6rt::CommonOpts co;                // every flag g6m4 takes too, parsed in engine_opts.h
+@@ -320,6 +325,7 @@ int main(int argc, char** argv)
+     }
+     else if (!minv_s.empty()) die("--minv-rows needs --minv");
+     if (dhead.on && !mtp) die("G6_DRAFT_HEAD_I4=1 needs --mtp");
++    if (mtp_last && !mtp) die("G6_MTP_LASTROW=1 needs --mtp");
+     if (plan.rs && (s2mode || !mtp)) die("--spec-accept rejection needs --mtp, and not --s2");
+     if ((adapt || !levels_s.empty()) && (s2mode || !mtp || (!levels_s.empty() && !adapt))) die("--spec-adaptive needs --mtp, and not --s2; --spec-levels needs it");
+     SpecLen spec;                       // --spec-adaptive (graphs are captured per row count on first use here)
+@@ -631,6 +637,7 @@ int main(int argc, char** argv)
+             build_draft(DR[r], R[r], rfind(r), cap, fd, stepp_d, st, MP ? pf_attn_rows(MP) : MX);
+             qs_loop_attach(DR[r].d, qsl_d, stepp_d);
+             build_draft_head_i4(DR[r], dhead, st);
++            DR[r].d.route_last = mtp_last;
+             DR[r].d.graph = graph; DR[r].d.in = in_d; DR[r].d.out = out_d + r;
+             loop_d.send[r] = fd.send;
+             if (MP) DQ[r].P.attn_rows = pf_attn_rows(MP);   // DQ is empty without --prefill (was an out-of-bounds write)
+@@ -1186,6 +1193,41 @@ int main(int argc, char** argv)
+         printf("%s\n", line0.c_str());
+         return last;
+     };
++    // G6_MTP_LASTROW_CHECK=1 (header): after every draft step, per session, one line with what readers of a draft step take
++    // and the layer-78 caches: "<prefix> check <s> | rows <n> last <row> tok <t> lp <bits> x <fnv> resid <fnv> kv <fnv>":
++    // the last row's token and log-probability (rank 0), its head-input row (x, the shared_head_norm output) and residual
++    // over every rank, and every rank's whole draft-layer KV latent and indexer key caches. G6_MTP_LASTROW on and off must
++    // print the same lines (scripts/mtp_lastrow_check.sh)
++    const bool dcheck_on = getenv("G6_MTP_LASTROW_CHECK") && atoi(getenv("G6_MTP_LASTROW_CHECK")) != 0;
++    auto dcheck = [&](const std::string& prefix, int s, int r0, int n, const StepOut* so) {
++        if (!dcheck_on) return;
++        const int last = r0 + n - 1;
++        uint64_t hx = 0xcbf29ce484222325ull, hr = hx, hk = hx;
++        std::vector<uint8_t> h;
++        for (int r = 0; r < NR; ++r)
++        {
++            const G6Attn& a = DR[r].d.layers[0].ab.args;
++            const size_t kb = (size_t)a.page_count * 64 * g6kv::ROW, ib = (size_t)a.page_count * 64 * g6kv::IDX_ROW;
++            h.resize(kb);
++            G6RT_CK(cudaMemcpy(h.data(), a.mla_cache, kb, cudaMemcpyDeviceToHost));
++            hk = fnv(hk, h.data(), kb);
++            if (a.index_cache)
++            {
++                h.resize(ib);
++                G6RT_CK(cudaMemcpy(h.data(), a.index_cache, ib, cudaMemcpyDeviceToHost));
++                hk = fnv(hk, h.data(), ib);
++            }
++            h.resize(HID * 4);
++            G6RT_CK(cudaMemcpy(h.data(), DR[r].d.x + (size_t)last * HID, HID * 2, cudaMemcpyDeviceToHost));
++            hx = fnv(hx, h.data(), HID * 2);
++            G6RT_CK(cudaMemcpy(h.data(), DR[r].d.resid + (size_t)last * HID, HID * 4, cudaMemcpyDeviceToHost));
++            hr = fnv(hr, h.data(), HID * 4);
++        }
++        uint32_t ul;
++        memcpy(&ul, &so[0].lp[last], 4);
++        printf("%s check %d | rows %d last %d tok %d lp %08x x %016llx resid %016llx kv %016llx\n", prefix.c_str(), s, n, last, so[0].tok[last], ul,
++               (unsigned long long)hx, (unsigned long long)hr, (unsigned long long)hk);
++    };
+     // G6_ROW_LINES (header): the target step's rows, one line each (rank 0); every rank's residual row must be rank 0's
+     auto row_lines = [&](size_t q, int s, const StepIn& si, const StepOut* so) {
+         const int M = si.M;
+@@ -1361,6 +1403,7 @@ int main(int argc, char** argv)
+                     else if (line != line0) { ++bad; printf("RANK %d DIFFERS: %s\n", r, line.c_str()); }
+                 }
+                 printf("%s\n", line0.c_str());
++                if (draft) dcheck(prefix, s, h.row0[j], h.rows[j], so);
+                 if (rowhash && !draft)
+                     for (int r = h.row0[j]; r < h.row0[j] + h.rows[j]; ++r)
+                     {
+@@ -1828,6 +1871,7 @@ int main(int argc, char** argv)
+             auto rd = [&](const StepIn& di, bool chain, int s, double& ms) {
+                 ms += run_draft(di, chain, sd);
+                 const int t = lines(chain ? "chain" : "draft", true, sd, s, di.M);
++                dcheck(chain ? "chain" : "draft", s, 0, di.M, sd);
+                 if (!mtp_dump.empty() && di.step == 1)               // the first prompt step's draft pass
+                 {
+                     const int M = di.M;
+diff --git a/engine/runtime/rank.cuh b/engine/runtime/rank.cuh
+index 78927a9..896e39f 100644
+--- a/engine/runtime/rank.cuh
++++ b/engine/runtime/rank.cuh
+@@ -410,6 +410,8 @@ struct Model
+                                       // rejection sampling (the glue.cuh _rs head kernels)
+     QSplit qs;                        // G6_QA_SPLIT (main model only; mode 0 = today's replicated GEMVs)
+     bind::K1Ovl ovl;                  // G6_ROUTE_OVL (route_ovl_init; mode 0 = off): the shared expert's side stream
++    bool route_last = false;          // G6_MTP_LASTROW (MTP draft model only, set before capture): only each session's last row
++                                      // of a step takes routed experts (launch_mlp_block, mtp_lastrow_env)
+     int ncoll() const { return 2 * nl + 1; }
+ #if defined(G6_CP) && G6_CP
+     CpState cp;
+@@ -1378,6 +1380,25 @@ inline void route_ovl_init(Model& m)
+ }
+ 
+ constexpr int RLOG = 4 + SMAX;           // RoutePlan head: n_slots (slots, an expert can take several), pad_[3], slot_expert[SMAX]
++#ifdef DEC_S2
++inline const unsigned* s2_last_rows(Model& m, cudaStream_t st);
++#endif
++// G6_MTP_LASTROW=1 (default 0; needs --mtp; every rank, read at boot before any capture): the MTP draft step routes only
++// the last row of each session (the step's last row on today's path; on the S2 path each session's last row, from S2In,
++// so a chain step routes all of its rows). Every reader of a draft step takes only those rows: d[1] and its log-probability
++// (s2_batch.h, mtp_sequence) and the kept hidden row (launch_draft_keep). The other rows of a first form are there to
++// write layer 78's caches, and those are written in the attention block from the layer input, before the experts. So
++// their experts are skipped (k_router_plan keep: no slot, the shared expert only; a row's K1 bytes do not depend on the
++// other rows' routes, as S2 sessions in one step rely on), and the caches, the last row's hidden, its token and its
++// log-probability are the bytes of the full step. The other rows' outputs (unread) change. A first form of a+1 rows reads
++// the routed experts of one row instead of a+1. In the S2 runtime signature.
++inline bool mtp_lastrow_env()
++{
++    std::string err;
++    const int v = env_choice("G6_MTP_LASTROW", 1, 0, &err);
++    if (v < 0) die(err);
++    return v != 0;
++}
+ inline void launch_mlp_block(Model& m, int i, int M, cudaStream_t st)
+ {
+     Layer& y = m.layers[i];
+@@ -1390,7 +1411,17 @@ inline void launch_mlp_block(Model& m, int i, int M, cudaStream_t st)
+     if (y.moe)
+     {
+         bind::launch(b.router, st);
+-        glue::k_router_plan<<<1, 256, 0, st>>>(m.logits, y.router_bias, M, m.plan);
++        unsigned keep = 0u;                    // G6_MTP_LASTROW: the rows that take routed experts (0 = all)
++        const unsigned* keep_dev = nullptr;
++        if (m.route_last)
++        {
++#ifdef DEC_S2
++            if (m.s2on) keep_dev = s2_last_rows(m, st);
++            else
++#endif
++            keep = 1u << (M - 1);
++        }
++        glue::k_router_plan<<<1, 256, 0, st>>>(m.logits, y.router_bias, M, m.plan, keep, keep_dev);
+         if (m.rlog) G6RT_CK(cudaMemcpyAsync(m.rlog + (size_t)i * RLOG, m.plan, RLOG * sizeof(int), cudaMemcpyDeviceToHost, st));
+     }
+     dmark(DP_ROUTER, st);
+diff --git a/engine/runtime/s2.cuh b/engine/runtime/s2.cuh
+index 7e4ed36..dfd7d0b 100644
+--- a/engine/runtime/s2.cuh
++++ b/engine/runtime/s2.cuh
+@@ -90,6 +90,7 @@ struct S2Model
+     std::vector<std::unique_ptr<G6AttnBinding>> views;       // shallow views of a pool binding (never released / reset)
+     std::map<std::tuple<int, int, int>, std::unique_ptr<bind::Layer>> L;              // (layer, M, cls)
+     __half *hcat = nullptr, *hprev_b = nullptr;              // draft model: [MX][HID], [S2N][HID]
++    unsigned* last_rows = nullptr;                           // draft model, G6_MTP_LASTROW: bit r = row r is its session's last
+ };
+ 
+ // pages base, base + 1, .., base + pages - 1: the contiguous run the allocator grants
+@@ -238,6 +239,7 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
+     s->cat = dmalloc<__half>((size_t)MX * heads * 256);
+     s->hcat = dmalloc<__half>((size_t)MX * HID);
+     s->hprev_b = dmalloc<__half>((size_t)S2N * HID);
++    s->last_rows = dmalloc<unsigned>(1);
+     s->sab.assign(m.nl, std::vector<G6AttnBinding*>(S2N, nullptr));
+     s->bv.assign(m.nl, nullptr);
+     std::vector<const int*> tabs((size_t)S2N * m.nl, nullptr);
+@@ -775,6 +777,23 @@ inline void s2_draft_keep(Draft& D, cudaStream_t st)
+     S2Model& s = *D.d.s2;
+     k_s2_draft_keep<<<S2N, 256, 0, st>>>(S2Keep{reinterpret_cast<const uint32_t*>(s.in), D.d.x, s.hprev_b});
+ }
++// G6_MTP_LASTROW (rank.cuh launch_mlp_block): the rows of the step that are their session's last (S2In, device), as the
++// router plan's keep mask. grid 1, block 32
++__global__ void __launch_bounds__(32) k_s2_last_rows(const uint32_t* in, unsigned* out)
++{
++    if (threadIdx.x) return;
++    const int ns = (int)__ldcv(in + offsetof(S2In, ns) / 4);
++    unsigned b = 0u;
++    for (int j = 0; j < ns && j < S2N; ++j)
++        b |= 1u << ((int)__ldcv(in + offsetof(S2In, row0) / 4 + j) + (int)__ldcv(in + offsetof(S2In, rows) / 4 + j) - 1);
++    *out = b;
++}
++inline const unsigned* s2_last_rows(Model& m, cudaStream_t st)
++{
++    S2Model& s = *m.s2;
++    k_s2_last_rows<<<1, 32, 0, st>>>(reinterpret_cast<const uint32_t*>(s.in), s.last_rows);
++    return s.last_rows;
++}
+ 
+ // after the step's stream is synchronized: step_line over the rows r0..r0+n-1 of a step (tokens, logprobs, target
+ // logprobs, residual hash of those rows), so a session's line in a batched step compares with its solo line
+diff --git a/scripts/mtp_lastrow_check.sh b/scripts/mtp_lastrow_check.sh
+new file mode 100755
+index 0000000..3ed9786
+--- /dev/null
++++ b/scripts/mtp_lastrow_check.sh
+@@ -0,0 +1,84 @@
++#!/bin/bash
++# m4sim check of G6_MTP_LASTROW (rank.cuh launch_mlp_block: a draft step routes only each session's last row) on ONE GPU
++# (m4sim simulates every rank). The claim: the layer-78 caches, every draft step's last row (token, log-probability,
++# head-input and residual rows) and so every target step, round and generated token are the bytes of the run without it.
++#
++#   MODEL_ARGS="--packs DIR" [M4SIM=./m4sim] [OUT=dir] [QUICK=1] scripts/mtp_lastrow_check.sh
++#
++# MODEL_ARGS: as scripts/m4sim_split_check.sh (--packs DIR, or --tp 4 --v2 DIR --v2-slices DIR --v2-widths FILE --v2-dense DIR).
++# Runs, each with G6_MTP_LASTROW=0 and =1 and G6_MTP_LASTROW_CHECK=1 (a "check" line after every draft step, m4sim header):
++#   mtp   --mtp K decode of two prompts (prompt steps of --chunk 8 rows, so first forms of 1..8 rows), plain and graph
++#   s2    --s2 --mtp 2, three sessions sharing steps (first forms of several sessions: each session's last row), plain
++#         and graph
++#   split the mtp graph run with G6_MTP_SPLIT=1 (the eh_proj gather) and G6_DRAFT_HEAD_I4=1 (not QUICK)
++# PASS = stdout of the two runs equal after dropping the first-form "draft" lines (their other rows change by design),
++# with at least one check line, and the dropped lines differing somewhere (the flag took effect).
++# Exit 0 = every check PASS. Every run's stdout / stderr stays in OUT.
++set -u
++HERE=$(cd "$(dirname "$0")" && pwd)
++M4SIM=${M4SIM:-$HERE/m4sim}
++[ -x "$M4SIM" ] || M4SIM=$HERE/../bin/m4sim
++[ -x "$M4SIM" ] || { echo "m4sim not found: set M4SIM"; exit 2; }
++[ -n "${MODEL_ARGS:-}" ] || { echo "set MODEL_ARGS (--packs DIR, or the --v2 ... --v2-dense ... release form)"; exit 2; }
++OUT=${OUT:-$PWD/m4sim-mtplast-$(date +%Y%m%d-%H%M%S)}
++mkdir -p "$OUT"
++LAYERS=${LAYERS:-0,1,2,3,6}
++QUICK=${QUICK:-0}
++TMO=${TMO:-1800}
++TEMP=${TEMP:-0}
++MTP_K=${MTP_K:-3}
++GEN=${GEN:-48}
++CAP=${CAP:-256}
++COMMON_ENV="G6_DEC_SHARED_SCRATCH=1 G6_MTP_LASTROW_CHECK=1 ${BASE_ENV:-G6_CP=0}"
++COMMON_ARGS="--layers $LAYERS --cap $CAP --temp $TEMP --wide --pfv2"
++GRAPH_ENV="G6_DEC_SPLIT=3"
++read -r P0 P1 P2 < <(python3 - <<'EOF'
++x = 12345
++out = []
++for n in (72, 48, 24):
++    ids = []
++    for _ in range(n):
++        x = (x * 1103515245 + 12345) % (1 << 31)
++        ids.append(str(1000 + x % 149000))
++    out.append(','.join(ids))
++print(' '.join(out))
++EOF
++)
++PROMPTS="--prompt $P0 --prompt $P1"
++fails=0
++run() {   # run NAME "ENV..." ARGS...
++  local name=$1 env=$2; shift 2
++  echo "+ $env m4sim $*" > "$OUT/cmd.$name.txt"
++  local t0=$SECONDS
++  env $env timeout "$TMO" "$M4SIM" $MODEL_ARGS "$@" > "$OUT/out.$name.txt" 2> "$OUT/err.$name.txt"
++  local rc=$?
++  echo "  $name: rc $rc, $((SECONDS - t0)) s"
++  [ $rc = 0 ] || { echo "FAIL run $name: exit $rc (see $OUT/err.$name.txt)"; fails=$((fails + 1)); }
++}
++drop='^(q[0-9]+ )?draft [0-9]'
++pair() {  # pair NAME "ENV" ARGS...: flag off and on, compared
++  local name=$1 env=$2; shift 2
++  run "$name.off" "$env G6_MTP_LASTROW=0" "$@"
++  run "$name.on" "$env G6_MTP_LASTROW=1" "$@"
++  local a=$OUT/out.$name.off.txt b=$OUT/out.$name.on.txt
++  local nchk; nchk=$(grep -c ' check ' "$b")
++  if ! diff -q <(grep -Ev "$drop" "$a") <(grep -Ev "$drop" "$b") > /dev/null; then
++    echo "FAIL $name: lines differ (diff <(grep -Ev '$drop' $a) <(grep -Ev '$drop' $b))"; fails=$((fails + 1))
++  elif [ "$nchk" = 0 ]; then
++    echo "FAIL $name: no check lines (G6_MTP_LASTROW_CHECK not in this m4sim?)"; fails=$((fails + 1))
++  elif diff -q <(grep -E "$drop" "$a") <(grep -E "$drop" "$b") > /dev/null; then
++    echo "FAIL $name: the draft lines did not change at all (the flag had no effect?)"; fails=$((fails + 1))
++  else
++    echo "PASS $name: $(grep -Evc "$drop" "$b") lines equal ($nchk check lines: caches, last rows), $(grep -Ec "$drop" "$b") draft lines dropped"
++  fi
++}
++pair mtp.plain "$COMMON_ENV" $COMMON_ARGS $PROMPTS --chunk 8 --gen "$GEN" --mtp "$MTP_K"
++pair mtp.graph "$COMMON_ENV $GRAPH_ENV" $COMMON_ARGS --graph $PROMPTS --chunk 8 --gen "$GEN" --mtp "$MTP_K"
++pair s2.plain "$COMMON_ENV" $COMMON_ARGS $PROMPTS --prompt "$P2" --chunk 8 --gen 24 --mtp 2 --s2
++pair s2.graph "$COMMON_ENV $GRAPH_ENV" $COMMON_ARGS --graph $PROMPTS --prompt "$P2" --chunk 8 --gen 24 --mtp 2 --s2
++if [ "$QUICK" != 1 ]; then
++  pair split.graph "$COMMON_ENV $GRAPH_ENV G6_MTP_SPLIT=1 G6_DRAFT_HEAD_I4=1" $COMMON_ARGS --graph $PROMPTS --chunk 8 --gen "$GEN" --mtp "$MTP_K"
++  pair temp.graph "$COMMON_ENV $GRAPH_ENV" $COMMON_ARGS --graph $PROMPTS --chunk 8 --gen "$GEN" --mtp "$MTP_K" --temp 0.8 --seed 77
++fi
++echo "$([ $fails = 0 ] && echo OK || echo FAILED): $fails failure(s); outputs in $OUT"
++exit $([ $fails = 0 ] && echo 0 || echo 1)

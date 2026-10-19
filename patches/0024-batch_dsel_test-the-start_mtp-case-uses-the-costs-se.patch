@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Mon, 19 Oct 2026 03:01:58 +0200
+Subject: [PATCH 24/30] batch_dsel_test: the start_mtp case uses the costs set
+ before the reset case's MTP-cheap table
+
+---
+ engine/runtime/s2/tests/batch_dsel_test.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/engine/runtime/s2/tests/batch_dsel_test.cpp b/engine/runtime/s2/tests/batch_dsel_test.cpp
+index 7e084de..32b7672 100644
+--- a/engine/runtime/s2/tests/batch_dsel_test.cpp
++++ b/engine/runtime/s2/tests/batch_dsel_test.cpp
+@@ -42,6 +42,7 @@ int main()
+     sel.on = true;
+     sel.d.draft_round = 8.1; sel.m.draft_round = 5.5; sel.m.draft_each = 2.1;
+     b.dsel(sel);
++    const DSel sel0 = sel;   // the start_mtp case below uses these costs, not the reset case's MTP-cheap table
+     Session s; s.prompt.assign(10, 5); s.first = 9; s.chunk = 8; s.n_gen = 4000; s.dflash = true;
+     b.admit({0}, {s});
+     for (int i = 0; i < 40; ++i) CHECK(b.round({0}));
+@@ -86,7 +87,7 @@ int main()
+     {
+         Batch c(3, 32, h);
+         c.dflash(7, g6rt::SpecLen());
+-        DSel s2 = sel;
++        DSel s2 = sel0;
+         s2.start_mtp = true;
+         c.dsel(s2);
+         rounds.clear(); got.clear();

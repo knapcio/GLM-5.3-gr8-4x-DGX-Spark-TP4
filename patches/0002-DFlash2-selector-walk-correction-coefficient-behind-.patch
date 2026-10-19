@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Thu, 15 Oct 2026 08:15:31 +0200
+Subject: [PATCH 02/30] DFlash2 selector walk: correction coefficient behind
+ G6_DFL_SEL_ALPHA
+
+score = logit + alpha * correction; the draft lp follows the new scores. Drafts
+only, the verify is unchanged. Default 1 gives the same bits (1 * x is exact).
+---
+ docs/SETTINGS.md          |  1 +
+ engine/runtime/dflash.cuh |  8 +++++---
+ engine/runtime/g6m4.cu    | 11 +++++++++--
+ 3 files changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/docs/SETTINGS.md b/docs/SETTINGS.md
+index ddddad3..f9b7b20 100644
+--- a/docs/SETTINGS.md
++++ b/docs/SETTINGS.md
+@@ -100,6 +100,7 @@ the short version.
+ | `G6_DFL_HEAD_I4` | 0 | DFlash2 drafter (needs `--dflash-manifest`): its lm_head GEMV reads the same INT4 g32 records as `G6_DRAFT_HEAD_I4` (the MTP draft's copy when that is on, else one made the same way; same `G6_DRAFT_HEAD_KS` / `_TPC`). In selector mode the head's raw logits choose each row's top-16 candidates and enter their walk scores, so INT4 can change both. The target's head and the verify steps are unchanged. Every rank must set the same value |
+ | `G6_DFL_BODY_I4` | 0 | DFlash2 drafter (needs `--dflash-manifest`): its body GEMVs (fc, and per layer kv, aconv, q, o, mconv, gu, down) read INT4 g32 copies of their MXFP8 records, made at boot on the GPU by the `G6_DRAFT_HEAD_I4` arithmetic, with the same splits: 382 MB instead of 701 MB per draft step's reads (the pack image keeps the MXFP8 records: +382 MB per rank). The selector's hproj and the head (`G6_DFL_HEAD_I4`) are not touched. Drafts only: the target and the verify steps are unchanged; drafts and their log-probabilities can differ (`engine/runtime/dflreplay.cu` compares both drafters on a `G6_DFL_DUMP`). The drafter choice's drafting cost (`G6_SPEC_DRAFT`) is not changed with it. Every rank must set the same value |
+ | `G6_ROUTE_OVL` | 0 | decode, trellis-shared MoE layers with separate fc1 / fc2 launches (2+ rows): the shared expert runs on a forked stream from before the router GEMV, so its weight reads overlap the router GEMV (8 of 48 SMs) and the single-CTA plan kernel. 1 = its fc1 and fc2 on the fork, joined before the finalize; 2 = its fc1 only, joined before fc2. Same bytes out (`k1_ovl_test`). Fused layers (1 row) and the MTP layer run as before. Read once |
++| `G6_DFL_SEL_ALPHA` | 1 | DFlash2 selector walk (needs `--dflash-manifest` and the selector): each candidate scores `logit + a * correction` instead of `logit + correction`, and the draft's log-probability comes from those scores. Drafts only; the verify is unchanged. Every rank must set the same value |
+ | `G6_GV_MULTI` | 1 | steps of up to 8 rows run the GEMVs on the layer input (q_a, kv_a, the indexer's k and weights) as one launch; 0 = one launch each (same bits) |
+ | `G6_S2_ADAPT` | 0 | S2: choose each round's MTP draft count (1..k) from the sessions' accept rates and the S2 step costs; 1 adds ~1 GiB of main-step graphs |
+ | `G6_S2_GROW` | 1 | S2: a session below R holds the KV pages it needs now and takes more as its output grows, admitted and grown only while every live session can still reach prompt + `max_tokens` + guard; a session that cannot grow sits out rounds. 0 = every run holds that worst case from admission |
+diff --git a/engine/runtime/dflash.cuh b/engine/runtime/dflash.cuh
+index 1340b10..19b18a2 100644
+--- a/engine/runtime/dflash.cuh
++++ b/engine/runtime/dflash.cuh
+@@ -79,6 +79,7 @@ struct Dfl
+ {
+     int rank = -1;
+     bool sel = false;                 // DFlash2 selector walk (else argmax / gr8's sampler)
++    float sel_alpha = 1.f;            // G6_DFL_SEL_ALPHA: the walk's correction coefficient (draft tokens and lp only)
+     int mask_id = 0;
+     float theta = 1e6f, eps = 1e-5f;
+     int tlayer[dfl::NT] = {};         // target_layer_ids
+@@ -416,7 +417,7 @@ __global__ void __launch_bounds__(1024) k_top_local(TopArgs a)
+     glue::publish(a.f, a.c, g6::coll_seq(*a.stepp, a.c, a.f.ncoll), a.ticket);
+ }
+ // merge every rank's candidates -> global top-16 per row, then the walk, with prev = the bonus token at s = 1:
+-//   score(c) = logit(c) + sum_i pred[prev][i] hp[s][i] succ[c][i]
++//   score(c) = logit(c) + alpha * sum_i pred[prev][i] hp[s][i] succ[c][i]   (alpha = Dfl::sel_alpha, 1 by default)
+ //   pick = argmax of score * inv_temp + gumbel(row s's key, c), or of score when greedy
+ //   prev = pick, s = s + 1, up to s = 7. lp_out = log-probability of the pick in softmax(score) over the 16
+ // grid 1, block 256. Warp w < 7 merges row w + 1, then warp w scores candidates w and w + 8.
+@@ -429,6 +430,7 @@ struct WalkArgs
+     const glue::SampleRow* srow;
+     int* tok_out;
+     float* lp_out;
++    float alpha;                      // the correction's coefficient (1: the trained selector, exactly)
+ };
+ __global__ void __launch_bounds__(256) k_walk(WalkArgs a)
+ {
+@@ -472,7 +474,7 @@ __global__ void __launch_bounds__(256) k_walk(WalkArgs a)
+                 acc += __bfloat162float(a.pred[(size_t)prev * SELR + i]) * hp[i] * __bfloat162float(a.succ[(size_t)id * SELR + i]);
+             #pragma unroll
+             for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+-            if (l == 0) s_sc[cc] = s_l[s][cc] + acc;
++            if (l == 0) s_sc[cc] = s_l[s][cc] + a.alpha * acc;
+         }
+         __syncthreads();
+         if (t == 0)
+@@ -873,7 +875,7 @@ inline void dfl_phase(Dfl& D, int p, cudaStream_t st, bool query = true)
+     }
+     // p == NC: the merge (gr8's head merge in argmax mode, the walk in selector mode), StepOut
+     if (D.sel)
+-        dflk::k_walk<<<1, 256, 0, st>>>(dflk::WalkArgs{D.f, D.stepp, NC - 1, D.hp, D.pred, D.succ, D.tok, D.srow, D.tok_out, D.lp});
++        dflk::k_walk<<<1, 256, 0, st>>>(dflk::WalkArgs{D.f, D.stepp, NC - 1, D.hp, D.pred, D.succ, D.tok, D.srow, D.tok_out, D.lp, D.sel_alpha});
+     else if (D.nc > 0) glue::k_head_merge_tp<<<B, 1024, 0, st>>>(dfl_head_args(D));
+     else glue::k_head_merge<<<1, 32, 0, st>>>(dfl_head_args(D));
+     dflk::k_out<<<1, 32, 0, st>>>(dflk::OutArgs{D.tok_out, D.lp, D.out});
+diff --git a/engine/runtime/g6m4.cu b/engine/runtime/g6m4.cu
+index 3b3c59d..6da53d5 100644
+--- a/engine/runtime/g6m4.cu
++++ b/engine/runtime/g6m4.cu
+@@ -503,6 +503,11 @@ int main(int argc, char** argv)
+     const char* dse = getenv("G6_S2_DSEL_START");
+     const bool dsel_start_mtp = dse && !strcmp(dse, "mtp");
+     if (dse && *dse && !dsel_start_mtp && strcmp(dse, "dflash")) die("G6_S2_DSEL_START: mtp or dflash");
++    // G6_DFL_SEL_ALPHA=<a> (dflash.cuh k_walk; default 1): the DFlash2 selector walk scores logit + a * correction. Drafts
++    // only: the verify is unchanged. In the S2 runtime signature
++    const float dfl_alpha = getenv("G6_DFL_SEL_ALPHA") ? (float)atof(getenv("G6_DFL_SEL_ALPHA")) : 1.f;
++    if (!std::isfinite(dfl_alpha)) die("G6_DFL_SEL_ALPHA: not a finite number");
++    if (dfl_alpha != 1.f && !dfl) die("G6_DFL_SEL_ALPHA needs --dflash-manifest");
+     g6::Fabric fabg, fabdg;
+     bool fabg_on = false, fabdg_on = false;
+     auto qs_fabric = [&](g6::Fabric& fb, const Model& mm, int port_off, const char* what) {
+@@ -776,6 +781,8 @@ int main(int argc, char** argv)
+             dfl_head_i4(DF, D.d.dh_i4 ? D.d.dh_i4 : head_i4_records(m.head_t.lm_head, m.vn, dhead.ks, R, "G6_DFL_HEAD_I4", st),
+                         dhead.tpc, dhead.ks);
+         if (dfl_body_i4_on) dfl_body_i4(DF, st);
++        if (dfl_alpha != 1.f && !DF.sel) die("G6_DFL_SEL_ALPHA needs the selector walk");
++        DF.sel_alpha = dfl_alpha;
+         dfl_attach(m, DF);              // before the target graphs are captured: they carry the residual taps
+         if (pfctx) { P.dfl_tap = dfl_pf_tap_launch; P2.dfl_tap = dfl_pf_tap_launch; }
+     }
+@@ -1383,8 +1390,8 @@ int main(int argc, char** argv)
+                 (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
+                 (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
+                 (dfl_body_i4_on ? " dflbodyi4 1" : "") +
+-                (dsel_start_mtp ? " dselstart mtp" : "");
+-
++                (dsel_start_mtp ? " dselstart mtp" : "") +
++                (dfl_alpha != 1.f ? " dflalpha " + std::to_string(dfl_alpha) : "");
+             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
+                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
+             g6s2::ControlLinks links = g6s2::bootstrap(bc);

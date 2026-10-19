@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: spectra-kindling <spectra-kindling@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 05:05:35 -0400
+Subject: [PATCH 19/30] D2 (#50) review round 2: KVB=fp8 accepted with --model
+ (the engine refuses a pack boot), the wire path's FP8 expansion ahead of the
+ consumed wait, absorb_m2 in the bench
+
+---
+ engine/runtime/qo_weights.cuh     |  8 ++++----
+ engine/runtime/tests/kvb8_test.cu | 13 ++++++++-----
+ tools/launch/options.py           |  6 ++++--
+ tools/launch/test_hf.py           | 12 ++++++++++++
+ tools/launch/test_options.py      |  3 ++-
+ 5 files changed, 30 insertions(+), 12 deletions(-)
+
+diff --git a/engine/runtime/qo_weights.cuh b/engine/runtime/qo_weights.cuh
+index 0003b9c..3bbd3ba 100644
+--- a/engine/runtime/qo_weights.cuh
++++ b/engine/runtime/qo_weights.cuh
+@@ -448,11 +448,8 @@ inline void qp_wire_build(QpRoll& R, QpWire& x, const QpSrc& q, QpW& w, cudaStre
+     const unsigned pe = (unsigned)(e << 4) | (unsigned)x.peer;
+     const unsigned long long tg = qw::tag(q.layer, x.S, x.E, x.ctx, q.form);
+     const QpHalf& o = q.h[oh];
+-    k_qp_wait<<<1, 32, 0, b>>>(x.bd, qw::f_consumed(e), x.peer, qw::consumed_min(n, x.E), qw::ERR_WAIT_CONSUMED | pe, 0ull, 0u);
+-    G6RT_CK(cudaGetLastError());
+-    char* tx = x.bd.bulk + qw::pos_off(e, oh);
+     // G6_KVB=fp8: the wire carries BF16 UK / UV (qp_wire.h layout, both members alike), so my half's are expanded into my
+-    // half of the slot first and sent from there
++    // half of the slot first (it needs only the slot's `used` events, waited by qp_roll_build) and sent from there
+     const void *wuk = o.uk.p, *wuv = o.uv.p;
+     if (o.uks)
+     {
+@@ -460,6 +457,9 @@ inline void qp_wire_build(QpRoll& R, QpWire& x, const QpSrc& q, QpW& w, cudaStre
+         kvb_put(const_cast<void*>(wuk), o.uk.p, o.uks, (size_t)16 * 192, b);
+         kvb_put(const_cast<void*>(wuv), o.uv.p, o.uvs, (size_t)16 * 256, b);
+     }
++    k_qp_wait<<<1, 32, 0, b>>>(x.bd, qw::f_consumed(e), x.peer, qw::consumed_min(n, x.E), qw::ERR_WAIT_CONSUMED | pe, 0ull, 0u);
++    G6RT_CK(cudaGetLastError());
++    char* tx = x.bd.bulk + qw::pos_off(e, oh);
+     G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_QC, o.qc.p, qw::QC, cudaMemcpyDefault, b));
+     G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_QS, o.qs.p, qw::QS, cudaMemcpyDefault, b));
+     G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_OC, o.oc.p, q.form & 2 ? qw::OT : qw::OC, cudaMemcpyDefault, b));
+diff --git a/engine/runtime/tests/kvb8_test.cu b/engine/runtime/tests/kvb8_test.cu
+index c340c31..6953032 100644
+--- a/engine/runtime/tests/kvb8_test.cu
++++ b/engine/runtime/tests/kvb8_test.cu
+@@ -6,8 +6,9 @@
+ //   2. Two bindings of one layer, BF16 and FP8, on the same KV rows and queries: decode (g6_attn_bind_run) under each
+ //      absorb / value_project variant (absorb_m / value_project_m, G6_AVP1, G6_ATTN_QT) and prefill
+ //      (g6_attn_bind_prefill_run) must give byte-identical outputs.
+-//   3. --bench: absorb_m and value_project_m of one layer (their launchers: the BF16 or FP8 instantiation), BF16 against FP8, at M rows with a cold L2 (a 96 MB write
+-//      between calls, as the experts' stream between two layers' attention when serving): us per call.
++//   3. --bench: absorb_m and value_project_m of one layer (their launchers: the BF16 or FP8 instantiation), BF16 against
++//      FP8, at M rows with a cold L2 (a 96 MB write between calls, as the experts' stream between two layers' attention
++//      when serving): us per call. Also absorb_m2<1, true> (G6_ATTN_QT), BF16 against FP8.
+ //   kvb8_test [--bench] [--layer L] [--seed S]
+ // Build and run: TEST=kvb8_test G6_NR=4 scripts/c1_tests.sh <bin_dir> [args]  (the K1H2 flags; attn.cu included, bind.cu)
+ // Exit code: 0 PASS, 1 FAIL, 2 CUDA error.
+@@ -206,10 +207,10 @@ int main(int argc, char** argv)
+         };
+         printf("BENCH heads %d: UK %.2f MB / UV %.2f MB a layer in BF16, %.2f / %.2f MB in FP8 (+ scales)\n", H,
+                H * 192 * 512 * 2 / 1e6, H * 256 * 512 * 2 / 1e6, H * 192 * 512 / 1e6, H * 256 * 512 / 1e6);
+-        printf("BENCH rows | absorb_m BF16 FP8 us | value_project_m BF16 FP8 us | sum saved us | x 78 layers ms\n");
++        printf("BENCH rows | absorb_m BF16 FP8 us | value_project_m BF16 FP8 us | sum saved us | x 78 layers ms | absorb_m2 QT BF16 FP8 us\n");
+         for (int M : {1, 3, 4, 8, 16, 24})
+         {
+-            float t[2][2];
++            float t[2][3];
+             for (int k = 0; k < 2; ++k)
+             {
+                 G6Attn a = (k ? b8 : bb).args;
+@@ -217,10 +218,12 @@ int main(int argc, char** argv)
+                 ga::Work w{}; w.q = q; w.rope = rope; w.context = ctx;
+                 t[k][0] = timed([&] { ga::launch_absorb_m(a, a, w, 0, M, nullptr); });
+                 t[k][1] = timed([&] { ga::launch_value_project_m(a, a, w, 0, M, nullptr); });
++                t[k][2] = timed([&] { ga::launch_absorb_m2(a, a, w, 0, M, nullptr); });
+                 CK(cudaGetLastError());
+             }
+             const float saved = t[0][0] + t[0][1] - t[1][0] - t[1][1];
+-            printf("BENCH %4d | %8.1f %8.1f | %8.1f %8.1f | %8.1f | %6.3f\n", M, t[0][0], t[1][0], t[0][1], t[1][1], saved, saved * 78 / 1000);
++            printf("BENCH %4d | %8.1f %8.1f | %8.1f %8.1f | %8.1f | %6.3f | %8.1f %8.1f\n", M, t[0][0], t[1][0], t[0][1], t[1][1], saved,
++                   saved * 78 / 1000, t[0][2], t[1][2]);
+         }
+         for (void* p : {(void*)dpos, (void*)dqb, (void*)q, (void*)rope, (void*)ctx, flush}) CK(cudaFree(p));
+         CKI(g6_attn_bind_release(&bb)); CKI(g6_attn_bind_release(&b8));
+diff --git a/tools/launch/options.py b/tools/launch/options.py
+index febe1eb..02fb82d 100644
+--- a/tools/launch/options.py
++++ b/tools/launch/options.py
+@@ -341,8 +341,10 @@ def validate(o):
+         raise OptionError(f'--v2-dense-form {o.get("V2_DENSE_FORM")}: want trellis or rounded')
+     if o.get('KVB') not in (None, 'bf16', 'fp8'):
+         raise OptionError(f'--kvb {o.get("KVB")}: want bf16 or fp8')
+-    if o.get('KVB') == 'fp8' and not o.get('V2_DENSE'):
+-        raise OptionError('--kvb fp8 needs a release boot (--v2-dense, or --model with a release): packs hold kv_b in BF16')
++    # a release boot sets V2_DENSE, or --model names a release (resolve_model sets V2_DENSE after this); the engine refuses
++    # KVB=fp8 on a pack boot at start
++    if o.get('KVB') == 'fp8' and not (o.get('V2_DENSE') or o.get('MODEL')):
++        raise OptionError('--kvb fp8 needs a release boot (--model <release> or --v2-dense): packs hold kv_b in BF16')
+     if o.plain == '1':
+         raise OptionError('PLAIN=1 (the one-request loop) is retired at every TP: unset it')
+     steering = o.get('STEERING_PROFILE')
+diff --git a/tools/launch/test_hf.py b/tools/launch/test_hf.py
+index b229626..7bce458 100644
+--- a/tools/launch/test_hf.py
++++ b/tools/launch/test_hf.py
+@@ -331,6 +331,18 @@ class HFTests(unittest.TestCase):
+         self.assertEqual(modelset.needed(ms.set, 2, plan), {})
+         self.assertEqual(str(ms.release), ms.source)
+ 
++    def test_kvb_fp8_with_the_release_as_the_model(self):
++        import options as opt
++        import supervisor as S
++        o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--model',
++                       f'https://huggingface.co/{RELEASE}', '--model-cache', self.cache, '--dflash', '0', '--kvb', 'fp8'], {})
++        opt.validate(o)                                          # V2_DENSE is set later, by resolve_model
++        ms, v, err = S.resolve_model(o, log=self.logs.append)
++        self.assertEqual(err, '')
++        plan = opt.engine_plan(o, rank=2, rank_dir=ms.rank_dir(2), aux_dir=ms.rank_dir(2), home='/h')
++        self.assertIn('G6_KVB=fp8', plan['env'])
++        self.assertIn('--v2-dense', plan['args'])
++
+     def test_commit_is_recorded_and_refreshed(self):
+         r = self.release()
+         with open(os.path.join(r.repo.root, 'refs', 'main')) as f:
+diff --git a/tools/launch/test_options.py b/tools/launch/test_options.py
+index 6aa3b0e..00b1103 100644
+--- a/tools/launch/test_options.py
++++ b/tools/launch/test_options.py
+@@ -274,7 +274,8 @@ class CanonicalTests(unittest.TestCase):
+         opt.validate(o)
+         self.assertNotIn('G6_KVB', opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h')['env'])
+         with self.assertRaises(opt.OptionError):
+-            self.digest('--kvb', 'fp8')                        # rank packs hold kv_b in BF16
++            self.digest('--kvb', 'fp8')                        # no model at all: rank packs hold kv_b in BF16
++        self.digest('--model', '/some/model', '--kvb', 'fp8')   # a --model may be a release (the engine checks)
+         with self.assertRaises(opt.OptionError):
+             self.digest(*rel, '--kvb', 'int4')
+ 

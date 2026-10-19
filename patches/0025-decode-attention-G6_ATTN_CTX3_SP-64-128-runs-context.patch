@@ -1,0 +1,291 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Mon, 19 Oct 2026 02:30:36 +0200
+Subject: [PATCH 25/30] decode attention: G6_ATTN_CTX3_SP=64|128 runs
+ context_pk3 over 64- or 128-slot partitions (E1, default off)
+
+The served context kernel (G6_ATTN_CTX3) is one CTA per (row, head group, 256-slot partition), and its time is
+that CTA's serial chain over 256 slots. With G6_ATTN_CTX3_SP=64 (or 128) run_body's context_pk3 calls use
+partitions of 64 (128) slots: 4x (2x) the CTAs, each a 4x (2x) shorter chain, and merge_parts sums the 32 (16)
+partials in partition order. Every fmaf operand is unchanged; the 2048-slot fp32 sum is regrouped, so the
+context differs in the last bits (E1), deterministically.
+
+Only run_body (the replicated decode path) takes it; the CP calls keep 256-slot partitions and their merges.
+The workspace sizes the partials for the flag. The flag is read once (before the bindings size their
+scratch), is in the S2 runtime signature, and is off by default: with it off the kernels, grids and merges
+are those of before (SP=256 is the old instantiation).
+---
+ KNOBS.md                     |  1 +
+ docs/SETTINGS.md             |  1 +
+ engine/attn/attn.cu          | 27 +++++++++++++----
+ engine/attn/attn.h           |  2 ++
+ engine/attn/decode-small.cuh | 56 +++++++++++++++++++++++++-----------
+ engine/runtime/g6m4.cu       |  5 +++-
+ scripts/engine_args.sh       |  2 ++
+ tools/launch/options.py      |  1 +
+ 8 files changed, 72 insertions(+), 23 deletions(-)
+
+diff --git a/KNOBS.md b/KNOBS.md
+index c9e8138..c3eae0a 100644
+--- a/KNOBS.md
++++ b/KNOBS.md
+@@ -80,6 +80,7 @@ manifest instead.
+ | `IDX_GRP` | unset (0) | unset (0) | unset (0) | S2 batched decode: the indexer reads each key tile once for up to 1..64 rows of a session (`G6_IDX_GRP`; bit-exact) |
+ | `ATTN_QT` | unset (0) | unset (0) | unset (0) | 1 = q and rope stored lane-transposed for the scores kernel (`G6_ATTN_QT`; needs `ATTN_SC2` 2 or 4; bit-exact) |
+ | `ATTN_FRONT` | unset (0) | unset (0) | unset (0) | 1 = a decode step's first attention kernels in one launch (`G6_ATTN_FRONT`; bit-exact) |
++| `ATTN_CTX3_SP` | unset (0) | unset (0) | unset (0) | with `ATTN_CTX3`: 64 or 128 key slots per context partition instead of 256 (`G6_ATTN_CTX3_SP`; deterministic, not bit-exact) |
+ | `KVB` | unset (bf16) | unset (bf16) | unset (bf16) | `fp8` = kv_b (UK / UV) as the release's block FP8 bytes and scales instead of their BF16 (`G6_KVB`; half the bytes, bit-exact). Needs `V2_DENSE` (a release boot) |
+ | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
+ | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
+diff --git a/docs/SETTINGS.md b/docs/SETTINGS.md
+index 3d06b94..663d5c1 100644
+--- a/docs/SETTINGS.md
++++ b/docs/SETTINGS.md
+@@ -88,6 +88,7 @@ the short version.
+ | `G6_ATTN_CTX2` | 0 | decode attention context: 1 / 2 = the head-group kernel with 32 / 64 gathered pairs per batch (16 when off), 3 / 4 = a packed, branch-free kernel with 16 / 32, two batches in flight. FP8 KV only, same bits |
+ | `G6_ATTN_CTX3` | 0 | decode attention context with one test per batch of slots instead of per slot: 1 / 2 = 16 / 32 pairs per batch over 256 dims per CTA, 3 / 4 = the same over 512. Overrides `G6_ATTN_CTX2`. FP8 KV only, same bits |
+ | `G6_ATTN_CTX3_HG` | 0 | with `G6_ATTN_CTX3`: heads per CTA, 2, 4 or 8; 0 = 4 up to 4 rows, then 8 |
++| `G6_ATTN_CTX3_SP` | 0 | with `G6_ATTN_CTX3`: 64 or 128 key slots per context partition (32 or 16 partials, merged in order) instead of 256 (8): shorter chains, more CTAs. Replicated decode only (not the CP block). FP8 KV only. Deterministic, a different fp32 summation order (not the same bits) |
+ | `G6_ATTN_SEL2` | 0 | decode index selection: the final sort as a rank by count over 8, 16, 32 or 64 CTAs per row. Same bits |
+ | `G6_IDX_GRP` | 0 | S2 batched decode steps: the indexer reads each key tile once for up to G = 1..64 rows of one session. Same bits |
+ | `G6_ATTN_QT` | 0 | 1 = decode absorb stores q and rope lane-transposed and the scores kernel reads them with 16 B loads. Needs `G6_ATTN_SC2` 2 or 4; not with `G6_AVP1`. FP8 KV only, same bits |
+diff --git a/engine/attn/attn.cu b/engine/attn/attn.cu
+index 6fa8582..3da7505 100644
+--- a/engine/attn/attn.cu
++++ b/engine/attn/attn.cu
+@@ -435,10 +435,11 @@ __global__ void context_parts(Input input,int start,const float* probs,float* pa
+ #endif
+     float* dst=parts+(((int64_t)row*a.heads+h)*PART+part)*512;dst[t]=lo;dst[t+256]=hi;
+ }
+-template<class Input>
++// P = TOP/SP partials (G6_ATTN_CTX3_SP, run_body: 16 or 32), summed in partition order
++template<class Input,int P=PART>
+ __global__ void merge_parts(Input input,const float* parts,float* out){
+     auto a=resolve(input);if(!a.active)return;
+-    int rowhead=blockIdx.x,t=threadIdx.x;for(int d=t;d<512;d+=256){float s=0;for(int part=0;part<PART;part++)s+=parts[((int64_t)rowhead*PART+part)*512+d];out[(int64_t)rowhead*512+d]=s;}
++    int rowhead=blockIdx.x,t=threadIdx.x;for(int d=t;d<512;d+=256){float s=0;for(int part=0;part<P;part++)s+=parts[((int64_t)rowhead*P+part)*512+d];out[(int64_t)rowhead*512+d]=s;}
+ }
+ template<bool F8=false,class Input>
+ __global__ void value_project(Input input,int start,const float* context){
+@@ -635,6 +636,18 @@ static int& attn_qt(){static int v=[]{
+ #endif
+     }();return v;}
+ static int& attn_front_on(){static int v=[]{const char* e=getenv("G6_ATTN_FRONT");return e&&atoi(e)==1?1:0;}();return v;}
++// Round 10 (E1: deterministic fp-order changes, default 0 = off; host-side, read once, before the bindings size their
++// scratch and before graph capture; in the S2 runtime signature, g6m4; tests may assign them, before sizing the scratch):
++// G6_ATTN_CTX3_SP=64 / 128 (decode-small.cuh ctx_sp): run_body's context_pk3 calls over partitions of 64 / 128 slots (32 /
++// 16 partials, merge_parts over them in order) instead of 256 (8): 4x / 2x the CTAs, each a 4x / 2x shorter slot chain.
++// FP8 KV only.
++static int& attn_ctx3_sp(){static int v=[]{
++#if G6_KV4
++    return 0;
++#else
++    const char* e=getenv("G6_ATTN_CTX3_SP");const int x=e?atoi(e):0;return x==64||x==128?x:0;
++#endif
++    }();return v;}
+ static bool al16(const void* p){return ((uintptr_t)p&15)==0;}
+ struct Work {
+     float *q,*rope,*weights,*si,*so,*prob,*parts,*context;
+@@ -648,7 +661,7 @@ static Work workspace(const G6Attn& a,void* base){
+     w.si=(float*)alloc(R*T*4);w.so=(float*)alloc(R*T*4);w.ii=(int*)alloc(R*T*4);w.io=(int*)alloc(R*T*4);w.offsets=(int*)alloc((R+1)*4);
+     w.selected=(uint64_t*)alloc(R*TOP*8);w.selection=(SelectionState*)alloc(R*sizeof(SelectionState));
+     w.histogram=(int*)alloc(R*((std::min(T,size_t(32768))+RADIX_CHUNK-1)/RADIX_CHUNK)*256*4);
+-    w.prob=(float*)alloc(R*H*TOP*4);w.parts=(float*)alloc(R*H*PART*512*4);w.context=(float*)alloc(R*H*512*4);
++    w.prob=(float*)alloc(R*H*TOP*4);w.parts=(float*)alloc(R*H*(attn_ctx3_sp()?TOP/attn_ctx3_sp():PART)*512*4);w.context=(float*)alloc(R*H*512*4);
+     size_t b=0;cudaError_t e=cub::DeviceSegmentedRadixSort::SortPairsDescending(nullptr,b,w.si,w.so,w.ii,w.io,(int)(R*T),(int)R,w.offsets,w.offsets+1);
+     if(e!=cudaSuccess)return Work{};
+     // The last query tile can contain one row even when the workspace has R>1.
+@@ -828,9 +841,12 @@ static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t str
+         AMARK(4);
+         ga::normalize<<<n*a.heads,256,0,stream>>>(input,w.prob);
+         AMARK(5);
+-        ga::launch_context_parts(a,input,w,start,n,stream);
++        const int sp=ctx_sp(a,n);
++        ga::launch_context_parts(a,input,w,start,n,stream,sp);
+         AMARK(6);
+-        ga::merge_parts<<<n*a.heads,256,0,stream>>>(input,w.parts,w.context);
++        if(sp==64)ga::merge_parts<Input,TOP/64><<<n*a.heads,256,0,stream>>>(input,w.parts,w.context);
++        else if(sp==128)ga::merge_parts<Input,TOP/128><<<n*a.heads,256,0,stream>>>(input,w.parts,w.context);
++        else ga::merge_parts<<<n*a.heads,256,0,stream>>>(input,w.parts,w.context);
+         KV4_ROTATE(w.context,n*a.heads,stream);
+         AMARK(7);
+ #if defined(DEC_AVP) && DEC_AVP
+@@ -979,6 +995,7 @@ static bool cp_ok(const G6Attn* a){return a&&valid(*a)&&a->cp_nr>=2&&a->cp_nr<=8
+ #endif
+ }
+ extern "C" size_t g6_attn_scratch_bytes(const G6Attn* a){if(!a||!ga::valid(*a))return 0;return ga::workspace(*a,nullptr).total;}
++extern "C" int g6_attn_ctx_sp(void){return ga::attn_ctx3_sp();}
+ extern "C" int g6_attn_append(const G6Attn* a,void* s){
+     if(!a||!ga::valid(*a)||!a->kv_a||!a->kv_norm||!a->mla_cache||!a->positions||!a->block_table||!a->error)return (int)cudaErrorInvalidValue;
+     cudaStream_t stream=(cudaStream_t)s;ga::append_kv<<<a->rows,256,0,stream>>>(*a);
+diff --git a/engine/attn/attn.h b/engine/attn/attn.h
+index 47f0018..b78347c 100644
+--- a/engine/attn/attn.h
++++ b/engine/attn/attn.h
+@@ -37,6 +37,8 @@ struct G6Attn {
+ #endif
+ };
+ extern "C" size_t g6_attn_scratch_bytes(const G6Attn*);
++// G6_ATTN_CTX3_SP as the kernels read it (attn.cu; read once): 64 / 128, 0 = off. For the S2 runtime signature.
++extern "C" int g6_attn_ctx_sp(void);
+ extern "C" void (*g6_attn_mark)(int stage,void* stream);
+ extern "C" int g6_attn_rope_init(int cap,void* stream);   // decode RoPE table when no QO attention builds it   // decode profile hook (attn.cu AMARK); null = off
+ extern "C" int g6_attn_run(const G6Attn*,void* scratch,size_t bytes,void* stream);
+diff --git a/engine/attn/decode-small.cuh b/engine/attn/decode-small.cuh
+index c865ecd..540e53d 100644
+--- a/engine/attn/decode-small.cuh
++++ b/engine/attn/decode-small.cuh
+@@ -285,12 +285,16 @@ __global__ void __launch_bounds__(128) context_pk(Input input,int start,const fl
+ // read-only 16-bit load from the row index, no pointer test) loaded before the current batch is used. Per (row, head, dim)
+ // chain: the same fmaf operands in the same slot order as context_parts_heads, the same skips of unread slots and of
+ // p == 0 (-0 and NaN p as there) -> parts bit-identical. D = dims per CTA: 256 (two CTAs per partition, as
+-// context_parts_heads) or 512 (one, the prologue once per partition). grid dim3(PART*512/D, ceil(heads/HG), n), block D/2.
++// context_parts_heads) or 512 (one, the prologue once per partition). grid dim3(P*512/D, ceil(heads/HG), n), block D/2.
+ // Rows are 32-bit: the dispatch (use_ctx3) needs page_count * page_size <= INT_MAX.
+-template<int HG,int PB,int D,class Input>
++// SP = slots per partition, P = TOP/SP partitions: 256 (P = PART, the bytes above); 64 / 128 (G6_ATTN_CTX3_SP, run_body
++// only, E1): every (row, head, dim) chain runs over SP slots in slot order and merge_parts<P> sums the P partials in
++// partition order, so the 2048-slot sum is regrouped (deterministic, not the same bits).
++template<int HG,int PB,int D,int SP=256,class Input>
+ __global__ void __launch_bounds__(D/2) context_pk3(Input input,int start,const float* probs,float* parts){
+  static_assert((D==256||D==512)&&(PB==16||PB==32)&&(HG==2||HG%4==0),"D 256 / 512, PB 16 / 32, HG 2 or a multiple of 4");
+- auto a=ga::resolve(input);if(!a.active)return;constexpr int THREADS=D/2,GROUPS=D/128,SP=256,NB=SP/PB;
++ static_assert(SP==64||SP==128||SP==256,"SP 64 / 128 / 256");
++ auto a=ga::resolve(input);if(!a.active)return;constexpr int THREADS=D/2,GROUPS=D/128,NB=SP/PB,P=ga::TOP/SP;
+  const int row=blockIdx.z,r=start+row,h0=blockIdx.y*HG,part=blockIdx.x/(512/D),d0=(blockIdx.x%(512/D))*D,t=threadIdx.x,lane=t&31;FOR_ROW(a,input,r);
+  const int nh=min(HG,a.heads-h0);
+  __shared__ __align__(16) float pm[SP][HG];__shared__ float scl[GROUPS][SP];__shared__ int kv_row[SP];__shared__ uint8_t state[NB];
+@@ -342,7 +346,7 @@ __global__ void __launch_bounds__(D/2) context_pk3(Input input,int start,const f
+   load(ra,0);
+   for(int b=0;b<nb;b+=2){if(b+1<nb)load(rb,b+1);use(ra,b);if(b+2<nb)load(ra,b+2);if(b+1<nb)use(rb,b+1);}}
+  #pragma unroll
+- for(int hh=0;hh<HG;hh++)if(hh<nh){float* dst=parts+(((int64_t)row*a.heads+h0+hh)*ga::PART+part)*512;dst[d]=lo[hh];dst[d+1]=hi[hh];}
++ for(int hh=0;hh<HG;hh++)if(hh<nh){float* dst=parts+(((int64_t)row*a.heads+h0+hh)*P+part)*512;dst[d]=lo[hh];dst[d+1]=hi[hh];}
+ }
+ // scores_tr = scores_heads with all HG head dot products held per lane (ILP across
+ // heads), then ONE transpose reduction over xor offsets 16,8,4,2,1: each stage keeps half of the remaining heads, so every
+@@ -510,21 +514,28 @@ static void launch_ctx2(const G6Attn& a,Input input,Work& w,int start,int n,cuda
+ // G6_ATTN_CTX3 (attn.cu attn_ctx3): context_pk3 on the context_parts_heads calls; head group G6_ATTN_CTX3_HG, else as there.
+ // Only while every KV row index fits in 32 bits (page() bounds a page by the fixed page_count).
+ static bool use_ctx3(const G6Attn& a){return attn_ctx3()&&(int64_t)a.page_count*a.page_size<=INT_MAX;}
+-template<int HG,class Input>
+-static void launch_ctx3_hg(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
+- const int y=(a.heads+HG-1)/HG;
++// SP slots per partition (sp, ctx_sp below): P = TOP/SP partitions; SP = 256 is PART, the launches as before
++template<int HG,int SP,class Input>
++static void launch_ctx3_sp(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
++ const int y=(a.heads+HG-1)/HG;constexpr int P=TOP/SP;
+  switch(attn_ctx3()){
+-  case 1:small_decode::context_pk3<HG,16,256><<<dim3(PART*2,y,n),128,0,st>>>(input,start,w.prob,w.parts);break;
+-  case 2:small_decode::context_pk3<HG,32,256><<<dim3(PART*2,y,n),128,0,st>>>(input,start,w.prob,w.parts);break;
+-  case 3:small_decode::context_pk3<HG,16,512><<<dim3(PART,y,n),256,0,st>>>(input,start,w.prob,w.parts);break;
+-  default:small_decode::context_pk3<HG,32,512><<<dim3(PART,y,n),256,0,st>>>(input,start,w.prob,w.parts);break;}
++  case 1:small_decode::context_pk3<HG,16,256,SP><<<dim3(P*2,y,n),128,0,st>>>(input,start,w.prob,w.parts);break;
++  case 2:small_decode::context_pk3<HG,32,256,SP><<<dim3(P*2,y,n),128,0,st>>>(input,start,w.prob,w.parts);break;
++  case 3:small_decode::context_pk3<HG,16,512,SP><<<dim3(P,y,n),256,0,st>>>(input,start,w.prob,w.parts);break;
++  default:small_decode::context_pk3<HG,32,512,SP><<<dim3(P,y,n),256,0,st>>>(input,start,w.prob,w.parts);break;}
++}
++template<int HG,class Input>
++static void launch_ctx3_hg(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,int sp){
++ if(sp==64)launch_ctx3_sp<HG,64>(a,input,w,start,n,st);
++ else if(sp==128)launch_ctx3_sp<HG,128>(a,input,w,start,n,st);
++ else launch_ctx3_sp<HG,256>(a,input,w,start,n,st);
+ }
+ template<class Input>
+-static void launch_ctx3(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
++static void launch_ctx3(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,int sp=256){
+  switch(attn_ctx3_hg()?attn_ctx3_hg():n>=5?8:4){
+-  case 2:launch_ctx3_hg<2>(a,input,w,start,n,st);break;
+-  case 8:launch_ctx3_hg<8>(a,input,w,start,n,st);break;
+-  default:launch_ctx3_hg<4>(a,input,w,start,n,st);break;}
++  case 2:launch_ctx3_hg<2>(a,input,w,start,n,st,sp);break;
++  case 8:launch_ctx3_hg<8>(a,input,w,start,n,st,sp);break;
++  default:launch_ctx3_hg<4>(a,input,w,start,n,st,sp);break;}
+ }
+ // G6_ATTN_P11 decode tile retune. Host-side, read once (set before graph
+ // capture). G6_ATTN_P11=0 -> the old head-batched path (scores_heads<16>, context_parts_heads HG4/HG8 x D256), unchanged.
+@@ -537,6 +548,16 @@ static bool attn_p11(){
+  static const bool on=getenv("G6_ATTN_P11")&&atoi(getenv("G6_ATTN_P11"))!=0;return on;
+  #endif
+ }
++// G6_ATTN_CTX3_SP (attn.cu attn_ctx3_sp, E1): the slots per partition of a run_body call's context, 64 / 128 exactly when
++// launch_context_parts reaches launch_ctx3 (no FLIP, the head-batched kernels, no P11, use_ctx3); 256 otherwise. run_body
++// passes it to launch_context_parts and merges TOP/sp partials; the CP calls keep 256 (their merges assume PART).
++static int ctx_sp(const G6Attn& a,int n){
++ #if G6_KV4
++ (void)a;(void)n;return 256;
++ #else
++ return attn_ctx3_sp()&&!use_attn_flip(a,n)&&attn_heads()&&!attn_p11()&&use_ctx3(a)?attn_ctx3_sp():256;
++ #endif
++}
+ // Context length used to pick the tile. a.context at capture is the cell window, not the live length (live_context is
+ // device-side), so graphs captured per context bucket get the right row; G6_ATTN_TILE_L=<L> overrides (A/B, tests).
+ static int attn_tile_l(const G6Attn& a){static const int f=[]{const char* e=getenv("G6_ATTN_TILE_L");return e&&*e?atoi(e):0;}();return f>0?f:a.context;}
+@@ -592,8 +613,9 @@ static void launch_mla_scores(const G6Attn& a,Input input,Work& w,int start,int
+  else if(use_fixed_k_decode(a))small_decode::scores_direct<<<dim3(TOP/8,a.heads,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
+  else mla_scores<<<dim3(TOP/8,a.heads,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
+ }
++// sp (run_body, ctx_sp): context_pk3's slots per partition; 256 = PART partitions (every other caller)
+ template<class Input>
+-static void launch_context_parts(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
++static void launch_context_parts(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,int sp=256){
+  #if G6_KV4
+  if(!attn_heads())context_parts<<<dim3(PART,a.heads,n),256,0,st>>>(input,start,w.prob,w.parts);
+  else if(n>=5){constexpr int HG=8;kv4::context_parts_heads<HG><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);}
+@@ -617,7 +639,7 @@ static void launch_context_parts(const G6Attn& a,Input input,Work& w,int start,i
+  if(attn_heads()&&attn_p11()){launch_context_tile(a,input,w,start,n,st);return;}
+  if(attn_heads()){
+   // head group by rows (dec_heads_test --bench on GB10, contexts 500 and 2048): 4 heads per block up to 4 rows, then 8
+-  if(use_ctx3(a)){launch_ctx3(a,input,w,start,n,st);return;}
++  if(use_ctx3(a)){launch_ctx3(a,input,w,start,n,st,sp);return;}
+   if(attn_ctx2()){if(n>=5)launch_ctx2<8>(a,input,w,start,n,st);else launch_ctx2<4>(a,input,w,start,n,st);return;}
+   if(n>=5){constexpr int HG=8;small_decode::context_parts_heads<HG><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);}
+   else{constexpr int HG=4;small_decode::context_parts_heads<HG><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);}
+diff --git a/engine/runtime/g6m4.cu b/engine/runtime/g6m4.cu
+index 67af13e..632c884 100644
+--- a/engine/runtime/g6m4.cu
++++ b/engine/runtime/g6m4.cu
+@@ -1506,6 +1506,8 @@ int main(int argc, char** argv)
+             bc.head_ip = cfg.ips[0];
+             bc.directory = s2dir;
+             bc.port = (uint16_t)s2port;
++            if (g6_attn_ctx_sp())   // round 10 E1 attention flags (attn.cu), read once before the bindings
++                fprintf(stderr, "# rank %d: decode attention E1: G6_ATTN_CTX3_SP %d\n", R, g6_attn_ctx_sp());
+             bc.runtime_signature = "g6m4 s2 below " + std::to_string(s2_below) + " cap " + std::to_string(cap) + " layers " + layers_s +
+                 " mp " + std::to_string(MP) + " lanes " + std::to_string(two ? 2 : 1) + " mtp " + std::to_string(mtp) + " chunk " +
+                 std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " split 3 own " + std::to_string(pf_own) +
+@@ -1524,7 +1526,8 @@ int main(int argc, char** argv)
+                 (dfl_alpha != 1.f ? " dflalpha " + std::to_string(dfl_alpha) : "") +
+                 (dsel_posclk ? " dselposclk 1" : "") +
+                 (dsel_model ? " dselmodel " + std::to_string(dsel_model) + " " + dsel_tab.str() : "") + s2::kstopb_sig(kstop.b) +
+-                (cp_step ? " cpsr " + std::to_string(cp_step) + (sc.cp_seg ? " seg" : "") : "");
++                (cp_step ? " cpsr " + std::to_string(cp_step) + (sc.cp_seg ? " seg" : "") : "") +
++                (g6_attn_ctx_sp() ? " ctxsp " + std::to_string(g6_attn_ctx_sp()) : "");
+             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
+                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
+             g6s2::ControlLinks links = g6s2::bootstrap(bc);
+diff --git a/scripts/engine_args.sh b/scripts/engine_args.sh
+index c2d68ed..2ee8091 100644
+--- a/scripts/engine_args.sh
++++ b/scripts/engine_args.sh
+@@ -101,6 +101,8 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
+   ENGINE_ENV="$ENGINE_ENV${IDX_GRP:+ G6_IDX_GRP=$IDX_GRP}"
+   ENGINE_ENV="$ENGINE_ENV${ATTN_QT:+ G6_ATTN_QT=$ATTN_QT}"
+   ENGINE_ENV="$ENGINE_ENV${ATTN_FRONT:+ G6_ATTN_FRONT=$ATTN_FRONT}"
++  # deterministic fp-order attention variants (ATTN_CTX3_SP; E1, docs/SETTINGS.md): off unless set
++  ENGINE_ENV="$ENGINE_ENV${ATTN_CTX3_SP:+ G6_ATTN_CTX3_SP=$ATTN_CTX3_SP}"
+   # kv_b (UK / UV) as the release's block FP8 (KVB=fp8, #50; docs/SETTINGS.md): BF16 unless set. Needs V2_DENSE
+   ENGINE_ENV="$ENGINE_ENV${KVB:+ G6_KVB=$KVB}"
+   return 0
+diff --git a/tools/launch/options.py b/tools/launch/options.py
+index 02fb82d..ddd6e76 100644
+--- a/tools/launch/options.py
++++ b/tools/launch/options.py
+@@ -105,6 +105,7 @@ KEYS = {
+     'ATTN_SC2_TR': ('cluster', None, 'ATTN_SC2 transpose reduction (G6_ATTN_SC2_TR)'),
+     'ATTN_CTX2': ('cluster', None, 'decode attention context variant (G6_ATTN_CTX2)'),
+     'ATTN_CTX3': ('cluster', None, 'decode attention context, per-batch states (G6_ATTN_CTX3)'),
++    'ATTN_CTX3_SP': ('cluster', None, 'ATTN_CTX3 slots per context partition, 64 or 128 (G6_ATTN_CTX3_SP; E1)'),
+     'ATTN_SEL2': ('cluster', None, 'decode index selection by rank (G6_ATTN_SEL2)'),
+     'IDX_GRP': ('cluster', None, 'decode indexer row grouping (G6_IDX_GRP)'),
+     'ATTN_QT': ('cluster', None, 'decode attention transposed query (G6_ATTN_QT)'),

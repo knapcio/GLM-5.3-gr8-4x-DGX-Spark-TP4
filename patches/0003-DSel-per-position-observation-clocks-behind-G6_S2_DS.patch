@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Thu, 15 Oct 2026 08:16:05 +0200
+Subject: [PATCH 03/30] DSel: per-position observation clocks behind
+ G6_S2_DSEL_POSCLK=1
+
+A round decays only the positions it observes (1..min(k, a+1)), so DFlash2
+rounds, which score MTP's first draft alone, no longer age MTP's later
+positions toward the seed. Off: every round decays every position.
+---
+ docs/SETTINGS.md               |  1 +
+ engine/runtime/g6m4.cu         | 10 +++++++++-
+ engine/runtime/s2_batch.h      |  5 +++--
+ engine/runtime/spec_len.h      |  6 +++++-
+ engine/tests/test_spec_len.cpp | 11 +++++++++++
+ 5 files changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/docs/SETTINGS.md b/docs/SETTINGS.md
+index f9b7b20..898863d 100644
+--- a/docs/SETTINGS.md
++++ b/docs/SETTINGS.md
+@@ -116,6 +116,7 @@ the short version.
+ | `G6_DRAFT_PAR` | 2 when --serve + DFlash2 + --mtp (else 0) | S2 with DFlash2, a round of a request that decodes alone: 1 = the drafter choice is made before MTP's first form (it reads nothing the first form writes), the DFlash2 drafter step runs on its own CUDA stream under the first form (and the MTP chain on MTP rounds), and the round waits for it at the end. The same graphs on the same inputs as serial, so every step's bytes are unchanged (`batch_draftpar_test`: the same tokens, steps and statistics as serial). 2 = also a drafting step goes on a high-priority stream. Shared rounds run as before. In the S2 runtime signature; every rank must set the same value. Needs `--dflash-manifest`, `--mtp` and `--serve` |
+ | `G6_S2_TIMELINE` | unset | measurement, S2: N = every N main steps each rank prints, per decode step kind (main, first-form draft, chain, DFlash2 context and query steps, and their `G6_DRAFT_PAR` forms), the mean GPU span (CUDA events around the graph launch), host input prep, launch call and fence wait, and per transition the main-stream gap between steps (the drafter's side stream may run inside it under `G6_DRAFT_PAR`) and the host time between them (`frontend/README.md`). Unset: no events, no stamps |
+ | `G6_S2_DSEL_START` | dflash | S2 drafter choice: `mtp` = a DFlash2 request starts on MTP (the drafter's prompt-tail drafts are its first probe) and moves to DFlash2 when the evidence says so. Every rank must set the same value |
++| `G6_S2_DSEL_POSCLK` | 0 | S2 drafter choice: 1 = its DFlash2 and MTP estimates decay a draft position only on rounds that observe it, so the DFlash2 rounds (which score MTP's first draft alone) no longer age MTP's later positions toward the seed. Every rank must set the same value |
+ | `G6_DEC_EVPROF` | unset | measurement: N = per-stage decode step times from event nodes in the captured main-step graphs, printed every N main steps (rank logs) |
+ | `G6_DEC_PROF` | unset | measurement, plain launches only: the same stages with a synchronize at every mark |
+ | `G6_DFL_PFCTX` | 1 | `--dflash`: 0 = no prompt context from the prefill (measurement); the drafter then starts from the last prompt token |
+diff --git a/engine/runtime/g6m4.cu b/engine/runtime/g6m4.cu
+index 6da53d5..323cce4 100644
+--- a/engine/runtime/g6m4.cu
++++ b/engine/runtime/g6m4.cu
+@@ -503,6 +503,11 @@ int main(int argc, char** argv)
+     const char* dse = getenv("G6_S2_DSEL_START");
+     const bool dsel_start_mtp = dse && !strcmp(dse, "mtp");
+     if (dse && *dse && !dsel_start_mtp && strcmp(dse, "dflash")) die("G6_S2_DSEL_START: mtp or dflash");
++    // G6_S2_DSEL_POSCLK=1 (spec_len.h SpecLen::posclk; default 0): the drafter choice's estimates decay a position only on
++    // rounds that observe it. In the S2 runtime signature
++    std::string pce;
++    const int dsel_posclk = env_choice("G6_S2_DSEL_POSCLK", 1, 0, &pce);
++    if (dsel_posclk < 0) die(pce);
+     // G6_DFL_SEL_ALPHA=<a> (dflash.cuh k_walk; default 1): the DFlash2 selector walk scores logit + a * correction. Drafts
+     // only: the verify is unchanged. In the S2 runtime signature
+     const float dfl_alpha = getenv("G6_DFL_SEL_ALPHA") ? (float)atof(getenv("G6_DFL_SEL_ALPHA")) : 1.f;
+@@ -1273,6 +1278,7 @@ int main(int argc, char** argv)
+                 if (const char* e = getenv("G6_S2_DSEL_DWELL")) h.dsel.dwell = std::max(1, atoi(e));
+                 if (const char* e = getenv("G6_S2_DSEL_PROBE")) h.dsel.probe = std::max(1, atoi(e));
+                 h.dsel.start_mtp = dsel_start_mtp;
++                h.dsel.posclk = dsel_posclk;
+                 h.dsel.d.draft_round = 5.6 + 2.5;
+                 h.dsel.m.draft_round = 2.5 + 3.0;
+                 h.dsel.m.draft_each = 2.1;
+@@ -1308,6 +1314,7 @@ int main(int argc, char** argv)
+                 if (R == 0 && dfl_reuse) fprintf(stderr, "# s2 dflash reuse %d: reuse hits keep the drafter%s, warm-up %d context rows\n", dfl_reuse,
+                                                  dfl_reuse > 1 ? ", a session alone on MTP takes it" : "", dfl_reuse_min);
+                 if (R == 0 && h.dsel.on && h.dsel.start_mtp) fprintf(stderr, "# s2 drafter choice: requests start on MTP\n");
++                if (R == 0 && h.dsel.on && h.dsel.posclk) fprintf(stderr, "# s2 drafter choice: per-position clocks\n");
+                 // a 1-token prompt has no prefill: the drafter starts from its prompt step (dfl_lo = first, as plain)
+                 // G6_DFL_REUSE: also a hit into the window (the fill starts past its rows) and a hit with no prefill at all
+                 h.dispatch.dfl_ok = [&](int q) { return dfl_owner == q || slot_prompt[q] == 1 || slot_whole[q]; };
+@@ -1391,7 +1398,8 @@ int main(int argc, char** argv)
+                 (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
+                 (dfl_body_i4_on ? " dflbodyi4 1" : "") +
+                 (dsel_start_mtp ? " dselstart mtp" : "") +
+-                (dfl_alpha != 1.f ? " dflalpha " + std::to_string(dfl_alpha) : "");
++                (dfl_alpha != 1.f ? " dflalpha " + std::to_string(dfl_alpha) : "") +
++                (dsel_posclk ? " dselposclk 1" : "");
+             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
+                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
+             g6s2::ControlLinks links = g6s2::bootstrap(bc);
+diff --git a/engine/runtime/s2_batch.h b/engine/runtime/s2_batch.h
+index ae24c19..06b83ff 100644
+--- a/engine/runtime/s2_batch.h
++++ b/engine/runtime/s2_batch.h
+@@ -185,6 +185,7 @@ struct DSel
+     // G6_S2_DSEL_START=mtp: a request starts on MTP and the drafter's prompt-tail drafts are its first probe (default:
+     // it starts on DFlash2)
+     bool start_mtp = false;
++    bool posclk = false;              // G6_S2_DSEL_POSCLK=1: d and m keep a clock per position (SpecLen::posclk)
+     g6rt::SpecLen d, m;               // DFlash2 and MTP estimates; draft_round / draft_each hold each round's drafting ms
+ };
+ // G6_MTP_KSTOP (every rank, read at boot; Batch::kstop): how many MTP drafts a solo DFlash2 session's MTP round verifies.
+@@ -249,7 +250,7 @@ public:
+     void adapt(bool on) { adapt_ = on; }
+     // DFlash2 sessions verify up to kv of the 7 drafts; sl: the plain build's --spec-adaptive policy (sl.on = false: kv)
+     void dflash(int kv, const g6rt::SpecLen& sl) { dkv_ = kv; dsl_ = sl; }
+-    void dsel(const DSel& d) { sel_ = d; kstop(ks_); }
++    void dsel(const DSel& d) { sel_ = d; sel_.d.posclk = sel_.m.posclk = d.posclk; kstop(ks_); }
+     // solo MTP rounds' draft count (KStop; mode 2 sets DSel::m's levels and third-position seed, so call it after dsel)
+     void kstop(const KStop& k)
+     {
+@@ -632,7 +633,7 @@ private:
+     static g6rt::SpecLen fresh(const g6rt::SpecLen& o)
+     {
+         g6rt::SpecLen f;
+-        f.on = o.on; f.levels = o.levels; f.draft_round = o.draft_round; f.draft_each = o.draft_each;
++        f.on = o.on; f.levels = o.levels; f.draft_round = o.draft_round; f.draft_each = o.draft_each; f.posclk = o.posclk;
+         std::copy(o.table, o.table + g6rt::SpecLen::KX + 2, f.table);
+         std::copy(o.seed, o.seed + g6rt::SpecLen::KX + 1, f.seed);
+         return f;
+diff --git a/engine/runtime/spec_len.h b/engine/runtime/spec_len.h
+index eb2ff88..c9b9fec 100644
+--- a/engine/runtime/spec_len.h
++++ b/engine/runtime/spec_len.h
+@@ -71,6 +71,10 @@ struct SpecLen
+     double pos_decay = 0.9;           // per round: the position rate follows the text within a few dozen rounds
+     double bucket_decay = 0.998;      // the calibration of the drafter's probability changes slowly
+     double prior = 4;                 // pseudo-rounds of the fallback in each estimate
++    // per-position clocks (G6_S2_DSEL_POSCLK, the drafter choice's estimates): a round decays only the positions it
++    // observes (1..min(k, a + 1)), so rounds that see position 1 alone (DSel's MTP score on DFlash2 rounds) leave the
++    // later positions' evidence as it was. Off: every round decays every position
++    bool posclk = false;
+     long rounds = 0, chosen[KX + 1] = {};
+     double pred_sum = 0, got_sum = 0; // predicted and actual tokens per round, summed (log line)
+ 
+@@ -152,7 +156,7 @@ struct SpecLen
+     // a round verified k drafts and accepted a of them. lp[1..k]: the drafts' log-probabilities (null: none)
+     void observe(int k, int a, const float* lp, double predicted)
+     {
+-        for (int j = 1; j <= KX; ++j)
++        for (int j = 1; j <= (posclk ? std::min(k, a + 1) : KX); ++j)
+         {
+             pn[j] *= pos_decay; pk[j] *= pos_decay;
+             for (int b = 0; b < NB; ++b) { bn[j][b] *= bucket_decay; bk[j][b] *= bucket_decay; }
+diff --git a/engine/tests/test_spec_len.cpp b/engine/tests/test_spec_len.cpp
+index b2b0d80..5c6742d 100644
+--- a/engine/tests/test_spec_len.cpp
++++ b/engine/tests/test_spec_len.cpp
+@@ -162,6 +162,17 @@ int main()
+             }
+         }
+     }
++    {   // posclk: rounds that observe position 1 alone leave position 2's evidence as it was; off, they age it
++        g6rt::SpecLen on, off;
++        on.posclk = true;
++        for (g6rt::SpecLen* s : {&on, &off})
++        {
++            for (int i = 0; i < 20; ++i) s->observe(2, 2, nullptr, 0);    // position 2 accepted every round
++            for (int i = 0; i < 20; ++i) s->observe(1, 0, nullptr, 0);    // then 20 rounds of position 1 only
++        }
++        check(on.rate(2) > 0.9 && off.rate(2) < 0.8, "posclk: position 2 keeps its rate through position-1-only rounds");
++        check(on.rate(1) == off.rate(1), "posclk: position 1 decays as before");
++    }
+     printf("%d/%d checks passed\n", checks - fails, checks);
+     return fails ? 1 : 0;
+ }

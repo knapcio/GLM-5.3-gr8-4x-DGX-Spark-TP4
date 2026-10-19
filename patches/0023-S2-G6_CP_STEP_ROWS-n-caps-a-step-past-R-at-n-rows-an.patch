@@ -1,0 +1,948 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Sun, 18 Oct 2026 22:39:18 +0200
+Subject: [PATCH 23/30] S2: G6_CP_STEP_ROWS=n caps a step past R at n rows and
+ sizes the CP fabric for n (default off)
+
+Since #94 a split run past R shares batched steps, so the CP fabric and the CP graphs at every bucket past R are sized
+for the widest S2 step: sessions x (mtp + 1) = 24 rows at 8 sessions / MTP 2, 1.358 GB pinned + registered per rank at
+TP=4 (8 rows: 0.453 GB). With G6_CP_STEP_ROWS=n (at least the rows before #94, the boot names it; clamped to the widest
+S2 step) the fabric is sized for n, and Driver::step forms rounds so that no step past R carries more than n rows:
+while a session past R decodes and the decoding sessions' rows do not fit, a round takes at most n / (mtp + 1)
+sessions, those past R first (request-id order), and the others sit it out the way a grow stall does (Batch::round
+leaves their state untouched). Cycles: every decoding session gets one round per cycle; a round without a session past
+R keeps the full batch. A session counts as past R when length + mtp > cp_after (an upper bound of its verify context;
+cp_after = the largest bucket <= R, so ctx > cp_after exactly when the engine runs the CP block). capture_all skips the
+main widths above n at buckets past R. G6_CP_STEP_SEG=1: a round past R takes only sessions past R, so a session below
+R never runs the CP path (whose LSE merge rounds differently) because of a resident long session.
+
+Every input is replicated state (the scheduler's decoding sessions, grow stalls, Batch lengths, boot constants); the
+knob joins the scheduler digest, the bootstrap agreement and the S2 runtime signature only when set. m4sim applies the
+same rounds to its --s2 loop. One stderr line per rank when rounds become capped or uncapped.
+
+Host test s2/tests/cp_rows_test.cpp (scripts/host_tests.sh): cp_after against the bucket rule for every context, the
+boot parse, hand-made cycles, and Driver::step over random requests (past R from the start, crossing R, insert rules,
+grow stalls) at n = 8, 12 and SEG: every request emits its solo tokens, no step past R wider than n, SEG never mixes,
+two ranks agree on every digest and step, waits bounded; unengaged knob = the knob-off step sequence.
+---
+ docs/SETTINGS.md                         |   2 +
+ engine/runtime/g6m4.cu                   |  35 +-
+ engine/runtime/m4sim.cu                  |  43 +++
+ engine/runtime/s2.cuh                    |  12 +-
+ engine/runtime/s2/bootstrap.h            |   2 +
+ engine/runtime/s2/cp_rows.h              |  90 +++++
+ engine/runtime/s2/driver.h               |  33 ++
+ engine/runtime/s2/native.cuh             |  15 +-
+ engine/runtime/s2/scheduler.h            |   9 +
+ engine/runtime/s2/tests/cp_rows_test.cpp | 412 +++++++++++++++++++++++
+ scripts/host_tests.sh                    |   3 +
+ 11 files changed, 645 insertions(+), 11 deletions(-)
+ create mode 100644 engine/runtime/s2/cp_rows.h
+ create mode 100644 engine/runtime/s2/tests/cp_rows_test.cpp
+
+diff --git a/docs/SETTINGS.md b/docs/SETTINGS.md
+index 40d246b..3d06b94 100644
+--- a/docs/SETTINGS.md
++++ b/docs/SETTINGS.md
+@@ -74,6 +74,8 @@ the short version.
+ | `G6_CP_R` | `SHARE_LIMIT` | the first R tokens of KV are replicated on every rank. Pages past R are spread across ranks. Under S2 it is also the largest request that shares decode steps. A multiple of 64; R is always a decode bucket boundary (a value off the 2048 doubling is added as a bucket of its own) |
+ | `G6_CP_S3` | 1 | CP combine order (1 = head-group overlap order, same arithmetic as 0) |
+ | `G6_CP_ONECHAIN` | 0 | 1 = past R, the other ranks' head groups run as one attention call of 48 heads instead of three of 16 (the scores, softmax, context and merge kernels once per layer, not three times; their partials are published after it, in the order `G6_CP_S3=0` uses). Byte-exact. TP=4 only, and not with `G6_ATTN_FLIP`; about 1.3 MB a row of the CP fabric's rows (`G6_CP_MMAX`) for the gathered queries and the call's scratch |
++| `G6_CP_STEP_ROWS` | 0 | S2 (`--serve`): a step past R carries at most this many rows, and the CP fabric is sized for it instead of the widest S2 step (`--s2-sessions` x (`--mtp` + 1) = 24 rows, 1.358 GB pinned per rank at TP=4; 8 rows = 0.453 GB). While a session past R decodes and the decoding sessions' rows do not fit, a round takes at most this many / (`--mtp` + 1) sessions, those past R first, and the others go in the next round (every decoding session gets one round per cycle); rounds without a session past R keep the full batch. At least the rows of a solo or prompt step past R (the boot names the minimum: 8 with DFlash2), larger values are clamped to the widest S2 step. 0 = off (every round takes every session). The cap changes only which sessions share a step, never a session's rows, positions or sampling: sessions past R give the same tokens as without it; a session below R that is left out of a past-R round runs that round on the replicated path instead of the CP path, whose LSE merge rounds differently (see `G6_CP_STEP_SEG`). Part of the bootstrap agreement when set |
++| `G6_CP_STEP_SEG` | 0 | with `G6_CP_STEP_ROWS`: 1 = a round past R takes only sessions past R, so a session below R never runs the CP path because a long session is resident (its output is the one it has without that session); a mix that would fit in one step takes two rounds. Part of the bootstrap agreement when set |
+ | `G6_CP_PF_VERIFY` | 1 | check every KV page staged to another rank against a hash |
+ | `G6_CP_PF_HASH2` | 1 | the fast HASH2 page hash for that check (build flag `-DG6_CP_PF_HASH2=1`). This is the "H2" in K1H2 |
+ | `G6_PROGRESS_ISOLATE` | 1 | just before the first fabric barrier, move every thread that is not a fabric proxy thread off the proxy CPUs (the cores of the proxies this rank started, see `--proxy-cpu`) so no worker thread can preempt a progress thread. 0 = off (the A/B switch). Anything but 0/1 is rejected at startup. A thread that cannot be moved is named in the log |
+diff --git a/engine/runtime/g6m4.cu b/engine/runtime/g6m4.cu
+index c05635f..67af13e 100644
+--- a/engine/runtime/g6m4.cu
++++ b/engine/runtime/g6m4.cu
+@@ -90,6 +90,7 @@
+ #include "../comms/fabric.h"
+ #include "../comms/progress_cpus.h"
+ #include "s2/native.cuh"
++#include "s2/cp_rows.h"
+ #include "s2/pool.h"
+ #include "s2/kv_tier.cuh"
+ #include "host_reclaim.h"
+@@ -613,6 +614,7 @@ int main(int argc, char** argv)
+     const int dfl_body_i4_on = env_choice("G6_DFL_BODY_I4", 1, 0, &dfe);
+     if (dfl_body_i4_on < 0) die(dfe);
+     if (dfl_body_i4_on && !dfl) die("G6_DFL_BODY_I4=1 needs --dflash-manifest");
++    int cp_step = 0;                    // G6_CP_STEP_ROWS (s2/cp_rows.h): the rows a step past R may carry; 0 = off
+ #if defined(G6_CP) && G6_CP
+     // CP: env as m4sim (G6_CP, G6_CP_R, G6_CP_S3, G6_CP_MMAX). Own fabric `fabc` (cplayout.h variable
+     // layout: per-collective slots, single-destination partials), port + 32, its own proxy CPU.
+@@ -621,8 +623,18 @@ int main(int argc, char** argv)
+     const int cp_s3 = getenv("G6_CP_S3") ? atoi(getenv("G6_CP_S3")) : 1;
+     int cp_mmax = K + 1;
+     for (int M : row_counts) cp_mmax = std::max(cp_mmax, M);
+-    // S2: a split run past R shares batched steps, so any S2 step (sc.max_rows below) may run the CP block
+-    if (s2mode) cp_mmax = std::max(cp_mmax, std::min(MX, std::max(s2sess * (mtp + 1), plan.chunk)));
++    // S2: a split run past R shares batched steps, so any S2 step (sc.max_rows below) may run the CP block.
++    // G6_CP_STEP_ROWS=n: S2 steps past R carry at most n rows (Driver::step caps their rounds, cp_rows.h), so the fabric
++    // is sized for n: at least the rows before #94 (cp_mmax here), at most the widest S2 step
++    if (s2mode)
++    {
++        const int full = std::min(MX, std::max(s2sess * (mtp + 1), plan.chunk));
++        std::string ce;
++        cp_step = g6s2::cp_step_rows_env(getenv("G6_CP_STEP_ROWS"), cp_mmax, full, &ce);
++        if (cp_step < 0) die(ce);
++        cp_mmax = std::max(cp_mmax, cp_step ? cp_step : full);
++    }
++    else if (getenv("G6_CP_STEP_ROWS") && atoi(getenv("G6_CP_STEP_ROWS"))) die("G6_CP_STEP_ROWS needs --serve");
+     if (getenv("G6_CP_MMAX")) cp_mmax = std::max(cp_mmax, atoi(getenv("G6_CP_MMAX")));
+     if (cp_R < 0 || cp_R % 64) die("G6_CP_R must be a multiple of 64");
+     g6::CpColls cp_colls;
+@@ -1007,6 +1019,20 @@ int main(int argc, char** argv)
+             sc.decode_rounds = (uint32_t)v;
+         }
+         sc.steering = steering_boot;
++        // G6_CP_STEP_ROWS (sized the CP fabric above) and G6_CP_STEP_SEG=1: Driver::step's rounds past R (cp_rows.h)
++        {
++            std::string ce;
++            const int seg = env_choice("G6_CP_STEP_SEG", 1, 0, &ce);
++            if (seg < 0) die(ce);
++            if (seg && !cp_step) die("G6_CP_STEP_SEG=1 needs G6_CP_STEP_ROWS");
++            sc.cp_step_rows = (uint32_t)cp_step;
++            sc.cp_seg = seg == 1;
++            sc.cp_after = g6s2::cp_after(m.bk, m.nbk, m.cp.on ? m.cp.R : -1);
++            if (cp_step && R == 0)
++                fprintf(stderr, "# s2 G6_CP_STEP_ROWS=%d: a step past R (context > %llu) carries at most %d rows = %d sessions of %d%s; "
++                        "the CP fabric is sized for it\n", cp_step, (unsigned long long)sc.cp_after, cp_step, cp_step / (mtp + 1), mtp + 1,
++                        sc.cp_seg ? ", and no session below R (G6_CP_STEP_SEG)" : "");
++        }
+         const int place = std::min(m.s2->pool_pages, D.d.s2->pool_pages);
+         g6s2::RunPool pool((uint32_t)(cap / 64), (uint32_t)place, (uint32_t)s2_below);
+         // the pool's R is the CP map's: a run past R takes its own pages — the prefix and its shard below place, the
+@@ -1497,7 +1523,8 @@ int main(int argc, char** argv)
+                 (dsel_start_mtp ? " dselstart mtp" : "") +
+                 (dfl_alpha != 1.f ? " dflalpha " + std::to_string(dfl_alpha) : "") +
+                 (dsel_posclk ? " dselposclk 1" : "") +
+-                (dsel_model ? " dselmodel " + std::to_string(dsel_model) + " " + dsel_tab.str() : "") + s2::kstopb_sig(kstop.b);
++                (dsel_model ? " dselmodel " + std::to_string(dsel_model) + " " + dsel_tab.str() : "") + s2::kstopb_sig(kstop.b) +
++                (cp_step ? " cpsr " + std::to_string(cp_step) + (sc.cp_seg ? " seg" : "") : "");
+             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
+                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
+             g6s2::ControlLinks links = g6s2::bootstrap(bc);
+@@ -1516,7 +1543,7 @@ int main(int argc, char** argv)
+             // the weights are final once the graphs exist: seal them before the barrier, which absorbs the time it takes
+             try
+             {
+-                nd.capture_all(sc.limit(), mtp, plan.chunk, kstop.b);
++                nd.capture_all(sc.limit(), mtp, plan.chunk, kstop.b, cp_step);
+                 m.dfl_tap = tap;
+                 wcheck::seal(R);
+                 int dev = 0;
+diff --git a/engine/runtime/m4sim.cu b/engine/runtime/m4sim.cu
+index 947dbca..0301be5 100644
+--- a/engine/runtime/m4sim.cu
++++ b/engine/runtime/m4sim.cu
+@@ -62,6 +62,7 @@
+ #include <set>
+ #include "s2_batch.h"
+ #include "s2/pool.h"
++#include "s2/cp_rows.h"
+ #endif
+ 
+ using namespace g6rt;
+@@ -357,6 +358,9 @@ int main(int argc, char** argv)
+         plans.push_back(p);
+     }
+     const int NL = (int)layers.size(), NC = 2 * NL + 1;
++    int cp_step = 0;                    // --s2: G6_CP_STEP_ROWS (s2/cp_rows.h), as g6m4; 0 = off
++    bool cp_seg = false;                //       G6_CP_STEP_SEG
++    (void)cp_step; (void)cp_seg;
+ #if defined(G6_CP) && G6_CP
+     // CP: G6_CP=0|1 (default 1 in a CP build), G6_CP_R (replicated prefix tokens, multiple of 64, default 0),
+     // G6_CP_S3=0|1 (default 1), G6_CP_MMAX (CP fabric rows, default = the most rows of any step)
+@@ -365,6 +369,20 @@ int main(int argc, char** argv)
+     const int cp_s3 = getenv("G6_CP_S3") ? atoi(getenv("G6_CP_S3")) : 1;
+     int cp_mmax = mtp + 1;
+     for (int M : row_counts) cp_mmax = std::max(cp_mmax, M);
++#ifdef DEC_S2
++    // --s2 + G6_CP_STEP_ROWS=n: as g6m4, the rounds whose step runs past R take at most n rows (s2/cp_rows.h) and the CP
++    // loopback is sized for n. (An --s2 run's sessions stay below G6_S2_BELOW <= R, so here the cap never engages.)
++    if (s2mode)
++    {
++        std::string ce;
++        cp_step = g6s2::cp_step_rows_env(getenv("G6_CP_STEP_ROWS"), cp_mmax, std::min(MX, std::max((int)plans.size() * (mtp + 1), plan.chunk)), &ce);
++        const int seg = env_choice("G6_CP_STEP_SEG", 1, 0, &ce);
++        if (cp_step < 0 || seg < 0) die(ce);
++        if (seg && !cp_step) die("G6_CP_STEP_SEG=1 needs G6_CP_STEP_ROWS");
++        cp_seg = seg == 1;
++        cp_mmax = std::max(cp_mmax, cp_step);
++    }
++#endif
+     if (getenv("G6_CP_MMAX")) cp_mmax = std::max(cp_mmax, atoi(getenv("G6_CP_MMAX")));
+     if (cp_R < 0 || cp_R % 64) die("G6_CP_R must be a multiple of 64");
+     g6::CpColls cp_colls;
+@@ -1441,6 +1459,14 @@ int main(int argc, char** argv)
+         }
+         std::vector<s2::Stats> sst(NSS);
+         std::vector<std::vector<int>> gen(NSS);
++        // G6_CP_STEP_ROWS: contexts past cp_after run the CP block (s2/cp_rows.h); the cycle of capped rounds
++#if defined(G6_CP) && G6_CP
++        const uint64_t cp_after = g6s2::cp_after(R[0].bk, R[0].nbk, R[0].cp.on ? R[0].cp.R : -1);
++#else
++        const uint64_t cp_after = UINT64_MAX;
++#endif
++        g6s2::CpRound cpr;
++        long cp_capped = 0;
+         {
+             s2::Batch b(mtp, MX, hk);
+             std::vector<int> qs(NSS);
+@@ -1466,11 +1492,28 @@ int main(int argc, char** argv)
+                     if (order.empty()) die("G6_S2_GROW: every session sat the round out");
+                 }
+                 if (solo1 && solo < 0 && act.size() == 1) go_solo(act[0]);
++                if (cp_step)                // G6_CP_STEP_ROWS: the sessions this round takes, as g6m4's Driver::step
++                {
++                    std::vector<g6s2::CpCand> cand;
++                    std::vector<int> cq;
++                    for (int q : order)
++                        if (b.active(q)) { cand.push_back({(uint64_t)q, (uint64_t)b.length(q) + (uint64_t)mtp > cp_after}); cq.push_back(q); }
++                    if (!cand.empty())
++                    {
++                        const g6s2::CpPick pk = cpr.pick(cand, (uint32_t)cp_step, (uint32_t)mtp + 1, cp_seg);
++                        cpr.commit(pk, cand);
++                        order.clear();
++                        for (size_t i = 0; i < cq.size(); ++i) if (pk.in[i]) order.push_back(cq[i]);
++                        if (pk.capped) ++cp_capped;
++                    }
++                }
+                 b.round(order);
+                 for (int q = 0; gpool && q < NSS; ++q)
+                     if (!gone[q] && !b.active(q)) { gpool->release(grun[q]); gone[q] = true; }
+             }
+             if (gpool) fprintf(stderr, "# s2 grow: %ld growths, %ld rounds sat out\n", grows, stalls);
++            if (cp_step) fprintf(stderr, "# s2 G6_CP_STEP_ROWS=%d%s: %ld capped rounds (contexts past %llu)\n", cp_step, cp_seg ? " seg" : "",
++                                 cp_capped, (unsigned long long)cp_after);
+             for (int q = 0; q < NSS; ++q) { gen[q] = b.result(q); sst[q] = b.stats(q); }
+         }
+         for (int q = 0; q < NSS; ++q)
+diff --git a/engine/runtime/s2.cuh b/engine/runtime/s2.cuh
+index 593aff9..3c81d78 100644
+--- a/engine/runtime/s2.cuh
++++ b/engine/runtime/s2.cuh
+@@ -617,16 +617,19 @@ inline int s2_step_rows(const S2Model& s) { return s.h.ns <= 0 ? 0 : s.h.row0[s.
+ // the step runs the CP block (launch_attn_cp on the CP batch views): CP batch views, CP on, and the step's bucket past R.
+ // The fabric side enqueues the CP collectives when the step's largest context is past R (g6m4 cp_enqueue); R is a
+ // bucket boundary (context_buckets.h), so the two agree. Rows below R in such a step take the CP numerics (LSE merge).
+-inline bool s2_cp_step(const Model& m)
++// s2_cp_bucket: the same for a step whose bucket is bk (NativeDispatch::capture_all skips the widths past
++// G6_CP_STEP_ROWS where it holds)
++inline bool s2_cp_bucket(const Model& m, int bk)
+ {
+ #if defined(G6_CP) && G6_CP
+     const S2Model& s = *m.s2;
+-    return s.batch && !s.cbv.empty() && m.cp.on && m.bk[s2_bucket(s)] > m.cp.R;
++    return s.batch && !s.cbv.empty() && m.cp.on && m.bk[bk] > m.cp.R;
+ #else
+-    (void)m;
++    (void)m; (void)bk;
+     return false;
+ #endif
+ }
++inline bool s2_cp_step(const Model& m) { return s2_cp_bucket(m, s2_bucket(*m.s2)); }
+ // the CP batch view's replay entry of layer i for the current step (s2_prepare made it)
+ inline G6AttnReplay* s2_cp_replay(Model& m, int i, int M)
+ {
+@@ -676,7 +679,8 @@ inline void s2_prepare(Model& m, int M, cudaStream_t st)
+             const int bk = s2_bucket(s);
+             const bool cp = s2_cp_step(m);
+ #if defined(G6_CP) && G6_CP
+-            if (cp && M > m.cp.colls.mmax) die("s2: a CP step of " + std::to_string(M) + " rows exceeds the CP fabric's mmax (G6_CP_MMAX)");
++            if (cp && M > m.cp.colls.mmax) die("s2: a CP step of " + std::to_string(M) + " rows exceeds the CP fabric's mmax " + std::to_string(m.cp.colls.mmax) +
++                                                     " (G6_CP_MMAX, G6_CP_STEP_ROWS)");
+ #endif
+             auto& map = cp ? s.cbrp : s.brp;
+             const auto key = std::make_tuple(bk, i, M);
+diff --git a/engine/runtime/s2/bootstrap.h b/engine/runtime/s2/bootstrap.h
+index 8131124..c1e9513 100644
+--- a/engine/runtime/s2/bootstrap.h
++++ b/engine/runtime/s2/bootstrap.h
+@@ -101,6 +101,8 @@ struct BootstrapConfig {
+             std::to_string(scheduler.prefill_rows) + " " + std::to_string(scheduler.two_lanes) +
+             (scheduler.decode_prefill_rows ? " dpf " + std::to_string(scheduler.decode_prefill_rows) : std::string()) +
+             (scheduler.decode_rounds > 1 ? " dr " + std::to_string(scheduler.decode_rounds) : std::string()) +
++            (scheduler.cp_step_rows ? " cpsr " + std::to_string(scheduler.cp_step_rows) + (scheduler.cp_seg ? " seg" : "") +
++                                      " after " + std::to_string(scheduler.cp_after) : std::string()) +
+             " ctl " + std::to_string(control_version) + "\n" + runtime_signature;
+     }
+ };
+diff --git a/engine/runtime/s2/cp_rows.h b/engine/runtime/s2/cp_rows.h
+new file mode 100644
+index 0000000..12a4585
+--- /dev/null
++++ b/engine/runtime/s2/cp_rows.h
+@@ -0,0 +1,90 @@
++// G6_CP_STEP_ROWS=n (every rank, read at boot; default off): a step past R carries at most n rows. Host only, no CUDA.
++// Since #94 a split run past R shares batched steps, and the CP fabric (and the CP graphs at every bucket past R) are
++// sized for the widest S2 step: sessions x (mtp + 1) = 24 rows at 8 sessions, MTP 2. With the knob the fabric is sized
++// for n rows and the round a past-R session takes holds at most n / (mtp + 1) sessions; the other sessions sit that round
++// out (s2_batch.h Batch::round: their state does not change) and go in the next one, in cycles in which every decoding
++// session gets exactly one round. A round without a past-R session (a step below R) keeps the full batch.
++// G6_CP_STEP_SEG=1 (needs the knob): a past-R round never takes a session below R, so a session below R never runs the CP
++// block (whose LSE merge rounds differently from the replicated path) because of a long session it shares the pool with.
++// Every input is replicated state (the scheduler's decoding sessions in request-id order, the driver's grow stalls,
++// Batch lengths, boot constants), so every rank forms the same rounds without exchanging them.
++#pragma once
++#include <algorithm>
++#include <cstdint>
++#include <cstdlib>
++#include <limits>
++#include <string>
++#include <vector>
++
++namespace g6s2 {
++// The contexts that run the CP block: ctx > cp_after(...) exactly when bk[bucket_of(ctx)] > R, bucket_of = the smallest
++// bucket >= ctx, clamped to the last (rank.cuh). bk ascending, nbk >= 1. R < 0: no CP (never past). Returns the largest
++// bucket <= R (0 when every bucket is past R), or UINT64_MAX when no bucket is past R.
++inline uint64_t cp_after(const int* bk, int nbk, int R)
++{
++    if (R < 0 || nbk < 1 || bk[nbk - 1] <= R) return std::numeric_limits<uint64_t>::max();
++    uint64_t t = 0;
++    for (int k = 0; k < nbk && bk[k] <= R; ++k) t = uint64_t(bk[k]);
++    return t;
++}
++// The knob's boot value: env (unset, "" or "0" = off -> 0), solo = the rows a CP step takes without S2 batching (the
++// solo and prompt graphs' row counts: the fabric's size before #94), full = the widest S2 step (#94's size). A value
++// below solo is refused (-1, *err); one above full is clamped to full.
++inline int cp_step_rows_env(const char* env, int solo, int full, std::string* err)
++{
++    if (!env || !*env) return 0;
++    char* end = nullptr;
++    const long v = std::strtol(env, &end, 10);
++    if (*end || v < 0 || v > 4096) { *err = "G6_CP_STEP_ROWS=" + std::string(env) + ": a row count"; return -1; }
++    if (v == 0) return 0;
++    if (v < solo) {
++        *err = "G6_CP_STEP_ROWS=" + std::string(env) + ": at least " + std::to_string(solo) +
++               " (the rows of a solo or prompt step past R: the verify width and --chunk)";
++        return -1;
++    }
++    return int(std::min<long>(v, std::max(full, solo)));
++}
++struct CpCand { uint64_t id; bool past; };   // a decoding session: its immutable id, its next round may run past R
++struct CpPick {
++    std::vector<bool> in;   // per candidate: in this round
++    bool capped = false;    // a cycle round (the others sit it out); false = everyone, and the cycle resets
++    bool fresh = false;     // capped: this round starts a new cycle
++};
++class CpRound {
++    std::vector<uint64_t> served_;   // ids served in the current cycle
++    bool served(uint64_t id) const { return std::find(served_.begin(), served_.end(), id) != served_.end(); }
++public:
++    // The round's sessions among cand (the decoding sessions that are not stalled, in request-id order). rows = n (0 =
++    // off: everyone), per = the most rows one session's verify takes (mtp + 1), seg = G6_CP_STEP_SEG. Pure: commit()
++    // records it once the round really runs.
++    CpPick pick(const std::vector<CpCand>& cand, uint32_t rows, uint32_t per, bool seg) const {
++        CpPick p;
++        p.in.assign(cand.size(), true);
++        if (!rows || cand.empty()) return p;
++        unsigned past = 0;
++        for (const CpCand& c : cand) past += c.past;
++        if (!past) return p;
++        const bool mixed = past < cand.size();
++        if (uint64_t(cand.size()) * per <= rows && !(seg && mixed)) return p;   // everyone fits in one step past R
++        p.capped = true;
++        std::vector<size_t> open;
++        for (size_t i = 0; i < cand.size(); ++i) if (!served(cand[i].id)) open.push_back(i);
++        if (open.empty()) { p.fresh = true; for (size_t i = 0; i < cand.size(); ++i) open.push_back(i); }
++        p.in.assign(cand.size(), false);
++        bool open_past = false;
++        for (size_t i : open) open_past |= cand[i].past;
++        if (!open_past) { for (size_t i : open) p.in[i] = true; return p; }   // a step below R: every open session
++        const size_t most = std::max<size_t>(1, rows / std::max<uint32_t>(per, 1));
++        size_t n = 0;
++        for (size_t i : open) if (cand[i].past && n < most) { p.in[i] = true; ++n; }
++        if (!seg) for (size_t i : open) if (!cand[i].past && n < most) { p.in[i] = true; ++n; }
++        return p;
++    }
++    void commit(const CpPick& p, const std::vector<CpCand>& cand) {
++        if (!p.capped || p.fresh) served_.clear();
++        if (!p.capped) return;
++        for (size_t i = 0; i < cand.size(); ++i) if (p.in[i]) served_.push_back(cand[i].id);
++    }
++    const std::vector<uint64_t>& cycle() const { return served_; }
++};
++} // namespace g6s2
+diff --git a/engine/runtime/s2/driver.h b/engine/runtime/s2/driver.h
+index 25d6715..5d7e90b 100644
+--- a/engine/runtime/s2/driver.h
++++ b/engine/runtime/s2/driver.h
+@@ -3,6 +3,7 @@
+ // EventGate all-rank fence; callbacks must fail the whole epoch on any error.
+ #pragma once
+ #include "scheduler.h"
++#include "cp_rows.h"
+ #include "../s2_batch.h"
+ 
+ namespace g6s2 {
+@@ -51,6 +52,9 @@ class Driver {
+     std::array<uint32_t, MAX_SESSIONS> emitted_{};
+     std::array<bool, MAX_SESSIONS> initialized_{};
+     s2::Batch batch_;
++    CpRound cp_round_;   // G6_CP_STEP_ROWS: the current cycle of capped rounds (cp_rows.h)
++    bool cp_capped_ = false;
++    uint64_t cp_rounds_ = 0;   // capped rounds so far
+     s2::Hooks batch_hooks() {
+         return {
+             [this](const s2::Step& s) {
+@@ -96,6 +100,7 @@ public:
+         require(bool(hooks_.bind) && bool(hooks_.retire) && bool(hooks_.prefill) && bool(hooks_.run) && bool(hooks_.emit), "missing driver callback");
+     }
+     const Scheduler& state() const { return scheduler_; }
++    uint64_t cp_capped_rounds() const { return cp_rounds_; }
+     const s2::Stats& stats(Key k) const {
+         require(k.slot < MAX_SESSIONS && scheduler_.slots()[k.slot].key == k && initialized_[k.slot], "stats for stale/uninitialized slot");
+         return batch_.stats(int(k.slot));
+@@ -158,7 +163,35 @@ public:
+                 }
+             if (hooks_.settle) hooks_.settle();
+         } catch (...) { scheduler_.fail(); throw; }
++        // G6_CP_STEP_ROWS: of the sessions that can decode, the ones this round takes (cp_rows.h); the rest sit it out like
++        // a grow stall. A session's verify context is at most its length + mtp, so `past` holds for every session whose
++        // main step can run past R. The pick is recorded only if the quantum is a decode round
++        const Config& cc = scheduler_.config();
++        std::vector<CpCand> cand;
++        CpPick pick;
++        if (cc.cp_step_rows) {
++            std::vector<unsigned> slot;
++            for (const Key& k : scheduler_.decoding())
++                if (!stalled[k.slot]) {
++                    const uint64_t ctx = uint64_t(batch_.length(int(k.slot))) + cc.mtp;
++                    cand.push_back({scheduler_.slots()[k.slot].req.id, ctx > cc.cp_after});
++                    slot.push_back(k.slot);
++                }
++            pick = cp_round_.pick(cand, cc.cp_step_rows, cc.mtp + 1, cc.cp_seg);
++            for (size_t i = 0; i < cand.size(); ++i) if (!pick.in[i]) stalled[slot[i]] = true;
++        }
+         auto q = scheduler_.next(stalled);
++        if (cc.cp_step_rows && q.kind == Kind::Decode) {
++            cp_round_.commit(pick, cand);
++            if (pick.capped != cp_capped_) {   // one line per change, every rank (the fleet check reads it)
++                unsigned past = 0, in = 0;
++                for (size_t i = 0; i < cand.size(); ++i) { past += cand[i].past; in += pick.in[i]; }
++                std::fprintf(stderr, "# s2 G6_CP_STEP_ROWS=%u: rounds %s at boundary %llu (%zu decoding, %u past R, %u in this round)\n",
++                             cc.cp_step_rows, pick.capped ? "capped" : "uncapped", (unsigned long long)q.boundary, cand.size(), past, in);
++                cp_capped_ = pick.capped;
++            }
++            cp_rounds_ += pick.capped;
++        }
+         try {
+             if (q.kind == Kind::Prefill) {
+                 auto k = q.keys[0];
+diff --git a/engine/runtime/s2/native.cuh b/engine/runtime/s2/native.cuh
+index 4fb2b7e..b8337c6 100644
+--- a/engine/runtime/s2/native.cuh
++++ b/engine/runtime/s2/native.cuh
+@@ -390,7 +390,10 @@ public:
+     //   chain: M in 1..sessions (one row per session; only if K >= 2)
+     // each at every context bucket. The synthetic layout is irrelevant to the graph (S2_ATTN_LAYOUT_FREE): the sessions' rows,
+     // contexts and source rows are read from S2In at launch. Call before the first launch / before connecting.
+-    void capture_all(unsigned sessions, int mtp, int chunk, const s2::KStopB& kb = {}) {
++    // cp_rows (G6_CP_STEP_ROWS, cp_rows.h; 0 = off): at a bucket whose steps run the CP block (s2_cp_bucket) no main step
++    // is wider than cp_rows (Driver::step caps those rounds), so those widths are not captured; a launch of one would
++    // fail as any uncaptured key does.
++    void capture_all(unsigned sessions, int mtp, int chunk, const s2::KStopB& kb = {}, int cp_rows = 0) {
+         require(g6rt::S2_ATTN_LAYOUT_FREE, "boot capture needs the layout-free S2 attention: the graphs would bake the session layout");
+         require(sessions >= 1 && sessions <= unsigned(g6rt::S2N) && mtp >= 1 && chunk >= 1 && chunk <= g6rt::MX, "invalid boot capture set");
+         const int N = int(sessions), K = mtp, nbk = c_.main.nbk;
+@@ -409,7 +412,7 @@ public:
+         size_t free0 = 0, total = 0, free1 = 0; G6RT_CK(cudaMemGetInfo(&free0,&total));
+         const bool on_main = c_.main.s2on, on_draft = c_.draft.d.s2on;
+         c_.main.s2on = c_.draft.d.s2on = true; fence();
+-        size_t keys = 0, graphs = 0;
++        size_t keys = 0, graphs = 0, cp_skipped = 0;
+         // one synthetic step: ns sessions of rows each (first form: one session of M rows; chain: M sessions of one row)
+         auto one = [&](bool draft, bool chain, int M, int k, int cls) {
+             auto& model = draft ? c_.draft.d : c_.main;
+@@ -433,7 +436,10 @@ public:
+             graphs_.emplace(key,std::move(g));
+         };
+         for (int k = 0; k < nbk; ++k) {
+-            for (const auto& mc : mains) one(false,false,mc.first,k,mc.second);
++            for (const auto& mc : mains) {
++                if (cp_rows && mc.first > cp_rows && g6rt::s2_cp_bucket(c_.main,k)) { ++cp_skipped; continue; }
++                one(false,false,mc.first,k,mc.second);
++            }
+             for (int M : drafts) one(true,false,M,k,s2::row_class(M));
+             for (int M : chains) one(true,true,M,k,s2::row_class(M));
+         }
+@@ -444,6 +450,9 @@ public:
+                 keys,graphs,nbk,mains.size(),drafts.size(),chains.size(),N,K,chunk,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count(),
+                 (double(free0)-double(free1))/(1024.0*1024.0));
++        if (c_.main.rank == 0 && cp_rows)
++            fprintf(stderr,"# s2 boot capture: G6_CP_STEP_ROWS=%d: %zu main keys wider than that at the buckets past R not captured\n",
++                cp_rows,cp_skipped);
+     }
+     DispatchHooks hooks() {
+         DispatchHooks h{
+diff --git a/engine/runtime/s2/scheduler.h b/engine/runtime/s2/scheduler.h
+index a1b019d..de2f44f 100644
+--- a/engine/runtime/s2/scheduler.h
++++ b/engine/runtime/s2/scheduler.h
+@@ -55,6 +55,12 @@ struct Config {
+     // While a prefill waits and sessions decode, this many decode rounds run per prefill quantum, so the decoders get
+     // K rounds per quantum's wait instead of one (Scheduler::alternate). 0 or 1 = off: one round per quantum, as before.
+     uint32_t decode_rounds = 0;         // after decode_prefill_rows, for the same reason
++    // G6_CP_STEP_ROWS (cp_rows.h): a step past R carries at most cp_step_rows rows (0 = off: every decoding session in
++    // every round, as before). cp_after: contexts above it run the CP block (cp_after()). cp_seg: G6_CP_STEP_SEG. Read by
++    // Driver::step only; the scheduler's quanta keep their kinds (a capped round is a Decode quantum with fewer sessions)
++    uint32_t cp_step_rows = 0;          // after decode_rounds, for the same reason
++    uint64_t cp_after = UINT64_MAX;
++    bool cp_seg = false;
+     // max_rows bounds ONE step: a round is one main step of every session's mtp + 1 rows (s2_batch.h Batch::round)
+     uint32_t guard() const { return guard_tokens == UINT32_MAX ? 2 * mtp : guard_tokens; }
+     unsigned limit() const { return std::min(max_sessions, max_rows / (mtp + 1)); }
+@@ -65,6 +71,8 @@ struct Config {
+         require(!decode_prefill_rows || (decode_prefill_rows % PAGE == 0 && decode_prefill_rows <= prefill_rows),
+                 "decode_prefill_rows must be 0 or a multiple of 64 no larger than prefill_rows");
+         require(decode_rounds <= MAX_DECODE_ROUNDS, "decode_rounds must be at most 64");
++        require(!cp_step_rows || cp_step_rows >= mtp + 1, "cp_step_rows must be 0 or at least one session's verify (mtp + 1)");
++        require(!cp_seg || cp_step_rows, "cp_seg needs cp_step_rows");
+         require(!steering.loaded || (g6rt::steering::valid_profile_name(steering.profile_name) && steering.active_layers &&
+                 (steering.scope == g6rt::steering::Scope::Shared || steering.scope == g6rt::steering::Scope::Full)),
+                 "invalid loaded steering receipt");
+@@ -239,6 +247,7 @@ public:
+         add(c_.epoch); add(c_.pool_rows); add(c_.max_rows); add(c_.max_sessions); add(c_.mtp); add(c_.guard());
+         add(c_.prefill_rows); add(c_.two_lanes); if (c_.decode_prefill_rows) add(c_.decode_prefill_rows); add(have_id_); add(last_id_); add(boundary_); add(event_); add(want_decode_); add(busy_); add(failed_);
+         if (c_.decode_rounds > 1) { add(c_.decode_rounds); add(decode_run_); }
++        if (c_.cp_step_rows) { add(c_.cp_step_rows); add(c_.cp_after); add(c_.cp_seg); }
+         add(pool_); g6rt::steering::hash_boot(h, c_.steering);
+         for (const auto& s : s_) {
+             add(s.key.slot); add(s.key.generation); add(uint64_t(s.phase));
+diff --git a/engine/runtime/s2/tests/cp_rows_test.cpp b/engine/runtime/s2/tests/cp_rows_test.cpp
+new file mode 100644
+index 0000000..8879ac5
+--- /dev/null
++++ b/engine/runtime/s2/tests/cp_rows_test.cpp
+@@ -0,0 +1,412 @@
++// G6_CP_STEP_ROWS / G6_CP_STEP_SEG (s2/cp_rows.h, Driver::step): a step past R carries at most n rows. Properties:
++//   1. cp_after(bk, R) splits the contexts exactly as the engine's CP test does (bk[bucket_of(ctx)] > R, context_buckets.h).
++//   2. the boot parse: off, the minimum (solo rows), the clamp to the widest S2 step, junk refused.
++//   3. CpRound::pick on hand-made rounds: fits / no past-R session = everyone; cycles of past-R-first rounds of n / per
++//      sessions and full-batch rounds below R; SEG never mixes; pick is pure; arrivals join the current cycle.
++//   4. Driver::step with random requests (prompts below and past R, sessions crossing R while decoding, insert rules,
++//      grow stalls): every request emits exactly its solo tokens (the cap only changes which sessions share a step), no
++//      main step past R is wider than n, SEG never puts a session below R in such a step, two ranks fed the same events
++//      agree on every digest and step, no decoding session waits more than a bounded number of rounds, and the trial
++//      reaches steps past R wider than n with the knob off (so the cap is exercised).
++//   5. not engaged = unchanged: no session past R, or n >= the widest round, gives the knob-off step sequence.
++//   6. Config::validate refuses n < mtp + 1 and SEG without n; the digest and the bootstrap agreement name the knob only
++//      when it is set (the default ones are unchanged), so ranks with different values refuse each other.
++// Host only: no GPU, no CUDA, no pool. Build and run: see scripts/host_tests.sh.
++#include "s2/bootstrap.h"
++#include "s2/driver.h"
++#include "context_buckets.h"
++#include <cstdio>
++#include <deque>
++#include <map>
++#include <memory>
++#include <optional>
++
++using namespace g6s2;
++static int fails = 0;
++#define CHECK(c) do { if (!(c)) { std::fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
++
++static uint32_t mix(uint32_t a, uint32_t b, uint32_t c)
++{
++    uint64_t x = a * 0x9E3779B97F4A7C15ull ^ (b + 0x632BE59BD9B4E019ull) * 0xBF58476D1CE4E5B9ull ^ (c + 0x1234567ull) * 0x94D049BB133111EBull;
++    x ^= x >> 29; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 32;
++    return (uint32_t)x;
++}
++// the fake model of driver_grow_test: a pure function of (request, row position, row token)
++constexpr int V = 2;
++static int model(const s2::Row& r, int kind, uint32_t salt)
++{
++    int t = (int)(mix(salt, kind == s2::Step::MAIN ? r.pos : r.pos + 1, r.tok) % V);
++    if (kind != s2::Step::MAIN && mix(salt, r.pos, r.tok + 99) % 3 == 0) t = (t + 1) % V;
++    return t;
++}
++
++// ---- 1. cp_after against the engine's bucket rule ----
++static void after_tests()
++{
++    long checked = 0;
++    for (int cap : {4096, 65536 + 64, 212224, 262144})
++        for (int base : {0, 2048, 4096})
++            for (int R : {-1, 0, 64, 2048, 30016, 32768, 65536, 98304, 212224, 300000})
++                for (int doublings : {7, 8}) {
++                    int bk[9] = {};
++                    const int nbk = context_buckets(bk, base, cap, R > 0 ? R : 0, doublings);
++                    const uint64_t t = cp_after(bk, nbk, R);
++                    auto bucket_of = [&](int ctx) { for (int k = 0; k < nbk; ++k) if (bk[k] >= ctx) return k; return nbk - 1; };
++                    for (int ctx = 1; ctx <= cap + 64; ctx += (ctx < 4200 ? 1 : 61)) {
++                        const bool engine = R >= 0 && bk[bucket_of(ctx)] > R;
++                        CHECK((uint64_t(ctx) > t) == engine);
++                        ++checked;
++                    }
++                    for (int k = 0; k < nbk; ++k) {   // the bucket boundaries themselves and one past them
++                        CHECK((uint64_t(bk[k]) > t) == (R >= 0 && bk[bucket_of(bk[k])] > R));
++                        CHECK((uint64_t(bk[k]) + 1 > t) == (R >= 0 && bk[bucket_of(bk[k] + 1)] > R));
++                    }
++                }
++    CHECK(checked > 100000);
++}
++
++// ---- 2. the boot parse ----
++static void parse_tests()
++{
++    std::string e;
++    CHECK(cp_step_rows_env(nullptr, 8, 24, &e) == 0);
++    CHECK(cp_step_rows_env("", 8, 24, &e) == 0);
++    CHECK(cp_step_rows_env("0", 8, 24, &e) == 0);
++    CHECK(cp_step_rows_env("8", 8, 24, &e) == 8);
++    CHECK(cp_step_rows_env("12", 8, 24, &e) == 12);
++    CHECK(cp_step_rows_env("24", 8, 24, &e) == 24);
++    CHECK(cp_step_rows_env("32", 8, 24, &e) == 24);          // clamped to the widest S2 step
++    e.clear(); CHECK(cp_step_rows_env("7", 8, 24, &e) == -1 && e.find("at least 8") != std::string::npos);
++    for (const char* bad : {"x", "8x", "-8", "1e3", "99999"}) { e.clear(); CHECK(cp_step_rows_env(bad, 8, 24, &e) == -1 && !e.empty()); }
++}
++
++// ---- 3. CpRound on hand-made rounds ----
++static std::vector<uint64_t> ids_in(const std::vector<CpCand>& c, const CpPick& p)
++{
++    std::vector<uint64_t> v;
++    for (size_t i = 0; i < c.size(); ++i) if (p.in[i]) v.push_back(c[i].id);
++    return v;
++}
++// runs `rounds` rounds over cand (fixed), returns the ids of each round
++static std::vector<std::vector<uint64_t>> cycle(CpRound& r, const std::vector<CpCand>& cand, uint32_t rows, bool seg, int rounds)
++{
++    std::vector<std::vector<uint64_t>> out;
++    for (int k = 0; k < rounds; ++k) {
++        const CpPick p = r.pick(cand, rows, 3, seg);
++        CHECK(p.in.size() == cand.size());
++        const CpPick again = r.pick(cand, rows, 3, seg);    // pure
++        CHECK(again.in == p.in && again.capped == p.capped && again.fresh == p.fresh);
++        r.commit(p, cand);
++        out.push_back(ids_in(cand, p));
++    }
++    return out;
++}
++using VV = std::vector<std::vector<uint64_t>>;
++static void pick_tests()
++{
++    auto L = [](uint64_t id) { return CpCand{id, true}; };
++    auto S = [](uint64_t id) { return CpCand{id, false}; };
++    {   // off, no past-R session, everyone fits: everyone, never capped
++        CpRound r;
++        const std::vector<CpCand> eight{S(1), S(2), S(3), S(4), S(5), S(6), S(7), S(8)};
++        CHECK(cycle(r, eight, 8, false, 2) == (VV{{1, 2, 3, 4, 5, 6, 7, 8}, {1, 2, 3, 4, 5, 6, 7, 8}}));
++        const std::vector<CpCand> mixed{L(1), S(2), S(3), S(4)};
++        CHECK(cycle(r, mixed, 0, false, 1) == (VV{{1, 2, 3, 4}}));
++        CHECK(cycle(r, {L(1), S(2)}, 8, false, 2) == (VV{{1, 2}, {1, 2}}));       // 6 rows <= 8
++        CHECK(cycle(r, mixed, 12, false, 1) == (VV{{1, 2, 3, 4}}));              // 12 rows <= 12
++        CHECK(!r.pick(mixed, 12, 3, false).capped && r.cycle().empty());
++    }
++    {   // n = 8 (two sessions a round): the design note's examples
++        CpRound r;
++        CHECK(cycle(r, {L(1), S(2), S(3), S(4)}, 8, false, 4) == (VV{{1, 2}, {3, 4}, {1, 2}, {3, 4}}));
++        CpRound r2;
++        CHECK(cycle(r2, {L(1), S(2), S(3), S(4), S(5), S(6), S(7), S(8)}, 8, false, 4) ==
++              (VV{{1, 2}, {3, 4, 5, 6, 7, 8}, {1, 2}, {3, 4, 5, 6, 7, 8}}));
++        CpRound r3;
++        CHECK(cycle(r3, {L(1), L(2), L(3), S(4), S(5), S(6), S(7), S(8)}, 8, false, 3) ==
++              (VV{{1, 2}, {3, 4}, {5, 6, 7, 8}}));
++        CpRound r4;   // past-R sessions first even when a session below R has the lower id
++        CHECK(cycle(r4, {S(1), L(2), S(3), S(4)}, 8, false, 2) == (VV{{1, 2}, {3, 4}}));
++        CpRound r5;
++        CHECK(cycle(r5, {S(1), S(2), L(3), S(4)}, 8, false, 2) == (VV{{1, 3}, {2, 4}}));
++        CpRound r6;   // n = 12: four a round
++        CHECK(cycle(r6, {L(1), S(2), S(3), S(4), S(5), S(6), S(7), S(8)}, 12, false, 2) ==
++              (VV{{1, 2, 3, 4}, {5, 6, 7, 8}}));
++        CpRound r7;   // more past-R sessions than a round holds: they rotate, every one once per cycle
++        CHECK(cycle(r7, {L(1), L(2), L(3), L(4), L(5)}, 8, false, 6) == (VV{{1, 2}, {3, 4}, {5}, {1, 2}, {3, 4}, {5}}));
++    }
++    {   // SEG: a past-R round never takes a session below R, even when everyone would fit
++        CpRound r;
++        CHECK(cycle(r, {L(1), S(2)}, 8, true, 4) == (VV{{1}, {2}, {1}, {2}}));
++        CpRound r2;
++        CHECK(cycle(r2, {L(1), L(2)}, 8, true, 2) == (VV{{1, 2}, {1, 2}}));     // all past R and they fit: one step
++        CpRound r3;
++        CHECK(cycle(r3, {L(1), L(2), L(3), S(4), S(5)}, 8, true, 3) == (VV{{1, 2}, {3}, {4, 5}}));
++        CpRound r4;
++        CHECK(cycle(r4, {S(1), S(2), S(3)}, 8, true, 1) == (VV{{1, 2, 3}}));    // no past-R session: everyone
++    }
++    {   // an arrival joins the current cycle; a session that left does not hold it open
++        CpRound r;
++        std::vector<CpCand> c{L(1), S(2), S(3), S(4)};
++        CHECK(cycle(r, c, 8, false, 1) == (VV{{1, 2}}));
++        c.push_back(S(5));
++        CHECK(cycle(r, c, 8, false, 1) == (VV{{3, 4, 5}}));
++        c.erase(c.begin() + 2);       // 3 finished
++        CHECK(cycle(r, c, 8, false, 2) == (VV{{1, 2}, {4, 5}}));
++        // a capped round followed by an uncapped one resets the cycle
++        CHECK(cycle(r, {L(1), S(2)}, 8, false, 1) == (VV{{1, 2}}) && r.cycle().empty());
++    }
++}
++
++// ---- 4 / 5. Driver::step ----
++struct Req { uint64_t id; std::vector<int> prompt; uint32_t max_tokens; g6rt::InsertRule ins; };
++struct Rank {
++    Config c;
++    std::unique_ptr<Driver> d;
++    std::map<uint64_t, std::vector<int>> out;   // request id -> emitted tokens
++    std::vector<uint64_t> trace;                // per step: a hash of its kind, sessions and rows (FNV)
++    long cp_steps = 0, wide_cp = 0, mixed_cp = 0, outside = 0, grows = 0;
++    int max_cp = 0;
++    bool stall = false;
++    uint64_t gcount = 0;
++    Rank(const Config& cfg, bool stalls) : c(cfg), stall(stalls) {
++        DriverHooks h;
++        h.bind = [](const Grant&) {};
++        h.retire = [](const Slot&) {};
++        h.prefill = [this](const Slot& s, const Payload&, uint32_t first, uint32_t rows) {
++            if (uint64_t(first) + rows > uint64_t(s.run.pages) * PAGE) ++outside;
++        };
++        h.run = [this](const s2::Step& st) {
++            std::vector<int> ids;
++            uint64_t hsh = 1469598103934665603ull;
++            auto add = [&](uint64_t v) { hsh = (hsh ^ v) * 1099511628211ull; };
++            add(uint64_t(st.kind)); add(uint64_t(st.M()));
++            for (size_t j = 0; j < st.sess.size(); ++j) { add(uint64_t(st.sess[j])); add(uint64_t(st.rows[j])); add(uint64_t(st.ctx[j])); }
++            for (const auto& r : st.r) {
++                const Slot& s = d->state().slots()[r.sess];
++                if (uint64_t(r.pos) >= uint64_t(s.run.pages) * PAGE) ++outside;
++                ids.push_back(model(r, st.kind, uint32_t(s.req.id)));
++            }
++            if (st.kind == s2::Step::MAIN) {
++                int ctx = 0;
++                for (int x : st.ctx) ctx = std::max(ctx, x);
++                if (uint64_t(ctx) > c.cp_after) {            // a step past R (Dispatch: the largest of its sessions' buckets)
++                    ++cp_steps; max_cp = std::max(max_cp, st.M());
++                    if (st.M() > 8) ++wide_cp;
++                    // a round's main step: rows = kq + 1, ctx = length + kq. A session the cap counts below R
++                    // (length + mtp <= cp_after) in a step past R
++                    for (size_t j = 0; j < st.sess.size() && st.sess.size() > 1; ++j)
++                        if (uint64_t(st.ctx[j] - st.rows[j] + 1 + int(c.mtp)) <= c.cp_after) { ++mixed_cp; break; }
++                }
++            }
++            trace.push_back(hsh);
++            return ids;
++        };
++        h.emit = [this](Key k, const int* ids, int n, int) {
++            const Slot& s = d->state().slots()[k.slot];
++            auto& o = out[s.req.id];
++            const int cnt = std::min<int>(n, int(s.req.max_tokens - o.size()));
++            o.insert(o.end(), ids, ids + cnt);
++            return Emission{uint32_t(cnt), o.size() == s.req.max_tokens};
++        };
++        // the runs hold their worst case from the start; a stall trial sits sessions out now and then (both ranks alike)
++        h.grow = [this](const Slot& s, uint64_t rows) -> std::optional<Run> {
++            ++grows;
++            if (rows > uint64_t(s.run.pages) * PAGE) ++outside;
++            if (stall && mix(uint32_t(s.req.id), uint32_t(++gcount), 5) % 6 == 0) return std::nullopt;
++            return s.run;
++        };
++        d = std::make_unique<Driver>(c, h);
++    }
++};
++static std::vector<int> solo(const Req& r, int K)
++{
++    s2::Hooks h;
++    h.run = [&](const s2::Step& st) {
++        std::vector<int> ids;
++        for (const auto& x : st.r) ids.push_back(model(x, st.kind, uint32_t(r.id)));
++        return ids;
++    };
++    s2::Session s;
++    s.prompt = r.prompt; s.first = int(r.prompt.size()) - 1; s.chunk = 4; s.n_gen = int(r.max_tokens); s.ins = r.ins;
++    std::vector<s2::Stats> st;
++    return s2::mtp_batch({s}, K, 8, h, st)[0];
++}
++struct Trial {
++    long cp_steps = 0, wide_cp = 0, mixed_cp = 0, max_wait = 0, capped_rounds = 0, decode_rounds = 0;
++    int max_cp = 0;
++    std::vector<uint64_t> trace;
++    std::map<uint64_t, std::vector<int>> out;
++};
++// one trial: the requests admitted FIFO as slots free up, `steps_per_event` steps between events, two ranks a / b
++static Trial run_trial(Config c, const std::vector<Req>& reqs, bool stalls, uint64_t seed)
++{
++    Rank a(c, stalls), b(c, stalls);
++    std::deque<Req> queue(reqs.begin(), reqs.end());
++    std::map<uint64_t, Req> all;
++    for (const auto& r : reqs) all[r.id] = r;
++    std::map<uint64_t, long> waited;   // request id -> decode rounds in a row it sat out (cap only: no stall trials)
++    Trial t;
++    auto rnd = [&](int lo, int hi) {
++        uint64_t z = (seed += 0x9E3779B97F4A7C15ull);
++        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull; z = (z ^ (z >> 27)) * 0x94D049BB133111EBull; z ^= z >> 31;
++        return lo + int(z % uint64_t(hi - lo + 1));
++    };
++    long guard = 0;
++    for (;;) {
++        const Scheduler& s = a.d->state();
++        Commit cm;
++        cm.epoch = c.epoch; cm.event = s.next_event(); cm.boundary = s.boundary();
++        if (!queue.empty() && s.resident() < c.limit()) {
++            const Req& r = queue.front();
++            const Request rq{r.id, uint32_t(r.prompt.size()), r.max_tokens};
++            cm.admit = Grant{s.next_key(), rq, Run{0, reserve_pages(c, rq), 1, r.id * 0x9E3779B97F4A7C15ull + 1}, 0};
++        }
++        for (Rank* x : {&a, &b}) {
++            Commit mine = cm; mine.before_hash = x->d->state().digest();
++            Payload p; p.prompt = cm.admit ? all[cm.admit->req.id].prompt : std::vector<int>{}; p.chunk = 4;
++            if (cm.admit) p.ins = all[cm.admit->req.id].ins;
++            x->d->apply(mine, cm.admit ? &p : nullptr);
++        }
++        CHECK(a.d->state().digest() == b.d->state().digest());
++        if (cm.admit) queue.pop_front();
++        if (!a.d->state().resident()) { if (queue.empty()) break; else continue; }
++        for (int k = rnd(1, 6); k > 0 && a.d->state().resident(); --k) {
++            const std::vector<Key> dec = a.d->state().decoding();
++            const auto qa = a.d->step(), qb = b.d->step();
++            CHECK(qa.kind == qb.kind && qa.count == qb.count);
++            for (unsigned i = 0; i < qa.count && i < qb.count; ++i) CHECK(qa.keys[i] == qb.keys[i]);
++            // a resident session always has something to run, unless every decoder drew a grow stall this time
++            if (qa.kind == Kind::Idle && !stalls) { CHECK(!"idle with a resident session"); fails += 1000; break; }
++            if (qa.kind == Kind::Decode) {
++                ++t.decode_rounds;
++                if (qa.count < dec.size()) ++t.capped_rounds;
++                for (const Key& kk : dec) {
++                    bool in = false;
++                    for (unsigned i = 0; i < qa.count; ++i) in |= qa.keys[i] == kk;
++                    const uint64_t id = a.d->state().slots()[kk.slot].req.id;
++                    long& w = waited[id];
++                    w = in ? 0 : w + 1;
++                    if (!stalls) t.max_wait = std::max(t.max_wait, w);
++                }
++            }
++        }
++        CHECK(a.trace == b.trace);
++        if (++guard > 400000 || fails > 100) { CHECK(!"no progress"); break; }
++    }
++    CHECK(a.outside == 0 && b.outside == 0);
++    t.cp_steps = a.cp_steps; t.wide_cp = a.wide_cp; t.mixed_cp = a.mixed_cp; t.max_cp = a.max_cp;
++    t.trace = a.trace; t.out = a.out;
++    return t;
++}
++static void driver_tests()
++{
++    Config base;
++    base.epoch = 1; base.mtp = 2; base.max_rows = 24; base.max_sessions = 8; base.prefill_rows = 64; base.two_lanes = false;
++    base.pool_rows = 64 * 4096;
++    uint64_t seed = 7;
++    auto rnd = [&](int lo, int hi) {
++        uint64_t z = (seed += 0x9E3779B97F4A7C15ull);
++        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull; z = (z ^ (z >> 27)) * 0x94D049BB133111EBull; z ^= z >> 31;
++        return lo + int(z % uint64_t(hi - lo + 1));
++    };
++    long cp_on = 0, wide_off = 0, capped = 0, crossed = 0, inserts = 0, max_wait = 0, seg_capped = 0, rounds = 0;
++    for (int trial = 0; trial < 60; ++trial) {
++        const uint64_t T = uint64_t(rnd(3, 8)) * 64;     // R: a bucket boundary, contexts past it run the CP block
++        std::vector<Req> reqs;
++        const int n = rnd(4, 14);
++        for (int i = 0; i < n; ++i) {
++            Req r; r.id = uint64_t(trial) * 100 + i + 1;
++            const int kind = rnd(0, 3);                  // 0: past R from the start, 1: crosses R while decoding, else short
++            const int plen = kind == 0 ? rnd(int(T) + 1, int(T) + 300) : kind == 1 ? rnd(int(T) - 120, int(T) - 10) : rnd(2, 120);
++            for (int k = 0; k < plen; ++k) r.prompt.push_back(int(mix(uint32_t(r.id), k, 7) % V));
++            r.max_tokens = uint32_t(kind == 1 ? rnd(150, 300) : rnd(1, 220));
++            if (kind == 1) ++crossed;
++            if (i % 3 == 1) {
++                r.ins.after = rnd(0, int(r.max_tokens));
++                r.ins.unless = rnd(0, 3) == 0 ? 1 : -1;
++                for (int k = rnd(1, 9); k > 0; --k) r.ins.tokens.push_back(rnd(0, V - 1));
++            }
++            reqs.push_back(r);
++        }
++        const bool stalls = trial % 3 == 2;
++        const uint64_t ev = uint64_t(rnd(1, 1 << 30));
++        Config off = base; off.cp_after = T;              // knob off: cp_after is only read with it on
++        Config on8 = base; on8.cp_step_rows = 8; on8.cp_after = T;
++        Config on12 = base; on12.cp_step_rows = 12; on12.cp_after = T;
++        Config seg = on8; seg.cp_seg = true;
++        const Trial t_off = run_trial(off, reqs, stalls, ev), t8 = run_trial(on8, reqs, stalls, ev),
++                    t12 = run_trial(on12, reqs, stalls, ev), ts = run_trial(seg, reqs, stalls, ev);
++        auto got = [](const Trial& t, uint64_t id) { const auto it = t.out.find(id); return it == t.out.end() ? std::vector<int>{} : it->second; };
++        for (const auto& r : reqs) {
++            const auto want = solo(r, int(base.mtp));
++            CHECK(got(t_off, r.id) == want);
++            CHECK(got(t8, r.id) == want);
++            CHECK(got(t12, r.id) == want);
++            CHECK(got(ts, r.id) == want);
++            if (r.ins.on() && int(r.ins.after) < int(want.size()) && want[size_t(r.ins.after)] == r.ins.tokens[0]) ++inserts;
++        }
++        CHECK(t8.max_cp <= 8 && ts.max_cp <= 8 && t12.max_cp <= 12);   // the invariant
++        CHECK(ts.mixed_cp == 0);                                        // SEG: no session below R in a step past R
++        cp_on += t8.cp_steps; wide_off += t_off.wide_cp; capped += t8.capped_rounds + t12.capped_rounds;
++        seg_capped += ts.capped_rounds; rounds += t8.decode_rounds;
++        max_wait = std::max({max_wait, t8.max_wait, t12.max_wait, ts.max_wait});
++        CHECK(t_off.capped_rounds == 0 || stalls);
++        // 5. not engaged: no session ever past R (cp_after past every context), or n = the widest round (non-SEG)
++        Config far = on8; far.cp_after = 1u << 30;
++        Config wide = base; wide.cp_step_rows = 24; wide.cp_after = T;
++        Config off_far = base; off_far.cp_after = 1u << 30;
++        CHECK(run_trial(far, reqs, stalls, ev).trace == run_trial(off_far, reqs, stalls, ev).trace);
++        CHECK(run_trial(wide, reqs, stalls, ev).trace == t_off.trace);
++    }
++    // the trials reach what the cap is for: knob off, steps past R wider than 8; knob on, capped rounds
++    CHECK(cp_on > 1000 && wide_off > 100 && capped > 100 && seg_capped > 100 && crossed > 20 && inserts > 10);
++    CHECK(max_wait <= 2 * long(MAX_SESSIONS));   // a cycle: ceil(past / c) + 1 rounds, arrivals join it
++    std::printf("cp_rows_test driver: %ld decode rounds at n=8, %ld main steps past R at n=8, %ld wider than 8 with the knob off, "
++                "%ld capped rounds (n=8 + 12), %ld SEG capped, longest wait %ld rounds\n",
++                rounds, cp_on, wide_off, capped, seg_capped, max_wait);
++}
++
++// ---- 6. config, digest, agreement ----
++static void config_tests()
++{
++    Config c;
++    c.mtp = 2;
++    auto bad = [](Config x) { try { x.validate(); return false; } catch (const std::exception&) { return true; } };
++    Config x = c; x.cp_step_rows = 2; CHECK(bad(x));
++    x.cp_step_rows = 3; CHECK(!bad(x));
++    x = c; x.cp_seg = true; CHECK(bad(x));
++    x.cp_step_rows = 8; CHECK(!bad(x));
++    // the default digest ignores cp_after (read only with the knob); a set knob changes it
++    Config d0 = c, d1 = c; d1.cp_after = 123;
++    CHECK(Scheduler(d0).digest() == Scheduler(d1).digest());
++    Config e8 = c; e8.cp_step_rows = 8; e8.cp_after = 65536;
++    Config e12 = e8; e12.cp_step_rows = 12;
++    Config es = e8; es.cp_seg = true;
++    Config ea = e8; ea.cp_after = 32768;
++    const uint64_t h0 = Scheduler(d0).digest(), h8 = Scheduler(e8).digest();
++    CHECK(h0 != h8 && h8 != Scheduler(e12).digest() && h8 != Scheduler(es).digest() && h8 != Scheduler(ea).digest());
++    BootstrapConfig b;
++    b.scheduler = c; b.ranks = 4; b.runtime_signature = "sig";
++    const std::string a0 = b.agreement();
++    CHECK(a0.find("cpsr") == std::string::npos);
++    b.scheduler = e8;
++    const std::string a8 = b.agreement();
++    CHECK(a8.find(" cpsr 8 after 65536 ctl ") != std::string::npos);
++    b.scheduler = es;
++    CHECK(b.agreement().find(" cpsr 8 seg after 65536 ctl ") != std::string::npos);
++    b.scheduler = e12;
++    CHECK(b.agreement() != a8);
++}
++
++int main()
++{
++    after_tests();
++    parse_tests();
++    pick_tests();
++    config_tests();
++    driver_tests();
++    if (fails) { std::fprintf(stderr, "cp_rows_test: %d FAILED\n", fails); return 1; }
++    std::printf("cp_rows_test: PASS\n");
++    return 0;
++}
+diff --git a/scripts/host_tests.sh b/scripts/host_tests.sh
+index 0f0f326..b0cee67 100755
+--- a/scripts/host_tests.sh
++++ b/scripts/host_tests.sh
+@@ -78,6 +78,9 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
+ # Config::decode_rounds (G6_S2_DECODE_ROUNDS): K decode rounds per prefill quantum, its notice target, default off
+ g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_rounds_test.cpp" -o "$T/scheduler_rounds_test"
+ "$T/scheduler_rounds_test"
++# G6_CP_STEP_ROWS / G6_CP_STEP_SEG (s2/cp_rows.h, Driver::step): steps past R capped at n rows, solo-exact tokens, fair cycles
++g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/cp_rows_test.cpp" -o "$T/cp_rows_test"
++"$T/cp_rows_test" 2> >(grep -v '^# s2 G6_CP_STEP_ROWS=' >&2)   # the driver's cap transition lines, thousands here
+ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_stash_test.cpp" "${KVLIB[@]}" -o "$T/pool_stash_test"
+ STORES=("mem:" "ssd:$T/store")
+ NODE=$REPO/engine/kvman-rs/target/release/kvman-remote

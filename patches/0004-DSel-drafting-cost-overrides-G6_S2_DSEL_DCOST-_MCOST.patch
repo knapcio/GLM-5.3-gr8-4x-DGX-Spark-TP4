@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Thu, 15 Oct 2026 08:16:14 +0200
+Subject: [PATCH 04/30] DSel: drafting-cost overrides G6_S2_DSEL_DCOST / _MCOST
+ / _MEACH
+
+Unset keeps 5.6 + 2.5, 2.5 + 3.0 and 2.1 ms; the rank-0 drafter-choice line
+prints the values in use.
+---
+ docs/SETTINGS.md       |  2 +-
+ engine/runtime/g6m4.cu | 10 ++++++++--
+ 2 files changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/docs/SETTINGS.md b/docs/SETTINGS.md
+index 898863d..965e465 100644
+--- a/docs/SETTINGS.md
++++ b/docs/SETTINGS.md
+@@ -104,7 +104,7 @@ the short version.
+ | `G6_GV_MULTI` | 1 | steps of up to 8 rows run the GEMVs on the layer input (q_a, kv_a, the indexer's k and weights) as one launch; 0 = one launch each (same bits) |
+ | `G6_S2_ADAPT` | 0 | S2: choose each round's MTP draft count (1..k) from the sessions' accept rates and the S2 step costs; 1 adds ~1 GiB of main-step graphs |
+ | `G6_S2_GROW` | 1 | S2: a session below R holds the KV pages it needs now and takes more as its output grows, admitted and grown only while every live session can still reach prompt + `max_tokens` + guard; a session that cannot grow sits out rounds. 0 = every run holds that worst case from admission |
+-| `G6_S2_DSEL` | 1 | S2 with DFlash2: a request that decodes alone drafts each round with DFlash2 or MTP, whichever is expected to commit more tokens per ms (prose +4.5% on RigMark, code level); 0 = DFlash2 every round. `G6_S2_DSEL_MARGIN` (0.15), `G6_S2_DSEL_DWELL` (8 rounds) and `G6_S2_DSEL_PROBE` (4) tune it |
++| `G6_S2_DSEL` | 1 | S2 with DFlash2: a request that decodes alone drafts each round with DFlash2 or MTP, whichever is expected to commit more tokens per ms (prose +4.5% on RigMark, code level); 0 = DFlash2 every round. `G6_S2_DSEL_MARGIN` (0.15), `G6_S2_DSEL_DWELL` (8 rounds) and `G6_S2_DSEL_PROBE` (4) tune it; `G6_S2_DSEL_DCOST` (8.1), `G6_S2_DSEL_MCOST` (5.5) and `G6_S2_DSEL_MEACH` (2.1) override its drafting ms per round (DFlash2; MTP's first form and the drafter's context step; each MTP chain step) |
+ | `G6_S2_DECODE_PF` | 0 | S2: while any session decodes, a prefill quantum takes at most this many rows on one lane, so a decode round comes round sooner (each round waits out one quantum). 0 = the full `--prefill` x lanes quantum. A multiple of 64, at most `--prefill`. Part of the bootstrap agreement when set |
+ | `G6_S2_DECODE_ROUNDS` | 0 | S2: while a prefill waits and sessions decode, K decode rounds run per prefill quantum instead of one (0 or 1 = off; at most 64). Part of the bootstrap agreement when set |
+ | `G6_S2_ADMIT_HOLD` | 0 | S2, head only: 1 = an admission with another request queued behind it and a slot left holds its boundary, and the next admission is announced at that same boundary, so a burst of queued requests is granted at once instead of one per notice (the workers follow the commit frame's hold field) |
+diff --git a/engine/runtime/g6m4.cu b/engine/runtime/g6m4.cu
+index 323cce4..8867dde 100644
+--- a/engine/runtime/g6m4.cu
++++ b/engine/runtime/g6m4.cu
+@@ -1300,8 +1300,14 @@ int main(int argc, char** argv)
+                     h.dsel.d.draft_round = d[0]; h.dsel.m.draft_round = d[1]; h.dsel.m.draft_each = d[2];
+                     if (R == 0) fprintf(stderr, "# spec: drafting ms from G6_SPEC_DRAFT: %s\n", e);
+                 }
+-                if (R == 0 && h.dsel.on) fprintf(stderr, "# s2 drafter choice on: DFlash2 or MTP per round (dwell %d, margin %.2f, probe %d)\n",
+-                                                    h.dsel.dwell, h.dsel.margin, h.dsel.probe);
++                // the drafting ms above, overridden (A/B of the cost model; every rank the same values)
++                if (const char* e = getenv("G6_S2_DSEL_DCOST")) h.dsel.d.draft_round = atof(e);
++                if (const char* e = getenv("G6_S2_DSEL_MCOST")) h.dsel.m.draft_round = atof(e);
++                if (const char* e = getenv("G6_S2_DSEL_MEACH")) h.dsel.m.draft_each = atof(e);
++                if (R == 0 && h.dsel.on) fprintf(stderr, "# s2 drafter choice on: DFlash2 or MTP per round (dwell %d, margin %.2f, probe %d, "
++                                                    "drafting ms: DFlash2 %.2f, MTP %.2f + %.2f per chain step)\n",
++                                                    h.dsel.dwell, h.dsel.margin, h.dsel.probe, h.dsel.d.draft_round, h.dsel.m.draft_round,
++                                                    h.dsel.m.draft_each);
+                 h.kstop = kstop;
+                 if (R == 0 && kstop.mode)
+                     fprintf(stderr, "# s2 MTP confidence stop: mode %d, solo MTP rounds verify 1..%d drafts (%s)%s\n", kstop.mode, kstop.kmax,

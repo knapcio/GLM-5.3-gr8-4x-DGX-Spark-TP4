@@ -1,13 +1,18 @@
 # Measurement history
 
 A/B measurements behind the releases: each release against the previous one and against the upstream baseline, the
-per-lever contributions, and the multi-turn test for patch 0014. The README shows only the current release; per-release
-summaries are in [CHANGELOG.md](../CHANGELOG.md).
+per-lever contributions, and the multi-turn test for `G6_DFL_REUSE`. The README shows only the current release;
+per-release summaries are in [CHANGELOG.md](../CHANGELOG.md).
+
+Patch numbers in a section are those of the release it describes. Through v0.8 the series sat on upstream `6448a16`
+and was numbered 0001–0039; v0.9 rebased onto `c53b5b8`, where fifteen of those patches are upstream code, and
+renumbered the rest (the mapping is in the CHANGELOG's v0.9 entry).
 
 ## Baseline
 
 The baseline is upstream gr8 `d9188e3` plus the MTU fix only (the engine without this recipe's speed patches),
-measured on the same four machines as the recipe. The recipe pins upstream `6448a16`. The upstream changes in between
+measured on the same four machines as the recipe. Through v0.8 the recipe pinned upstream `6448a16` (since v0.9
+`c53b5b8`, see [v0.9](#v09-rebase-cp-step-rows-and-round-10-levers)). The upstream changes between `d9188e3` and `6448a16`
 are engine-side (fabric relay back-pressure, giving host heap back after load, S2 prefill and notice scheduling); the
 front end, launcher and loader are identical. The comparisons below are of complete stacks, not of the patches alone.
 
@@ -46,6 +51,61 @@ prose 36.2 / 49.3 / 63.3, code 46.3 / 59.2 / 75.5, structured 70.6 / 65.7 / 85.0
 | v0.2 (2026-10-15) | prose | 34.9 [35.8] | 48.9 [25.9] | 62.8 [17.6] |
 | v0.2 (2026-10-15) | code | 43.4 [44.3] | 58.8 [31.2] | 74.8 [21.3] |
 | v0.2 (2026-10-15) | structured | 69.5 [72.0] | 65.2 [35.4] | 84.3 [24.8] |
+
+## v0.9: rebase, CP step rows and round-10 levers
+
+v0.9 is upstream `c53b5b8` plus thirty patches (v0.8: `6448a16` plus thirty-nine). Measured 2026-10-19, every
+configuration from a fresh boot with the host memory compacted first. The decode table by prompt type above was not
+re-measured for v0.9.
+
+speedbench, paired A/B against v0.8 (decode tok/s, c1):
+
+| Category | v0.8 | v0.9 | change [95 % CI] |
+|---|---:|---:|---:|
+| prose | 43.6 | 42.9 | +0.5 % [−3.3, +4.5] |
+| code | 53.7 | 54.1 | +1.3 % [−3.9, +6.7] |
+| structured | 55.6 | 57.7 | +3.5 % [+0.1, +7.0] |
+| agentic | 51.3 | 50.0 | −1.0 % [−5.5, +3.7] |
+| multilingual | 43.5 | 45.4 | +2.9 % [−1.0, +7.0] |
+| long context | 45.9 | 48.1 | +0.6 % [−2.1, +3.4] |
+| all 73 prompts | 47.8 | 48.6 | +1.2 % [−1.2, +3.6] |
+
+speedbench 0.2, full mode, four fresh boots alternated v0.8, v0.9, v0.9, v0.8; medians from the first run of each arm;
+change paired per prompt with a 95 % confidence interval. Each arm's two runs gave identical output on all 73 prompts;
+the two arms' outputs differ on 72 of 73 (POSIDX and the two-stage draft head change the text). Decomposition: step
+time −0.7 % [−2.9, +1.5], tokens per step +0.4 % [−2.4, +3.3]. An earlier same-day run of the same design on the v0.9
+image, the three round-10 flags off vs on, gave +1.5 % [−0.1, +3.1] (structured +3.9 % [+0.6, +7.3]).
+
+RigMark full runs:
+
+| Run | prose | code | structured | C1 / C2 / C4 aggregate | T=0 qeval | sampled qeval |
+|---|---:|---:|---:|---|---:|---:|
+| v0.8 (README) | 40.6 | 61.2 | 73.4 | 48.2 / 61.7 / 76.2 | 72/75 | 573/600 |
+| v0.9 run 1 | 40.6 | 60.8 | 74.2 | 47.0 / 59.1 / 77.1 | 71/75 | 578/600 |
+| v0.9 run 2 | 40.7 | 60.6 | 75.5 | 47.0 / 60.0 / 75.9 | 71/75 | 578/600 |
+| v0.9 run 3 | 40.6 | 59.0 | 76.0 | 47.0 / 59.9 / 76.6 | 70/75 | 578/600 |
+
+The round-10 levers, each alone on the same image against all three off (`bench/decset.py`, c1, T=0, 384 output
+tokens; two fresh boots per arm interleaved in one session, mean of the two; all off: prose 44.82, code 56.45,
+structured 61.57 tok/s):
+
+| Lever | Flag | prose | code | structured | Notes |
+|---|---|---:|---:|---:|---|
+| 0026, 0028 | `G6_ATTN_POSIDX=1` | −1.3 % | +4.2 % | −0.5 % | E1; acts only at contexts up to 2048 tokens |
+| 0029 | `G6_MTP_LASTROW=1` | +0.1 % | +0.2 % | +0.2 % | bit-exact |
+| 0030 | `G6_DRAFT_HEAD2=1` | −0.8 % | 0.0 % | −1.2 % | drafting |
+| 0023 | `G6_CP_STEP_ROWS=8` | — | — | — | memory: head 0.5 → 3.3 GiB available after boot, others 2.5–2.8 GiB; turn-taking past `SHARE_LIMIT` not measured separately |
+
+The three together gave +3.1 % prose, +3.8 % code and +2.1 % structured in the same benchmark (three interleaved
+pairs, an earlier session the same day), and RigMark decode screens gave −2.3 % to +0.4 % for single levers. The parts
+do not add up because POSIDX and DRAFT_HEAD2 change the generated text: at T=0 a 12-prompt set measures each text's
+own speed, and repeated boots of one configuration repeat the same texts, so they are not independent samples. Only
+LASTROW, which is bit-exact, keeps the text, so its number is free of that effect. The paired speedbench run above, over 73 prompts,
+is the measurement this release relies on. `G6_ATTN_CTX3_SP` (0025, E1) showed no gain in the attention bench and is
+off.
+
+Quality: T=0 KL vs the dh32f configuration (top-20 logprobs, 75 qeval prompts, prefix-cached pass) 35/75
+identical, mean 2.830e-03, max 0.465 (v0.8 2.734e-03, same method); sampled qeval 578/600 in each run (dh32f 578/600); T=0 qeval 71, 71, 70/75.
 
 ## v0.8: compaction and kv_b FP8
 
@@ -108,6 +168,8 @@ the README's Reproducing section. RigMark sends single-turn requests.
 
 | c1 decode | prose | code | structured |
 |---|---:|---:|---:|
+| v0.9, full run (median of three) | 40.6 | 60.6 | 75.5 |
+| v0.8, full run (median of three) | 40.6 | 61.2 | 73.4 |
 | v0.7, full run (median of three) | 38.3 | 58.4 | 70.2 |
 | v0.6, full run | 38.5 | 58.3 | 70.2 |
 | v0.5, full run | 37.8 | 57.9 | 70.2 |
@@ -120,6 +182,9 @@ the README's Reproducing section. RigMark sends single-turn requests.
 
 | Concurrency, aggregate end-to-end tok/s | C1 | C2 | C4 |
 |---|---:|---:|---:|
+| v0.9 (median of three full runs) | 47.0 | 59.9 | 76.6 |
+| v0.8 (median of three full runs) | 48.2 | 61.7 | 76.2 |
+| v0.7 (median of three full runs) | 46.4 | 58.8 | 73.5 |
 | v0.6 | 46.3 | 56.7 | 73.3 |
 | v0.5 | 46.1 | 57.4 | 72.5 |
 | v0.4 | 43.6 | 56.1 | 68.6 |
@@ -129,6 +194,8 @@ the README's Reproducing section. RigMark sends single-turn requests.
 
 | Prefill, cold, tok/s | 8K | 32K | 64K | 128K |
 |---|---:|---:|---:|---:|
+| v0.9 (median of three full runs) | 1381 | 1382 | 1327 | 1226 |
+| v0.8 (median of three full runs, after a warm-up prefill) | 1341 | 1362 | 1308 | 1205 |
 | v0.7 (median of three full runs) | 1371 | 1368 | 1317 | 1202 |
 | v0.6 (full run) | 1375 | 1381 | 1306 | 1157 |
 | v0.5 (after a warm-up request) | 1359 | 1383 | 1316 | 1154 |
@@ -145,7 +212,9 @@ Prefill (v0.1) is within 1 % of the baseline: the levers act on decode. v0.2: pr
 ## Per-lever contributions
 
 Measured contribution is RigMark c1 decode on short screens, each step on top of the levers above it, so the steps use
-different control runs and do not add up exactly to the release totals. The DSel model (0018–0020) is compared with
+different control runs and do not add up exactly to the release totals. Patch numbers in this table are v0.8's (the
+v0.9 levers are in [v0.9](#v09-rebase-cp-step-rows-and-round-10-levers)); in v0.9, 0001–0005, 0010–0017, 0022 and 0030
+are upstream code (#82–#90). The DSel model (0018–0020) is compared with
 v0.2's `G6_S2_DSEL_MCOST=2.9`, which it replaces.
 
 | Patch | Flags (serving) | Measured |
@@ -254,6 +323,10 @@ release acceptance rule (win per workload) it loses and is not shipped; the B=8 
 
 | Check | Result |
 |---|---|
+| T=0 identity / KL, v0.9 | top-20 logprobs on the 75 qeval prompts vs the dh32f reference configuration, prefix-cached pass: 35/75 identical, mean KL 2.830e-03 on the 3,622 common positions, max 0.465 (v0.8 2.734e-03, same method). v0.9 serves `G6_ATTN_POSIDX=1`, which is E1 (not byte-identical to upstream) |
+| Sampled qeval / T=0 qeval / needle, v0.9 | 578/600 sampled with `SPEC_ACCEPT=rejection` (the dh32f reference 578/600); 71/75 T=0; 96K needle correct |
+| T=0 identity / KL, v0.8 | the same check: mean KL 2.734e-03 on the 3,590 common positions, the same value as v0.7; the T=0 identity probe gave the same output as v0.7 on every v0.8 boot |
+| Sampled qeval / T=0 qeval / needle, v0.8 | 573/600 sampled with `SPEC_ACCEPT=rejection` on each of the three full runs (the dh32f reference 578/600); 72/75 T=0 on each; 96K needle correct |
 | T=0 identity / KL, v0.7 | top-20 logprobs on the 75 qeval prompts vs the dh32f reference configuration, prefix-cached pass: 34/75 identical, mean KL 2.734e-03 on the 3,590 common positions (noise scale 5.0e-3, as below; the c1-vs-c4 scale run gave 30/75, KL 4.994e-03). The same value v0.6 measured the same way |
 | Sampled qeval / T=0 qeval / needle, v0.7 | 573/600 sampled with `SPEC_ACCEPT=rejection` (the dh32f reference 578/600, standard error 0.85 pp, ~1 se apart; identical in both full runs); 72/75 T=0 (74/75 on the first full run; 71–74 across the release's boots); 96K needle correct |
 | T=0 identity / KL, v0.6 | top-20 logprobs on the 75 qeval prompts vs the v0.5 configuration, prefix-cached pass: 34/75 identical, mean KL 2.7e-3 on the 3,590 common positions (noise scale 5.0e-3) |

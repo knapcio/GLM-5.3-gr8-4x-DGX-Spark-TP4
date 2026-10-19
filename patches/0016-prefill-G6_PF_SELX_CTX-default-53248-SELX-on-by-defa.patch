@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Sun, 18 Oct 2026 00:57:40 +0200
+Subject: [PATCH 16/30] prefill: G6_PF_SELX_CTX default 53248 (SELX on by
+ default in v0.7)
+
+---
+ engine/attn/prefill.cuh | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/engine/attn/prefill.cuh b/engine/attn/prefill.cuh
+index c41edc8..03c6806 100644
+--- a/engine/attn/prefill.cuh
++++ b/engine/attn/prefill.cuh
+@@ -245,9 +245,9 @@ static ga::Work index_workspace(const G6Attn& a,void* base,bool full){
+ // cand scratch = w.so .. w.io (2 * R * T * 4 B, present for T > 32768, used by SEL32 only as its histogram) -> min(CAPG, T) keys/row.
+ static constexpr int SELX_MINN=32;   // our gate: selx 1.6-2.0x SEL32 from 53K at n >= 33
+ static int selx_ctx(){
+-    static const int v=[]{const char* s=getenv("G6_PF_SELX_CTX");if(!s)return 0;
++    static const int v=[]{const char* s=getenv("G6_PF_SELX_CTX");if(!s)return 53248;   // default: SELX at 53248 context (v0.7)
+         char* e=nullptr;errno=0;const long x=strtol(s,&e,10);
+-        if(!*s||*e||errno||x<=32768||x>1048576){fprintf(stderr,"G6_PF_SELX_CTX='%s': need an integer 32769..1048576 (unset = SEL32)\n",s);exit(2);}
++        if(!*s||*e||errno||x<=32768||x>1048576){fprintf(stderr,"G6_PF_SELX_CTX='%s': need an integer 32769..1048576 (unset = 53248)\n",s);exit(2);}
+         fprintf(stderr,"# G6_PF_SELX_CTX %ld: prefill index tiles with n >= %d and context >= %ld select with selx\n",x,SELX_MINN,x);return (int)x;}();
+     return v;
+ }

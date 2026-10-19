@@ -1,0 +1,245 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Mon, 19 Oct 2026 02:30:46 +0200
+Subject: [PATCH 27/30] attnk: round 10 E1 arms (SP = G6_ATTN_CTX3_SP, POS =
+ G6_ATTN_POSIDX) and attnk_r10a.sh
+
+An E1 arm is checked for determinism (every byte of repeated poisoned calls equal), for what must not change
+(the selected set per row, each key's raw score wherever its slot is, the appended KV / index rows, the error
+words; SP alone: indices, scores and probabilities byte for byte), and its error against stock is reported
+(max abs / rel of both layers' outputs and of the merged context). An E1 arm the dispatch does not take (POS
+past the 2048 bucket) must be byte-identical to stock. ATTNK_NANKEY puts a NaN into one index key's scale
+(stock drops the key with error 4, POS keeps it). attnk_r10a.sh runs the sweep (T 2K / 8K / 32K x M 1 / 3 / 8,
+the 2048 / 2049 boundary, two sessions, ties, underflowing probabilities) against the served flags.
+---
+ engine/attn/tests/attnk.cu      | 108 +++++++++++++++++++++++++++++---
+ engine/attn/tests/attnk_r10a.sh |  28 +++++++++
+ 2 files changed, 126 insertions(+), 10 deletions(-)
+ create mode 100755 engine/attn/tests/attnk_r10a.sh
+
+diff --git a/engine/attn/tests/attnk.cu b/engine/attn/tests/attnk.cu
+index 329a5bc..c33535b 100644
+--- a/engine/attn/tests/attnk.cu
++++ b/engine/attn/tests/attnk.cu
+@@ -40,6 +40,24 @@
+ //   against stock), default below. ATTNK_BASE="SC2=4,TR=2,CTX2=4,CTX3=2,SEL2=16,IDX=16" (the same syntax over stock).
+ //   sweep: for M in 1 3 8 12; do ./attnk 2048 1000 $M; ./attnk 8192 8000 $M; ./attnk 32768 32000 $M; done
+ // Exit 3 on any byte difference of an exact arm, 1 on a CUDA / validation error.
++//
++// Round 10, E1 arms (deterministic fp-order changes; keys SP and POS; ATTNK_E1=1 picks the default E1 arm list below):
++//   SP=64 / 128   G6_ATTN_CTX3_SP: context_pk3 over 64 / 128-slot partitions, merge_parts over 32 / 16 partials (run_body)
++//   POS=1         G6_ATTN_POSIDX: the full-index layer at capacity T <= 2048 takes the positional index (no indexer)
++//   An E1 arm is not compared byte for byte against stock; instead (E1 lines):
++//     DET    every byte of CHK repeated poisoned calls (a fresh graph each) identical to the arm's first call: deterministic
++//     SAME   what must not change: the selected SET per row (full layer, as sorted ids), the raw scores BY KEY (each key's
++//            score wherever its slot is: scores_sc's per-(key, head) arithmetic does not depend on the slot), the appended
++//            KV / index rows, the error words. SP alone: indices, scores and probabilities byte-compared too
++//     ERR    vs stock: max abs and max rel error of the attention outputs (fp16, both layers) and of the shared layer's
++//            merged context (fp32): max |d|, max |d| / max |ref|, max |d| / |ref| over |ref| >= 1e-3 max |ref|, elements
++//            differing; and of the normalized probabilities by key (POS)
++//   An E1 arm the dispatch does not take (POS at T > 2048: those buckets run the indexer) is still byte-compared against
++//   stock and must be IDENTICAL ("inert"): the bucket boundary. Then NODE / TIME as for an exact arm.
++//   ATTNK_NANKEY=<pos>: the index key at <pos> (session 0) gets a NaN scale. Stock drops that key from every row that
++//   sees it and raises error 4; POS keeps it (no indexer score): reported as the expected semantic difference, and the
++//   SET / score checks then ignore that key.
++//   E1 sweep on one GB10: attnk_r10a.sh next to this file.
+ #include "../attn.cu"
+ #include <cstdio>
+ #include <cstdlib>
+@@ -86,6 +104,22 @@ template<class T> static std::vector<T> host(const T* d,size_t n){std::vector<T>
+ static size_t ndiff(const void* x,const void* y,size_t bytes){size_t k=0;for(size_t i=0;i<bytes;i++)k+=((const uint8_t*)x)[i]!=((const uint8_t*)y)[i];return k;}
+ template<class T> static size_t vdiff(const std::vector<T>& x,const std::vector<T>& y){return x.size()!=y.size()?~size_t(0):ndiff(x.data(),y.data(),x.size()*sizeof(T));}
+ static float med(std::vector<float> v){std::sort(v.begin(),v.end());return v[v.size()/2];}
++// E1: x against the reference y: max |d|, max |d| / max |y|, max |d| / |y| over |y| >= 1e-3 max |y|, elements differing
++// (bitwise), nonfinite elements of x
++struct Err{double abs=0,nrel=0,erel=0;size_t ndiff=0,nonfin=0,n=0;};
++static float tof(float v){return v;}
++static float tof(__half v){return __half2float(v);}
++template<class T> static Err err_of(const std::vector<T>& x,const std::vector<T>& y){
++    Err e;e.n=x.size();if(x.size()!=y.size()){e.ndiff=~size_t(0);return e;}
++    double ym=0;for(const T& v:y){const double a=fabs((double)tof(v));if(std::isfinite(a))ym=std::max(ym,a);}
++    for(size_t i=0;i<x.size();i++){const double a=tof(x[i]),b=tof(y[i]);
++        e.ndiff+=memcmp(&x[i],&y[i],sizeof(T))!=0;
++        if(!std::isfinite(a)){e.nonfin++;continue;}
++        const double d=fabs(a-b);if(!std::isfinite(d))continue;
++        e.abs=std::max(e.abs,d);if(fabs(b)>=1e-3*ym&&b!=0)e.erel=std::max(e.erel,d/fabs(b));}
++    e.nrel=ym>0?e.abs/ym:0;return e;}
++static std::string err_str(const Err& e){char b[192];snprintf(b,sizeof b,"max abs %.3e, rel(max|ref|) %.3e, rel(elem) %.3e, %zu of %zu differ, %zu nonfinite",
++    e.abs,e.nrel,e.erel,e.ndiff,e.n,e.nonfin);return b;}
+ 
+ // ---- graphs
+ template<class F> static cudaGraph_t capture(cudaStream_t st,F body){
+@@ -153,19 +187,20 @@ static double floor_bytes(const std::string& s,int H,int L){
+     if(s.find("scores")!=std::string::npos)return kv;
+     return 0;
+ }
+-struct Arm{int sc,tr,ctx2,ctx3,hg,sel,idx,qt,front;bool vs_stock;};
++struct Arm{int sc,tr,ctx2,ctx3,hg,sel,idx,qt,front,sp,pos;bool vs_stock;bool e1()const{return sp||pos;}};
+ static void set_arm(const Arm& x){ga::attn_sc2()=x.sc;ga::attn_sc2_tr()=x.tr;ga::attn_ctx2()=x.ctx2;ga::attn_ctx3()=x.ctx3;ga::attn_ctx3_hg()=x.hg;
+-    ga::attn_sel2()=x.sel;ga::attn_idx_grp()=x.idx;ga::attn_qt()=x.qt;ga::attn_front_on()=x.front;}
+-static const Arm STOCK{0,0,0,0,0,0,0,0,0,false};
+-static std::string tag_of(const Arm& x){char b[160];snprintf(b,sizeof b,"SC2=%d TR=%d CTX2=%d CTX3=%d HG=%d SEL2=%d IDX=%d QT=%d FRONT=%d",
+-    x.sc,x.tr,x.ctx2,x.ctx3,x.hg,x.sel,x.idx,x.qt,x.front);return b;}
++    ga::attn_sel2()=x.sel;ga::attn_idx_grp()=x.idx;ga::attn_qt()=x.qt;ga::attn_front_on()=x.front;ga::attn_ctx3_sp()=x.sp;ga::attn_posidx()=x.pos;}
++static const Arm STOCK{0,0,0,0,0,0,0,0,0,0,0,false};
++static std::string tag_of(const Arm& x){char b[192];snprintf(b,sizeof b,"SC2=%d TR=%d CTX2=%d CTX3=%d HG=%d SEL2=%d IDX=%d QT=%d FRONT=%d%s",
++    x.sc,x.tr,x.ctx2,x.ctx3,x.hg,x.sel,x.idx,x.qt,x.front,x.e1()?(" SP="+std::to_string(x.sp)+" POS="+std::to_string(x.pos)).c_str():"");return b;}
+ // "KEY=V,KEY=V" over `on`; false on an unknown key
+ static bool parse_arm(const std::string& s,Arm& x){
+     if(s=="base"||s=="stock")return true;
+     size_t i=0;while(i<s.size()){size_t e=s.find(',',i);if(e==std::string::npos)e=s.size();const std::string kv=s.substr(i,e-i);i=e+1;
+         const size_t q=kv.find('=');if(q==std::string::npos)return false;const std::string k=kv.substr(0,q);const int v=atoi(kv.c_str()+q+1);
+         if(k=="SC2")x.sc=v;else if(k=="TR")x.tr=v;else if(k=="CTX2")x.ctx2=v;else if(k=="CTX3")x.ctx3=v;else if(k=="HG")x.hg=v;
+-        else if(k=="SEL2")x.sel=v;else if(k=="IDX")x.idx=v;else if(k=="QT")x.qt=v;else if(k=="FRONT")x.front=v;else return false;}
++        else if(k=="SEL2")x.sel=v;else if(k=="IDX")x.idx=v;else if(k=="QT")x.qt=v;else if(k=="FRONT")x.front=v;
++        else if(k=="SP")x.sp=v;else if(k=="POS")x.pos=v;else return false;}
+     return true;
+ }
+ 
+@@ -186,11 +221,13 @@ int main(int argc,char** argv){
+     const int NSESS=getenv("ATTNK_SESS")&&atoi(getenv("ATTNK_SESS"))==2&&S2&&M>=2?2:1;
+     const int TIES=getenv("ATTNK_TIES")&&atoi(getenv("ATTNK_TIES"))?1:0;
+     const float QS=getenv("ATTNK_QSCALE")?(float)atof(getenv("ATTNK_QSCALE")):1.f;
++    const int NANKEY=getenv("ATTNK_NANKEY")?atoi(getenv("ATTNK_NANKEY")):-1;
+     // BASE and the arms
+-    Arm base{4,2,4,2,0,16,16,0,0,false};   // the serving flags (rounds 1 + 2)
++    Arm base{4,2,4,2,0,16,16,0,0,0,0,false};   // the serving flags (rounds 1 + 2)
+     if(const char* e=getenv("ATTNK_BASE")){base=STOCK;if(!parse_arm(e,base)){fprintf(stderr,"ATTNK_BASE: KEY=V,...\n");return 2;}}
+     // round 3: QT (S = 4 and S = 2), FRONT, then both (the serving arm)
+     std::vector<std::string> specs={"base","QT=1","QT=1,SC2=2","FRONT=1","QT=1,FRONT=1"};
++    if(getenv("ATTNK_E1")&&atoi(getenv("ATTNK_E1")))specs={"base","SP=64","SP=128","POS=1","POS=1,FRONT=0","SP=64,POS=1"};   // round 10
+     if(const char* e=getenv("ATTNK_ARMS")){specs.clear();std::string s=e;size_t i=0;
+         while(i<s.size()){while(i<s.size()&&s[i]==' ')i++;size_t e2=s.find(' ',i);if(e2==std::string::npos)e2=s.size();if(e2>i)specs.push_back(s.substr(i,e2-i));i=e2;}}
+     std::vector<Arm> arms;
+@@ -210,6 +247,8 @@ int main(int argc,char** argv){
+     uint8_t *mla[2],*ixc=dalloc<uint8_t>((size_t)pool*64*g6kv::IDX_ROW);
+     for(int l=0;l<2;l++){mla[l]=dalloc<uint8_t>((size_t)pool*64*g6kv::ROW);fill_kv<<<1024,256,0,st>>>(mla[l],(size_t)pool*64,100+l);}
+     fill_idx<<<512,256,0,st>>>(ixc,pool,64,200,TIES);
++    if(NANKEY>=0&&NANKEY<L){const float nan=NAN;   // session 0's identity table: page NANKEY / 64; a page's scales follow its keys
++        CK(cudaMemcpy(ixc+(size_t)(NANKEY/64)*64*g6kv::IDX_ROW+64*128+(NANKEY%64)*4,&nan,4,cudaMemcpyHostToDevice));}
+     __half *qb=dalloc<__half>((size_t)M*H*256),*kva=dalloc<__half>((size_t)M*576),*iq=dalloc<__half>((size_t)M*32*128),
+         *ik=dalloc<__half>((size_t)M*128),*iw=dalloc<__half>((size_t)M*32);
+     fill_half<<<64,256,0,st>>>(qb,(size_t)M*H*256,6,QS);fill_half<<<8,256,0,st>>>(kva,(size_t)M*576,7,1.f);
+@@ -251,7 +290,9 @@ int main(int argc,char** argv){
+ #endif
+         CK(cudaMalloc(&dcell[l],sizeof c));CK(cudaMemcpy(dcell[l],&c,sizeof c,cudaMemcpyHostToDevice));
+         c.context=0;CK(cudaMalloc(&dead[l],sizeof c));CK(cudaMemcpy(dead[l],&c,sizeof c,cudaMemcpyHostToDevice));}
++    ga::attn_ctx3_sp()=64;   // size the scratch for the largest layout (SP=64: 32 partials), so every arm's layout fits it
+     const size_t sb=std::max(g6_attn_scratch_bytes(&a[0]),g6_attn_scratch_bytes(&a[1]));
++    ga::attn_ctx3_sp()=0;
+     void* scr=dalloc<uint8_t>(sb);
+     G6AttnReplay rp[2]={{a[0],dcell[0],scr,sb},{a[1],dcell[1],scr,sb}},rd[2]={{a[0],dead[0],scr,sb},{a[1],dead[1],scr,sb}};
+     const size_t fl=(size_t)96<<20;float4* fb=dalloc<float4>(fl/16);float* sink=dalloc<float>(1);
+@@ -290,7 +331,7 @@ int main(int argc,char** argv){
+     Snap ref;take(ref);
+     {int live=0;for(int v:ref.i0)live+=v>=0;size_t nan=0;for(auto h:ref.o0)nan+=!std::isfinite(__half2float(h));for(auto h:ref.o1)nan+=!std::isfinite(__half2float(h));
+      printf("REF selected %d, nonfinite out %zu, err %u/%u valid %u/%u\n",live,nan,ref.e0,ref.e1,ref.v0,ref.v1);
+-     if(ref.e0||ref.e1||!ref.v0||!ref.v1)return 1;}
++     if((ref.e0&&!(NANKEY>=0&&ref.e0==4))||ref.e1||!ref.v0||!ref.v1)return 1;}   // NANKEY: the indexer's error 4 expected
+ 
+     // ---- timing helpers: per-call us of `body` (cold: behind a flush, the flush subtracted)
+     float tflush=0;{cudaGraphExec_t g=inst(st,[&]{for(int k=0;k<K;k++)flushk();});std::vector<float> v;for(int t=0;t<TR;t++)v.push_back(run_us(g,st,REPS));tflush=med(v)/K;cudaGraphExecDestroy(g);}
+@@ -340,20 +381,67 @@ int main(int argc,char** argv){
+             set_arm(x);cudaGraph_t g1=capture(st,[&]{call(l);});auto c1=chain_of(g1);
+             differs=c0.size()!=c1.size();for(size_t i=0;!differs&&i<c0.size();i++)differs=!same_node(c0[i],c1[i])||arg_differs(c1[i],ref_arm.idx,x.idx);
+             cudaGraphDestroy(g0);cudaGraphDestroy(g1);}
+-         if(!differs){printf("ARM %s not taken by this call's dispatch (same chain as %s)\n",tag.c_str(),rtag.c_str());continue;}}
++         if(!differs&&!x.e1()){printf("ARM %s not taken by this call's dispatch (same chain as %s)\n",tag.c_str(),rtag.c_str());continue;}
++         if(!differs){   // an E1 arm this call's dispatch does not take (POS past 2048): must be byte-identical to stock
++            set_arm(x);size_t nd=0;bool ok=true;
++            for(int it=0;it<CHK;it++){Snap s;take(s);
++                nd+=vdiff(ref.o0,s.o0)+vdiff(ref.o1,s.o1)+vdiff(ref.i0,s.i0)+vdiff(ref.pr,s.pr)+vdiff(ref.cx,s.cx)+vdiff(ref.kv,s.kv)+vdiff(ref.ix,s.ix)+
++                    vdiff(ref.sc[0],s.sc[0])+vdiff(ref.sc[1],s.sc[1])+vdiff(ref.si,s.si)+vdiff(ref.ii,s.ii);ok&=s.e0==ref.e0&&!s.e1&&s.v0&&s.v1;}
++            printf("E1 %s T=%d L=%d M=%d: not taken by this call's dispatch (same chain as %s): bytes differing vs stock %zu x%d, err/valid %s | %s\n",
++                tag.c_str(),T,L,M,rtag.c_str(),nd,CHK,ok?"ok":"BAD",nd||!ok?"DIFFER":"IDENTICAL (inert)");
++            if(nd||!ok)bad++;
++            continue;}}
+         set_arm(x);
++        if(x.e1()){
++            // DET: CHK calls against the arm's first
++            std::vector<Snap> ss(CHK);for(int it=0;it<CHK;it++)take(ss[it]);
++            size_t det=0;bool ok=true;
++            for(int it=0;it<CHK;it++){const Snap& s=ss[it];const Snap& f=ss[0];
++                det+=vdiff(f.o0,s.o0)+vdiff(f.o1,s.o1)+vdiff(f.i0,s.i0)+vdiff(f.pr,s.pr)+vdiff(f.pa,s.pa)+vdiff(f.cx,s.cx)+vdiff(f.kv,s.kv)+vdiff(f.ix,s.ix)+
++                    vdiff(f.sc[0],s.sc[0])+vdiff(f.sc[1],s.sc[1])+vdiff(f.pl[0],s.pl[0])+vdiff(f.pl[1],s.pl[1])+vdiff(f.si,s.si)+vdiff(f.ii,s.ii);
++                ok&=!s.e1&&s.v0&&s.v1&&(x.pos?s.e0==0:s.e0==ref.e0);}
++            const Snap& s=ss[0];
++            // SAME: the set per row (NANKEY ignored), the raw scores by key, the kv / index rows
++            size_t setbad=0,nan_kept=0,nan_rows=0;
++            for(int r=0;r<M;r++){std::vector<int> u,v;
++                for(int j=0;j<ga::TOP;j++){const int p=ref.i0[(size_t)r*ga::TOP+j],q=s.i0[(size_t)r*ga::TOP+j];
++                    if(p>=0&&p!=NANKEY)u.push_back(p);if(q>=0&&q!=NANKEY)v.push_back(q);if(NANKEY>=0&&q==NANKEY)nan_kept++;}
++                if(NANKEY>=0&&rsess[r]==0&&NANKEY<=pos[r])nan_rows++;
++                std::sort(u.begin(),u.end());std::sort(v.begin(),v.end());setbad+=u!=v;}
++            // the score of (row, head, key): REF's slot j holds key ref.i0[r][j], the arm's slot k holds s.i0[r][k]
++            size_t scbad=0,sccmp=0;double pmax=0;
++            for(int l=0;l<2;l++)for(int r=0;r<M;r++){std::vector<int> at(T,-1);
++                for(int k=0;k<ga::TOP;k++){const int q=s.i0[(size_t)r*ga::TOP+k];if(q>=0&&q<T)at[q]=k;}
++                for(int j=0;j<ga::TOP;j++){const int p=ref.i0[(size_t)r*ga::TOP+j];if(p<0||p==NANKEY)continue;const int k=at[p];if(k<0){scbad++;continue;}
++                    for(int h=0;h<H;h++){const size_t o=((size_t)r*H+h)*ga::TOP;sccmp++;
++                        scbad+=memcmp(&ref.sc[l][o+j],&s.sc[l][o+k],4)!=0;
++                        if(l==1)pmax=std::max(pmax,(double)fabsf(ref.pr[o+j]-s.pr[o+k]));}}}
++            const size_t kvbad=vdiff(ref.kv,s.kv)+vdiff(ref.ix,s.ix);
++            const bool same=!setbad&&!scbad&&!kvbad&&(x.pos||(!vdiff(ref.i0,s.i0)&&!vdiff(ref.sc[0],s.sc[0])&&!vdiff(ref.sc[1],s.sc[1])&&!vdiff(ref.pr,s.pr)));
++            printf("E1 %s T=%d L=%d M=%d x%d | DET bytes differing across calls %zu, err/valid %s (err %u/%u) | SAME set rows differing %zu, "
++                   "scores by key %zu of %zu differ, kv+index cache %zu%s | %s\n",tag.c_str(),T,L,M,CHK,det,ok?"ok":"BAD",s.e0,s.e1,setbad,scbad,sccmp,kvbad,
++                   x.pos?"":" (SP: indices, scores, probs byte-compared too)",!det&&ok&&same?"DETERMINISTIC, SAME":"FAIL");
++            printf("E1 %s ERR vs stock | out full: %s\n",tag.c_str(),err_str(err_of(s.o0,ref.o0)).c_str());
++            printf("E1 %s ERR vs stock | out shared: %s\n",tag.c_str(),err_str(err_of(s.o1,ref.o1)).c_str());
++            printf("E1 %s ERR vs stock | context shared: %s\n",tag.c_str(),err_str(err_of(s.cx,ref.cx)).c_str());
++            if(x.pos)printf("E1 %s ERR vs stock | probs shared by key: max abs %.3e\n",tag.c_str(),pmax);
++            if(NANKEY>=0)printf("E1 %s NANKEY %d: stock dropped it (err %u); the arm lists it in %zu rows (of %zu that see it), err %u%s\n",tag.c_str(),NANKEY,ref.e0,
++                nan_kept,nan_rows,s.e0,x.pos?" (POS: expected, no indexer score)":"");
++            if(det||!ok||!same){bad++;continue;}
++        }else{
+         // EXACT (against stock)
+         size_t w[14]={0};bool ok=true;
+         for(int it=0;it<CHK;it++){Snap s;take(s);
+             size_t d[14]={vdiff(ref.o0,s.o0),vdiff(ref.o1,s.o1),vdiff(ref.i0,s.i0),vdiff(ref.pr,s.pr),vdiff(ref.pa,s.pa),vdiff(ref.cx,s.cx),
+                 vdiff(ref.kv,s.kv)+vdiff(ref.ix,s.ix),vdiff(ref.sc[0],s.sc[0]),vdiff(ref.sc[1],s.sc[1]),
+                 vdiff(ref.pl[0],s.pl[0]),vdiff(ref.pl[1],s.pl[1]),vdiff(ref.si,s.si),vdiff(ref.ii,s.ii),0};
+-            for(int q=0;q<13;q++)w[q]=std::max(w[q],d[q]);ok&=!s.e0&&!s.e1&&s.v0&&s.v1;}
++            for(int q=0;q<13;q++)w[q]=std::max(w[q],d[q]);ok&=s.e0==ref.e0&&!s.e1&&s.v0&&s.v1;}
+         bool exact=ok;for(int q=0;q<13;q++)exact&=!w[q];
+         printf("EXACT %s T=%d L=%d M=%d x%d | bytes differing vs stock: index scores %zu ids %zu, indices %zu, scores full %zu shared %zu, "
+                "parts full %zu shared %zu, probs %zu, parts(call) %zu, context %zu, out full %zu shared %zu, kv+index cache %zu | err/valid %s | %s\n",
+                tag.c_str(),T,L,M,CHK,w[11],w[12],w[2],w[7],w[8],w[9],w[10],w[3],w[4],w[5],w[0],w[1],w[6],ok?"ok":"BAD",exact?"IDENTICAL":"DIFFER");
+         if(!exact){bad++;continue;}
++        }
+         // NODE: per layer, the nodes that differ from the timing reference: prefix deltas, reference vs arm
+         for(int l=0;l<2;l++){
+             std::vector<Node> nn[2];cudaGraph_t gg[2];
+diff --git a/engine/attn/tests/attnk_r10a.sh b/engine/attn/tests/attnk_r10a.sh
+new file mode 100755
+index 0000000..14d5fc2
+--- /dev/null
++++ b/engine/attn/tests/attnk_r10a.sh
+@@ -0,0 +1,28 @@
++#!/bin/bash
++# attnk_r10a.sh [attnk] [log]: the round 10 E1 attention arms (G6_ATTN_CTX3_SP, G6_ATTN_POSIDX) on one GB10, against the
++# served attention flags (BASE). Per cell: determinism, what must stay the same, the error vs stock, and the hot / cold
++# timing vs BASE (attnk.cu, "Round 10"). Nothing else on the GPU; clocks as served. About 15-25 minutes.
++B=${1:-./attnk}
++LOG=${2:-attnk_r10a.log}
++export ATTNK_BASE="SC2=4,TR=2,CTX2=4,CTX3=2,SEL2=16,IDX=16,QT=1,FRONT=1"   # the served attention flags (recipe env)
++export ATTNK_E1=1                                                           # arms: base SP=64 SP=128 POS=1 POS=1,FRONT=0 SP=64,POS=1
++run() { echo "=== $*" ; "$@"; echo "=== exit $?"; }
++{
++  run "$B" 2048 1000 3 3                            # with the per-kernel CHAIN table of BASE
++  for M in 1 3 8; do
++    run "$B" 2048 1000 $M 2
++    run "$B" 2048 2048 $M 2                         # the 2048 bucket full: the last row at position 2047
++    run "$B" 8192 8000 $M 2                         # POS inert past 2048 (byte-identical), SP active
++    run "$B" 32768 32000 $M 2
++  done
++  run "$B" 4096 2049 3 2                            # boundary: 2049 keys take the 4096 bucket (indexer, top-2048 of 2049)
++  run "$B" 2048 1000 12 2                           # c4-sized step
++  run env ATTNK_SESS=2 "$B" 2048 1000 3 2               # two sessions in the step: per-row tables and positions
++  run env ATTNK_SESS=2 "$B" 2048 2000 8 2
++  run env ATTNK_TIES=1 "$B" 2048 1000 3 2               # exact indexer ties (stock's id tie-break vs position order)
++  run env ATTNK_QSCALE=400 "$B" 2048 1000 3 2           # most probabilities exactly 0: context_pk3's mixed / skipped batches
++  run env ATTNK_NANKEY=500 ATTNK_ARMS="POS=1" "$B" 2048 1000 3 2   # one NaN index key: stock drops it (err 4), POS keeps it
++} 2>&1 | tee "$LOG"
++echo "--- summary ($LOG)"
++grep -E "^(E1|TIME|EXACT|=== exit)" "$LOG" | grep -E "FAIL|DIFFER|BAD|exit [^0]" && echo "SOME CHECK FAILED (above)" || echo "all checks passed"
++grep -E "^TIME" "$LOG"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # make-patches.sh GR8_CLONE [REF]: regenerate patches/ from a gr8 clone whose REF (default HEAD) sits on the pinned
-# upstream commit. This is how patches/0001..0026 were made; the series is plain `git format-patch` output:
+# upstream commit. This is how patches/ was made; the series is plain `git format-patch` output:
 #
 #   git format-patch --no-signature --zero-commit -o patches <GR8_COMMIT>..<REF>
 #
@@ -9,7 +9,7 @@
 # After regenerating, scripts/apply.sh checks that the series rebuilds the expected source tree (EXPECTED_TREE there).
 set -euo pipefail
 
-GR8_COMMIT=6448a16661abd81e9540bc073b3cfa92d7234565   # kindlingai/gr8 main, "S2: size the notice target ... (#66)"
+GR8_COMMIT=c53b5b869818950a96a9b72c647d4b156b057127   # kindlingai/gr8 main, 2026-10-18, "EL6 (#154): fabric pool at boot ... (#95)"
 
 src=${1:?usage: make-patches.sh GR8_CLONE [REF]}
 ref=${2:-HEAD}

@@ -1,0 +1,1138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Mon, 19 Oct 2026 02:53:14 +0200
+Subject: [PATCH 30/30] MTP draft head in two stages: G6_DRAFT_HEAD2=1|2
+ (default off, experimental)
+
+kernels/head2.cuh: a 2-bit g32 screen of the rank's vocab slice (74.5 MB at TP4 instead of 134 MB INT4 / 246 MB
+MXFP8, made at boot from the MXFP8 head records), the 64 best screen rows per row (deterministic histogram cut,
+index order in the cut bin), their exact MXFP8 logits read out of the target's tile records, and the head record
+over the 64 (log-sum-exp over the whole row, screen logits outside them); the head merge is unchanged.
+Draft steps of up to 8 rows (first form, chain); wider steps keep the head GEMV. The DFlash2 head is not changed.
+G6_DRAFT_HEAD2=2 also runs the MXFP8 GEMV and counts rows whose MXFP8 argmax is not a candidate (measurement).
+Drafts only; in the S2 runtime signature.
+
+runtime/tests/dhead2_test.cu (one GB10, synthetic records): conversion vs host, screen vs fp64, candidate rule vs
+host, rescoring vs fp64 and the MXFP8 GEMV, head records vs k_head_local; --time: MXFP8 / INT4 / two-stage at M 1, 3, 8.
+---
+ docs/SETTINGS.md                    |   1 +
+ engine/kernels/head2.cuh            | 448 +++++++++++++++++++++++++++
+ engine/runtime/g6m4.cu              |   7 +-
+ engine/runtime/m4sim.cu             |   4 +
+ engine/runtime/rank.cuh             |  69 +++++
+ engine/runtime/tests/dhead2_test.cu | 463 ++++++++++++++++++++++++++++
+ 6 files changed, 991 insertions(+), 1 deletion(-)
+ create mode 100644 engine/kernels/head2.cuh
+ create mode 100644 engine/runtime/tests/dhead2_test.cu
+
+diff --git a/docs/SETTINGS.md b/docs/SETTINGS.md
+index eaf63c2..9e70d07 100644
+--- a/docs/SETTINGS.md
++++ b/docs/SETTINGS.md
+@@ -102,6 +102,7 @@ the short version.
+ | `G6_IDXQ_SPLIT` | 1 when TP>1 (else 0) | decode: the indexer's wq_b (idx_q, 4096 outputs, replicated) split by output tiles the same way on the same fabric, on the indexer layers: each rank's tiles are published, q_b runs while the gather is on the wire, then the gather. Same bits as 0. Independent of `G6_QA_SPLIT` |
+ | `G6_MTP_SPLIT` | 1 when TP>1 + --mtp (else 0) | MTP draft steps (needs `--mtp`): eh_proj (6144 outputs, 78 MB replicated), then layer 78's q_a / kv_a / indexer k and weights (as `G6_QA_SPLIT=1`) and idx_q (as `G6_IDXQ_SPLIT=1`), split by output tiles and gathered on a draft gather fabric (port + 72). Same bits as 0 |
+ | `G6_DRAFT_HEAD_I4` | 0 | MTP draft steps (needs `--mtp`): the draft's lm_head GEMV reads INT4 g32 records of the rank's vocab slice, made at boot on the GPU from its MXFP8 records (134 MB more per rank at TP4), instead of the MXFP8 records: 45% fewer head bytes per draft step. The target's head and the verify steps are unchanged, so the committed tokens are the target's; drafts (and their log-probabilities, which `--spec-adaptive` reads) can differ from the MXFP8 head's. Same on every rank. `G6_DRAFT_HEAD_KS` (32, 2..32) / `G6_DRAFT_HEAD_TPC` (1) = the GEMV's k parts per tile and tiles per CTA; every rank must set the same values |
++| `G6_DRAFT_HEAD2` | 0 | MTP draft steps (needs `--mtp`), experimental: the draft's head in two stages (`kernels/head2.cuh`): a 2-bit g32 screen of the rank's vocab slice (74.5 MB at TP4, made at boot from the MXFP8 head records; +74.5 MB per rank), the exact MXFP8 logits of the screen's best 64 rows (read out of the target's records), and the head record over those 64 (log-sum-exp over the whole row, screen logits outside them). A draft is the MXFP8 head's argmax whenever that token is among its slice's best 64 by the screen (no miss on 24k recorded draft-head inputs offline). Draft steps of more than 8 rows keep the head GEMV (INT4 with `G6_DRAFT_HEAD_I4`, else MXFP8); the DFlash2 head is not changed. 2 = also the MXFP8 GEMV per draft step and a count of the rows whose MXFP8 argmax was not a candidate (a line every 4096 rows; measurement only). Drafts only: the target's head and the verify steps are unchanged. Every rank must set the same value |
+ | `G6_MTP_LASTROW` | 0 | MTP draft steps (needs `--mtp`): a first-form draft step routes only each session's last row through the MTP layer's routed experts (the step's last row on the solo path, every session's last row on the S2 path; a chain step routes all its rows). The rows before it are in the step only to write layer 78's caches, which the attention block writes from the layer input, before the experts; no reader takes their outputs. Their experts are skipped (the router plan gives them no slot; the shared expert still runs). Same caches, drafts and log-probabilities as without it (`kernels/tests/mtp_lastrow_test.cu`, `scripts/mtp_lastrow_check.sh`); a first form of a + 1 rows reads one row's routed experts instead of a + 1 rows'. Every rank must set the same value |
+ | `G6_DFL_HEAD_I4` | 0 | DFlash2 drafter (needs `--dflash-manifest`): its lm_head GEMV reads the same INT4 g32 records as `G6_DRAFT_HEAD_I4` (the MTP draft's copy when that is on, else one made the same way; same `G6_DRAFT_HEAD_KS` / `_TPC`). In selector mode the head's raw logits choose each row's top-16 candidates and enter their walk scores, so INT4 can change both. The target's head and the verify steps are unchanged. Every rank must set the same value |
+ | `G6_DFL_BODY_I4` | 0 | DFlash2 drafter (needs `--dflash-manifest`): its body GEMVs (fc, and per layer kv, aconv, q, o, mconv, gu, down) read INT4 g32 copies of their MXFP8 records, made at boot on the GPU by the `G6_DRAFT_HEAD_I4` arithmetic, with the same splits: 382 MB instead of 701 MB per draft step's reads (the pack image keeps the MXFP8 records: +382 MB per rank). The selector's hproj and the head (`G6_DFL_HEAD_I4`) are not touched. Drafts only: the target and the verify steps are unchanged; drafts and their log-probabilities can differ (`engine/runtime/dflreplay.cu` compares both drafters on a `G6_DFL_DUMP`). The drafter choice's drafting cost (`G6_SPEC_DRAFT`) is not changed with it. Every rank must set the same value |
+diff --git a/engine/kernels/head2.cuh b/engine/kernels/head2.cuh
+new file mode 100644
+index 0000000..971ee14
+--- /dev/null
++++ b/engine/kernels/head2.cuh
+@@ -0,0 +1,448 @@
++// G6_DRAFT_HEAD2 (two-stage draft head): a 2-bit screen over the rank's vocab slice, then the exact MXFP8
++// logits of the screen's best SL rows. Drafts only: the target's head is not touched.
++//
++//   1. k_screen     y[m][v] ~ x[m] . w[v] from 2-bit g32 records of the slice (made at boot from the MXFP8 head records,
++//                   k_mx_to_i2): 1536 code bytes + 384 scale bytes per vocab row (6144 inputs), 74.5 MB per TP4 slice
++//                   instead of 134 MB (INT4 g32, G6_DRAFT_HEAD_I4) or 246 MB (MXFP8)
++//   2. k_screen_top per row, the SL best screen logits (ties and the last histogram bin in index order: deterministic)
++//   3. k_rescore    per row and candidate, the MXFP8 logit of that vocab row (its E4M3 codes and E8M0 scales read out of
++//                   the 16-row tile records the target's head reads), written over the screen logit in y and into the
++//                   candidate list
++//   4. k_head_local_sl (glue k_head_local over the candidates): the record's best sample score among the candidates,
++//                   its log-sum-exp over the whole row (exact at the candidates, screen elsewhere). The head merge is
++//                   unchanged, so every rank merges the same bytes.
++// The draft of a row is the MXFP8 head's argmax whenever that token is among its slice's SL screen best (offline, 24k
++// recorded draft-head inputs: never missed at SL >= 32 in an offline replay). Its log-probability's
++// log-sum-exp takes the screen logits outside the candidates (|error| p99 0.07 nats offline; INT4's own is 0.31).
++//
++// 2-bit record of a vocab row: 96 chunks of 64 inputs (k = 64 c .. 64 c + 63 = groups 2c and 2c+1 of 32), one uint4
++// each, chunk-major [vn][96]; word q of a chunk holds k = 64 c + 16 q .. + 15: bits 2i = element 2i, bits 16 + 2i =
++// element 2i + 1 (i = 0..7), so ((word << 1 >> 2i) & 0x00060006) | 0x64006400 is the fp16 pair (1024 + 2 q_2i, 1024 + 2 q_2i+1)
++// and minus 1027 the exact odd integers 2q - 3 = 2 (q - 1.5).
++// Scales [vn][96] half2 (groups 2c, 2c + 1). Value = (q - 1.5) s, per (row, group of 32) from the MXFP8 values v:
++//   s = fp16(amax |v| / 1.5) (round to nearest even), q = clamp(floor(v / s + 2), 0, 3) (q = 2 where s == 0)
++// Every thread writes only its own (row, chunk): the conversion is deterministic.
++#pragma once
++#include <cstdint>
++#include <cuda_fp16.h>
++#include "glue.cuh"
++#include "head_i4.cuh"
++
++namespace head2
++{
++constexpr int K = HID, NG = HID / 32, NCH = HID / 64;   // inputs, groups of 32, chunks of 64
++constexpr int SL = 64;                                   // candidates per row (the rescored best of the screen)
++constexpr int MXM = 8;                                   // rows per call at most (k_screen keeps x of every row in smem)
++constexpr int BINS = 2048;                               // k_screen_top: histogram of (max - logit) over RANGE logit units
++constexpr float RANGE = 32.f;
++static_assert(K % 2048 == 0, "k_screen: three 2048-input sweeps of 32 lanes x 64");
++
++inline size_t code_bytes(int vn) { return (size_t)vn * NCH * 16; }
++inline size_t scale_bytes(int vn) { return (size_t)vn * NG * 2; }
++inline size_t bytes(int vn) { return code_bytes(vn) + scale_bytes(vn); }
++
++// ------------------------------------------------------------------------------------------- boot conversion
++// mx [vn/16][NG][528] -> codes [vn][NCH] uint4, scales [vn][NCH] half2; one thread per (row, chunk); grid ceil(vn*NCH/256)
++__global__ void __launch_bounds__(256) k_mx_to_i2(const uint8_t* __restrict__ mx, uint4* __restrict__ codes, __half2* __restrict__ scales, int vn)
++{
++    const long long id = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    if (id >= (long long)vn * NCH) return;
++    const int row = (int)(id / NCH), c = (int)(id % NCH);
++    const int tile = row >> 4, r = row & 7, hi = (row >> 3) & 1;
++    uint32_t w[4] = {0u, 0u, 0u, 0u};
++    __half s16[2];
++    #pragma unroll
++    for (int gg = 0; gg < 2; ++gg)
++    {
++        const int g = 2 * c + gg;
++        const uint8_t* src = mx + ((size_t)tile * NG + g) * head_i4::MXGR;
++        const float sc = head_i4::e8m0_val(src[512 + 2 * r + hi]);
++        float v[32];
++        float amax = 0.f;
++        #pragma unroll
++        for (int kk = 0; kk < 32; ++kk)
++        {
++            const int h = kk >> 4, k = kk & 15, cc = (k & 7) >> 1;
++            v[kk] = head_i4::e4m3_val(src[h * 256 + (r * 4 + cc) * 8 + (k >> 3) * 4 + hi * 2 + (k & 1)]) * sc;
++            amax = fmaxf(amax, fabsf(v[kk]));
++        }
++        s16[gg] = __float2half_rn(__fdiv_rn(amax, 1.5f));
++        const float s = __half2float(s16[gg]);
++        #pragma unroll
++        for (int kk = 0; kk < 32; ++kk)
++        {
++            const uint32_t q = s != 0.f ? (uint32_t)min(max(__float2int_rd(__fadd_rn(__fdiv_rn(v[kk], s), 2.f)), 0), 3) : 2u;
++            const int e = gg * 32 + kk, word = e >> 4, i = e & 15;      // element i of word: bits 2 (i / 2) + 16 (i % 2)
++            w[word] |= q << (2 * (i >> 1) + 16 * (i & 1));
++        }
++    }
++    codes[id] = make_uint4(w[0], w[1], w[2], w[3]);
++    scales[id] = __halves2half2(s16[0], s16[1]);
++}
++inline void convert(const uint8_t* mx, uint4* codes, __half2* scales, int vn, cudaStream_t st)
++{
++    const long long n = (long long)vn * NCH;
++    k_mx_to_i2<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(mx, codes, scales, vn);
++}
++
++// ------------------------------------------------------------------------------------------- 1. screen GEMV
++// grid persistent (screen_grid), block 256 = 8 warps, dynamic smem M x K fp16 (x rows, 16-byte units swizzled: unit u of
++// a row at u ^ ((u >> 3) & 7), so the 32 lanes' reads of their chunks hit distinct units). A warp takes one vocab row at a
++// time; lane l takes chunks l, l + 32, l + 64. Per group of 32: 16 HFMA2 of (2q - 3) x into an fp16 pair from zero, then
++// y += (s / 2) * (lo + hi) in fp32; lane sums in chunk order, then an xor tree: the bits do not depend on the grid.
++__device__ __forceinline__ int swz(int u) { return u ^ ((u >> 3) & 7); }
++template <int M>
++__global__ void __launch_bounds__(256) k_screen(const uint4* __restrict__ codes, const __half2* __restrict__ scales, const __half* __restrict__ x,
++                                                int ldx, float* __restrict__ y, int ldy, int vn)
++{
++    extern __shared__ uint4 xs4[];
++    const int t = threadIdx.x, w = t >> 5, l = t & 31;
++    for (int i = t; i < M * (K / 8); i += 256)
++    {
++        const int m = i / (K / 8), u = i % (K / 8);
++        xs4[m * (K / 8) + swz(u)] = *reinterpret_cast<const uint4*>(x + (size_t)m * ldx + 8 * u);
++    }
++    __syncthreads();
++    const __half2 off = __float2half2_rn(1027.f);
++    for (int v = blockIdx.x * 8 + w; v < vn; v += gridDim.x * 8)
++    {
++        uint4 cw[3];
++        __half2 sc[3];
++        #pragma unroll
++        for (int j = 0; j < 3; ++j)
++        {
++            cw[j] = __ldcs(codes + (size_t)v * NCH + 32 * j + l);         // streamed once per pass
++            sc[j] = __ldcs(scales + (size_t)v * NCH + 32 * j + l);
++        }
++        float acc[M];
++        #pragma unroll
++        for (int m = 0; m < M; ++m) acc[m] = 0.f;
++        #pragma unroll
++        for (int j = 0; j < 3; ++j)
++        {
++            const int c = 32 * j + l;
++            const uint32_t wd[4] = {cw[j].x, cw[j].y, cw[j].z, cw[j].w};
++            #pragma unroll
++            for (int gg = 0; gg < 2; ++gg)
++            {
++                __half2 p[M];
++                #pragma unroll
++                for (int m = 0; m < M; ++m) p[m] = __float2half2_rn(0.f);
++                #pragma unroll
++                for (int q = 2 * gg; q < 2 * gg + 2; ++q)
++                {
++                    #pragma unroll
++                    for (int h8 = 0; h8 < 2; ++h8)                         // 8 elements = one 16-byte unit of x
++                    {
++                        const int u = 8 * c + 2 * q + h8;
++                        __half2 wv[4];
++                        #pragma unroll
++                        for (int i = 0; i < 4; ++i)
++                        {
++                            const int sh = 2 * (4 * h8 + i);              // pair (element sh / 2 * 2, + 1): codes at bits sh, 16 + sh
++                            const uint32_t b = ((sh ? wd[q] >> (sh - 1) : wd[q] << 1) & 0x00060006u) | 0x64006400u;
++                            wv[i] = __hsub2(*reinterpret_cast<const __half2*>(&b), off);
++                        }
++                        #pragma unroll
++                        for (int m = 0; m < M; ++m)
++                        {
++                            const uint4 xv = xs4[m * (K / 8) + swz(u)];
++                            const uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
++                            #pragma unroll
++                            for (int i = 0; i < 4; ++i) p[m] = __hfma2(wv[i], *reinterpret_cast<const __half2*>(&xw[i]), p[m]);
++                        }
++                    }
++                }
++                const float s = 0.5f * (gg ? __high2float(sc[j]) : __low2float(sc[j]));
++                #pragma unroll
++                for (int m = 0; m < M; ++m)
++                {
++                    const float2 f = __half22float2(p[m]);
++                    acc[m] = fmaf(s, f.x + f.y, acc[m]);
++                }
++            }
++        }
++        #pragma unroll
++        for (int m = 0; m < M; ++m)
++        {
++            #pragma unroll
++            for (int o = 16; o > 0; o >>= 1) acc[m] += __shfl_xor_sync(0xffffffffu, acc[m], o);
++            if (l == 0) y[(size_t)m * ldy + v] = acc[m];
++        }
++    }
++}
++inline size_t screen_smem(int M) { return (size_t)M * K * 2; }
++// one wave: the SMs x the CTAs of M rows' smem that fit on one (init); rows go to warps by a fixed stride
++inline int& screen_grid(int M) { static int g[MXM + 1] = {}; return g[M]; }
++template <int M> inline const char* screen_attr()
++{
++    if (cudaFuncSetAttribute(k_screen<M>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)screen_smem(M)) != cudaSuccess)
++        return "head2: cannot raise k_screen's shared memory";
++    int dev = 0, sms = 0, per = 0;
++    if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
++        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, k_screen<M>, 256, screen_smem(M)) != cudaSuccess || per < 1)
++        return "head2: k_screen does not fit on an SM";
++    screen_grid(M) = sms * per;
++    return nullptr;
++}
++// once before any launch (and outside any capture): the shared memory limits of every instantiation
++inline const char* init()
++{
++    const char* e = nullptr;
++    if (!e) e = screen_attr<1>();
++    if (!e) e = screen_attr<2>();
++    if (!e) e = screen_attr<3>();
++    if (!e) e = screen_attr<4>();
++    if (!e) e = screen_attr<5>();
++    if (!e) e = screen_attr<6>();
++    if (!e) e = screen_attr<7>();
++    if (!e) e = screen_attr<8>();
++    return e;
++}
++inline void launch_screen(const uint4* codes, const __half2* scales, const __half* x, int ldx, float* y, int ldy, int vn, int M, cudaStream_t st)
++{
++    const dim3 g(screen_grid(M < MXM ? M : MXM)), b(256);
++    const size_t sm = screen_smem(M);
++    switch (M)
++    {
++    case 1: k_screen<1><<<g, b, sm, st>>>(codes, scales, x, ldx, y, ldy, vn); break;
++    case 2: k_screen<2><<<g, b, sm, st>>>(codes, scales, x, ldx, y, ldy, vn); break;
++    case 3: k_screen<3><<<g, b, sm, st>>>(codes, scales, x, ldx, y, ldy, vn); break;
++    case 4: k_screen<4><<<g, b, sm, st>>>(codes, scales, x, ldx, y, ldy, vn); break;
++    case 5: k_screen<5><<<g, b, sm, st>>>(codes, scales, x, ldx, y, ldy, vn); break;
++    case 6: k_screen<6><<<g, b, sm, st>>>(codes, scales, x, ldx, y, ldy, vn); break;
++    case 7: k_screen<7><<<g, b, sm, st>>>(codes, scales, x, ldx, y, ldy, vn); break;
++    default: k_screen<8><<<g, b, sm, st>>>(codes, scales, x, ldx, y, ldy, vn); break;
++    }
++}
++
++// ------------------------------------------------------------------------------------------- 2. the screen's best SL
++// grid M, block 1024. Thread t owns the contiguous indices [t * per, (t + 1) * per). The SL best: every index whose
++// bin of (max - y) is below the cut bin, then the cut bin's indices in ascending order until SL (bin = BINS - 1 takes
++// everything past RANGE). cand[m][0..SL) = local indices (ascending within the two classes: deterministic).
++__global__ void __launch_bounds__(1024) k_screen_top(const float* __restrict__ y, int ldy, int vn, int* __restrict__ cand)
++{
++    __shared__ unsigned hist[BINS];
++    __shared__ float s_mx[32];
++    __shared__ int s_cut, s_lt;
++    __shared__ int s_n[2][1024];
++    const int m = blockIdx.x, t = threadIdx.x, w = t >> 5, l = t & 31;
++    const float* row = y + (size_t)m * ldy;
++    const int per = (vn + 1023) / 1024, i0 = min(t * per, vn), i1 = min(i0 + per, vn);
++    float mx = -INFINITY;
++    for (int i = i0; i < i1; ++i) mx = fmaxf(mx, row[i]);
++    #pragma unroll
++    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
++    if (l == 0) s_mx[w] = mx;
++    for (int i = t; i < BINS; i += 1024) hist[i] = 0u;
++    __syncthreads();
++    mx = s_mx[0];
++    for (int i = 1; i < 32; ++i) mx = fmaxf(mx, s_mx[i]);
++    auto bin = [&](float v) { const float b = (mx - v) * (BINS / RANGE); return b < (float)(BINS - 1) ? (int)b : BINS - 1; };
++    for (int i = i0; i < i1; ++i) atomicAdd(&hist[bin(row[i])], 1u);
++    __syncthreads();
++    if (w == 0)                          // cut = the first bin where the count of bins 0..cut reaches SL
++    {
++        constexpr int PER = BINS / 32;
++        unsigned c = 0;
++        for (int i = 0; i < PER; ++i) c += hist[l * PER + i];
++        unsigned inc = c;
++        #pragma unroll
++        for (int o = 1; o < 32; o <<= 1) { const unsigned z = __shfl_up_sync(0xffffffffu, inc, o); if (l >= o) inc += z; }
++        const unsigned over = __ballot_sync(0xffffffffu, inc >= (unsigned)SL);
++        const int L = over ? __ffs(over) - 1 : 31;
++        if (l == L)
++        {
++            unsigned cum = inc - c;
++            int cut = L * PER + PER - 1;
++            for (int i = 0; i < PER; ++i)
++            {
++                if (cum + hist[L * PER + i] >= (unsigned)SL) { cut = L * PER + i; break; }
++                cum += hist[L * PER + i];
++            }
++            s_cut = cut;
++            s_lt = (int)cum;                 // indices in bins below the cut (< SL)
++        }
++    }
++    __syncthreads();
++    const int cut = s_cut, lt = s_lt;
++    int nlt = 0, neq = 0;
++    for (int i = i0; i < i1; ++i) { const int b = bin(row[i]); nlt += b < cut; neq += b == cut; }
++    s_n[0][t] = nlt; s_n[1][t] = neq;
++    __syncthreads();
++    for (int o = 1; o < 1024; o <<= 1)       // inclusive scans of both counts in thread (= index) order
++    {
++        const int a = t >= o ? s_n[0][t - o] : 0, b = t >= o ? s_n[1][t - o] : 0;
++        __syncthreads();
++        s_n[0][t] += a; s_n[1][t] += b;
++        __syncthreads();
++    }
++    int plt = s_n[0][t] - nlt, peq = lt + s_n[1][t] - neq;
++    int* out = cand + (size_t)m * SL;
++    for (int i = i0; i < i1; ++i)
++    {
++        const int b = bin(row[i]);
++        if (b < cut) out[plt++] = i;
++        else if (b == cut && peq < SL) out[peq++] = i;
++    }
++}
++
++// ------------------------------------------------------------------------------------------- 3. exact rescoring
++// grid (M, SL / 8), block 256: warp = one candidate of row m. Lane l takes groups l, l + 32, .. (6 of 192): per group,
++// the row's 32 E4M3 codes (8 x 8 bytes of the tile record, 4 of the row's codes in each) x x[m] in fp32 in k order,
++// times the group's E8M0 scale; lanes in group order, then an xor tree. The logit goes over the screen's in y and into
++// cl[m][j].
++__global__ void __launch_bounds__(256) k_rescore(const uint8_t* __restrict__ mx, const __half* __restrict__ x, int ldx, const int* __restrict__ cand,
++                                                 float* __restrict__ y, int ldy, float* __restrict__ cl)
++{
++    const int m = blockIdx.x, j = blockIdx.y * 8 + (threadIdx.x >> 5), l = threadIdx.x & 31;
++    const int v = cand[(size_t)m * SL + j];
++    const int tile = v >> 4, r = v & 7, hi = (v >> 3) & 1;
++    const __half* xr = x + (size_t)m * ldx;
++    float acc = 0.f;
++    for (int g = l; g < NG; g += 32)
++    {
++        const uint8_t* src = mx + ((size_t)tile * NG + g) * head_i4::MXGR;
++        const float sc = head_i4::e8m0_val(src[512 + 2 * r + hi]);
++        float d = 0.f;
++        #pragma unroll
++        for (int h = 0; h < 2; ++h)
++            #pragma unroll
++            for (int c = 0; c < 4; ++c)
++            {
++                const uint2 b = *reinterpret_cast<const uint2*>(src + h * 256 + (r * 4 + c) * 8);
++                const uint32_t lo = hi ? b.x >> 16 : b.x, up = hi ? b.y >> 16 : b.y;   // (k 2c, 2c+1) and (2c+8, 2c+9) of half h
++                const int k0 = 32 * g + 16 * h + 2 * c;
++                const __half2 x01 = *reinterpret_cast<const __half2*>(xr + k0), x89 = *reinterpret_cast<const __half2*>(xr + k0 + 8);
++                d = fmaf(head_i4::e4m3_val(lo & 0xffu), __low2float(x01), d);
++                d = fmaf(head_i4::e4m3_val((lo >> 8) & 0xffu), __high2float(x01), d);
++                d = fmaf(head_i4::e4m3_val(up & 0xffu), __low2float(x89), d);
++                d = fmaf(head_i4::e4m3_val((up >> 8) & 0xffu), __high2float(x89), d);
++            }
++        acc = fmaf(sc, d, acc);
++    }
++    #pragma unroll
++    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
++    if (l == 0)
++    {
++        y[(size_t)m * ldy + v] = acc;
++        cl[(size_t)m * SL + j] = acc;
++    }
++}
++
++// ------------------------------------------------------------------------------------------- 4. the head record
++// glue::k_head_local with the best score taken over the row's SL candidates (exact logits), the log-sum-exp (and the
++// top_p / top-k parts, the target id) over the whole row as k_head_local reads it. grid M, block 1024.
++__global__ void __launch_bounds__(1024) k_head_local_sl(glue::HeadArgs a, const int* __restrict__ cand, const float* __restrict__ cl)
++{
++    using namespace glue;
++    __shared__ float s_sc[32], s_lg[32], s_mx[32], s_sm[32];
++    __shared__ int s_id[32];
++    const int m = blockIdx.x, t = threadIdx.x, w = t >> 5, l = t & 31;
++    const SampleRow sr = a.rows[m];
++    const float* row = a.logits + (size_t)m * a.ldl;
++    float bs = -INFINITY, blg = 0.f, mx = -INFINITY, sm = 0.f;
++    int bid = 0x7fffffff;
++    if (t < SL)
++    {
++        const float lg = cl[(size_t)m * SL + t];
++        const int v = a.vlo + cand[(size_t)m * SL + t];
++        bs = sample_score(sr, lg, v); bid = v; blg = lg;
++    }
++    for (int i = t; i < a.vn; i += 1024)
++    {
++        const float lg = row[i];
++        if (lg > mx) { sm = sm * expf(mx - lg) + 1.f; mx = lg; }
++        else sm += expf(lg - mx);
++    }
++    #pragma unroll
++    for (int o = 16; o > 0; o >>= 1)
++    {
++        const float os = __shfl_xor_sync(0xffffffffu, bs, o), ol = __shfl_xor_sync(0xffffffffu, blg, o);
++        const int oi = __shfl_xor_sync(0xffffffffu, bid, o);
++        if (os > bs || (os == bs && oi < bid)) { bs = os; bid = oi; blg = ol; }
++        const float omx = __shfl_xor_sync(0xffffffffu, mx, o), osm = __shfl_xor_sync(0xffffffffu, sm, o);
++        const float nmx = fmaxf(mx, omx);
++        sm = (mx == -INFINITY ? 0.f : sm * expf(mx - nmx)) + (omx == -INFINITY ? 0.f : osm * expf(omx - nmx));
++        mx = nmx;
++    }
++    if (l == 0) { s_sc[w] = bs; s_id[w] = bid; s_lg[w] = blg; s_mx[w] = mx; s_sm[w] = sm; }
++    __syncthreads();
++    if (t == 0)
++    {
++        HeadRec r;
++        r.score = s_sc[0]; r.id = s_id[0]; r.logit = s_lg[0]; r.lmax = s_mx[0]; r.lsum = s_sm[0];
++        for (int i = 1; i < 32; ++i)
++        {
++            if (s_sc[i] > r.score || (s_sc[i] == r.score && s_id[i] < r.id)) { r.score = s_sc[i]; r.id = s_id[i]; r.logit = s_lg[i]; }
++            const float nmx = fmaxf(r.lmax, s_mx[i]);
++            r.lsum = (r.lmax == -INFINITY ? 0.f : r.lsum * expf(r.lmax - nmx)) +
++                     (s_mx[i] == -INFINITY ? 0.f : s_sm[i] * expf(s_mx[i] - nmx));
++            r.lmax = nmx;
++        }
++        r.pad_[0] = r.pad_[1] = r.pad_[2] = 0.f;
++        if (a.tgt)
++        {
++            const int i = a.tgt[m] - a.vlo;
++            r.pad_[0] = i >= 0 && i < a.vn ? row[i] : -INFINITY;
++        }
++        reinterpret_cast<HeadRec*>(send_slot(a.f, *a.stepp, a.c))[m] = r;
++    }
++    if (a.nc > 0 && topp_on(sr)) head_local_topp(a, m, row, sr, s_mx);
++    if (a.tk && sr.topk > 0) head_local_topk(a, m, row);
++    const u64 step = *a.stepp;
++    publish(a.f, a.c, g6::coll_seq(step, a.c, a.f.ncoll), a.ticket);
++}
++
++// G6_DRAFT_HEAD2=2 (measurement): per row, whether the MXFP8 head's argmax of the slice (ref, the target's GEMV on the
++// same rows) is among the row's candidates. cnt[0] rows, cnt[1] misses; every 4096 rows rank prints a line (device
++// printf, flushed at the host's next synchronization). grid M, block 256
++__global__ void __launch_bounds__(256) k_check(const float* __restrict__ ref, int ldr, int vn, const int* __restrict__ cand, unsigned* cnt, int rank)
++{
++    __shared__ float s_v[8];
++    __shared__ int s_i[8];
++    const int m = blockIdx.x, t = threadIdx.x, w = t >> 5, l = t & 31;
++    float bv = -INFINITY;
++    int bi = 0x7fffffff;
++    for (int i = t; i < vn; i += 256)
++    {
++        const float v = ref[(size_t)m * ldr + i];
++        if (v > bv) { bv = v; bi = i; }
++    }
++    #pragma unroll
++    for (int o = 16; o > 0; o >>= 1)
++    {
++        const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
++        const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
++        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
++    }
++    if (l == 0) { s_v[w] = bv; s_i[w] = bi; }
++    __syncthreads();
++    if (t == 0)
++    {
++        for (int i = 1; i < 8; ++i)
++            if (s_v[i] > bv || (s_v[i] == bv && s_i[i] < bi)) { bv = s_v[i]; bi = s_i[i]; }
++        bool in = false;
++        for (int j = 0; j < SL; ++j) in |= cand[(size_t)m * SL + j] == bi;
++        const unsigned n = atomicAdd(cnt, 1u) + 1u;
++        const unsigned x = in ? cnt[1] : atomicAdd(cnt + 1, 1u) + 1u;
++        if (n % 4096 == 0) printf("# head2 check rank %d: %u of %u rows' MXFP8 argmax outside the %d candidates\n", rank, x, n, SL);
++    }
++}
++
++// the screen, its best, the rescoring: y [M][ldy] then holds the row logits k_head_local_sl reads (a.logits = y)
++struct Bufs
++{
++    const uint4* codes = nullptr;
++    const __half2* scales = nullptr;
++    const uint8_t* mx = nullptr;      // the MXFP8 head records of the slice (the target's)
++    int* cand = nullptr;              // [MXM][SL]
++    float* cl = nullptr;              // [MXM][SL]
++};
++inline void launch_front(const Bufs& b, const __half* x, int ldx, float* y, int ldy, int vn, int M, cudaStream_t st)
++{
++    launch_screen(b.codes, b.scales, x, ldx, y, ldy, vn, M, st);
++    k_screen_top<<<M, 1024, 0, st>>>(y, ldy, vn, b.cand);
++    k_rescore<<<dim3(M, SL / 8), 256, 0, st>>>(b.mx, x, ldx, b.cand, y, ldy, b.cl);
++}
++}   // namespace head2
+diff --git a/engine/runtime/g6m4.cu b/engine/runtime/g6m4.cu
+index 141d09c..fbb0f93 100644
+--- a/engine/runtime/g6m4.cu
++++ b/engine/runtime/g6m4.cu
+@@ -608,6 +608,10 @@ int main(int argc, char** argv)
+     // signature
+     const bool mtp_last = mtp_lastrow_env();
+     if (mtp_last && !mtp) die("G6_MTP_LASTROW=1 needs --mtp");
++    // G6_DRAFT_HEAD2=1|2 (rank.cuh draft_head2_env; default 0): the MTP draft's head in two stages (2-bit screen, exact
++    // MXFP8 rescoring of its best). Drafts only. In the S2 runtime signature
++    const int dhead2 = draft_head2_env();
++    if (dhead2 && !mtp) die("G6_DRAFT_HEAD2 needs --mtp");
+     // G6_DFL_HEAD_I4=1 (dflash.cuh dfl_head_i4; default 0): the DFlash2 drafter's head reads the same INT4 records (the MTP
+     // draft's copy when there is one), with G6_DRAFT_HEAD_KS / _TPC. In the S2 runtime signature.
+     std::string dfe;
+@@ -848,6 +852,7 @@ int main(int argc, char** argv)
+             qs_attach(D.d, fabdg.dev(), fd.error);   // the draft fabric's error word, which the draft step checks
+         }
+         build_draft_head_i4(D, dhead, st);
++        build_draft_head2(D, dhead2, st);
+         D.d.route_last = mtp_last;
+         D.d.graph = graph; D.d.in = in_d; D.d.out = out_d;
+         DQ.P.attn_rows = pf_attn_rows(MP);
+@@ -1526,7 +1531,7 @@ int main(int argc, char** argv)
+                 (qs_mode ? " qasplit " + std::to_string(qs_mode) : "") +
+                 (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "") +
+                 (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
+-                (mtp_last ? " mtplast 1" : "") +
++                (mtp_last ? " mtplast 1" : "") + (dhead2 ? " dhead2 " + std::to_string(dhead2) : "") +
+                 (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
+                 (dfl_body_i4_on ? " dflbodyi4 1" : "") +
+                 (dsel_start_mtp ? " dselstart mtp" : "") +
+diff --git a/engine/runtime/m4sim.cu b/engine/runtime/m4sim.cu
+index ad95456..50cd5ed 100644
+--- a/engine/runtime/m4sim.cu
++++ b/engine/runtime/m4sim.cu
+@@ -48,6 +48,7 @@
+ //        residual> logits <fnv of the row's logits, the ranks' slices in rank order>". The part after "|" must not depend
+ //        on the step's row count or on the other rows of the step (scripts/m4sim_split_check.sh compares it).
+ // G6_MTP_LASTROW=1 (needs --mtp): as g6m4, a draft step routes only each session's last row (rank.cuh launch_mlp_block).
++// G6_DRAFT_HEAD2=1|2 (needs --mtp): as g6m4, the MTP draft's two-stage head (2: with the MXFP8 check lines).
+ // G6_MTP_LASTROW_CHECK=1: after each draft step one "check" line per session: its last row's token, log-probability,
+ //        head-input and residual rows, and a hash of every rank's whole layer-78 caches. With and without G6_MTP_LASTROW
+ //        every line but the first-form "draft" lines (their other rows) must be the same (scripts/mtp_lastrow_check.sh).
+@@ -250,6 +251,7 @@ int main(int argc, char** argv)
+     pf_env_check();                    // strict G6_PF_* choices (envparse.h): a bad value exits before any work
+     const DraftHeadI4 dhead = draft_head_i4_env();   // G6_DRAFT_HEAD_I4 (rank.cuh), as g6m4: the MTP draft's INT4 head
+     const bool mtp_last = mtp_lastrow_env();         // G6_MTP_LASTROW (rank.cuh), as g6m4: draft steps route only last rows
++    const int dhead2 = draft_head2_env();            // G6_DRAFT_HEAD2 (rank.cuh), as g6m4: the two-stage draft head
+     std::string packs;
+     V2Src v2src;                        // --v2-dense: every rank's image from the exlr8 release (no packs)
+     g6rt::CommonOpts co;                // every flag g6m4 takes too, parsed in engine_opts.h
+@@ -326,6 +328,7 @@ int main(int argc, char** argv)
+     else if (!minv_s.empty()) die("--minv-rows needs --minv");
+     if (dhead.on && !mtp) die("G6_DRAFT_HEAD_I4=1 needs --mtp");
+     if (mtp_last && !mtp) die("G6_MTP_LASTROW=1 needs --mtp");
++    if (dhead2 && !mtp) die("G6_DRAFT_HEAD2 needs --mtp");
+     if (plan.rs && (s2mode || !mtp)) die("--spec-accept rejection needs --mtp, and not --s2");
+     if ((adapt || !levels_s.empty()) && (s2mode || !mtp || (!levels_s.empty() && !adapt))) die("--spec-adaptive needs --mtp, and not --s2; --spec-levels needs it");
+     SpecLen spec;                       // --spec-adaptive (graphs are captured per row count on first use here)
+@@ -637,6 +640,7 @@ int main(int argc, char** argv)
+             build_draft(DR[r], R[r], rfind(r), cap, fd, stepp_d, st, MP ? pf_attn_rows(MP) : MX);
+             qs_loop_attach(DR[r].d, qsl_d, stepp_d);
+             build_draft_head_i4(DR[r], dhead, st);
++            build_draft_head2(DR[r], dhead2, st);
+             DR[r].d.route_last = mtp_last;
+             DR[r].d.graph = graph; DR[r].d.in = in_d; DR[r].d.out = out_d + r;
+             loop_d.send[r] = fd.send;
+diff --git a/engine/runtime/rank.cuh b/engine/runtime/rank.cuh
+index 896e39f..d46b32d 100644
+--- a/engine/runtime/rank.cuh
++++ b/engine/runtime/rank.cuh
+@@ -40,6 +40,7 @@
+ #include "../kernels/bind.cuh"
+ #include "../kernels/l2pf.cuh"
+ #include "../kernels/head_i4.cuh"
++#include "../kernels/head2.cuh"
+ #include "../attn/bind.h"
+ #if defined(G6_CP) && G6_CP
+ #include "../kernels/cpglue.cuh"
+@@ -403,6 +404,14 @@ struct Model
+     // vocab slice instead of head_t.lm_head (build_draft_head_i4); dh_tpc / dh_ks = its CTA split. nullptr = MXFP8
+     const uint8_t* dh_i4 = nullptr;
+     int dh_tpc = 1, dh_ks = 32;
++    // G6_DRAFT_HEAD2 (MTP draft model only, set before prepare; build_draft_head2): steps of up to head2::MXM rows run the
++    // two-stage head (kernels/head2.cuh) instead of the head GEMV; dh2_mode 2 also runs the MXFP8 GEMV into dh2_ref and
++    // counts the rows whose MXFP8 argmax is not a candidate (dh2_cnt, measurement)
++    int dh2_mode = 0;
++    head2::Bufs dh2;
++    float* dh2_ref = nullptr;
++    unsigned* dh2_cnt = nullptr;
++    bind::Gv dh2_gv[MX + 1];
+     int nc = 0;                       // top_p candidates per rank per row (0 = top_p off); set before the first step
+     unsigned* topp_miss = nullptr;    // device counter: top_p rows whose nucleus went past the candidates
+     void (*dfl_tap)(Model&, int, int, cudaStream_t) = nullptr;   // --dflash: after layer i, copy the residual rows the drafter reads (dflash.cuh)
+@@ -1550,6 +1559,9 @@ inline const bind::Head& head_for(Model& m, int M)
+                 die("rank " + std::to_string(m.rank) + " INT4 draft head: " + e);
+             if (H.lm_head.O != H.vn || H.lm_head.K != HID) die("INT4 draft head is not this rank's vocab slice");
+         }
++        if (m.dh2_mode == 2 && M <= head2::MXM)   // G6_DRAFT_HEAD2=2: the MXFP8 GEMV of the slice, as the target's head binds it
++            if (const char* e = bind::make_gv(m.head_t.lm_head, bind::MXFP8, 1, 32, M, m.sc.xf_head, m.dh2_ref, gv::O_F32, m.dh2_gv[M]))
++                die("rank " + std::to_string(m.rank) + " G6_DRAFT_HEAD2 check GEMV: " + e);
+     }
+     return H;
+ }
+@@ -1617,6 +1629,19 @@ inline void launch_step_out(Model& m, int M, cudaStream_t st)
+ inline void launch_head_local(Model& m, int M, cudaStream_t st)
+ {
+     const bind::Head& H = head_for(m, M);
++    if (m.dh2_mode && M <= head2::MXM)        // G6_DRAFT_HEAD2: screen, its best SL rescored, the record over them
++    {
++        if (m.dh2_mode == 2)
++        {
++            bind::launch(H.xf_h, st);
++            bind::launch(m.dh2_gv[M], st);
++        }
++        head2::launch_front(m.dh2, m.x, HID, m.hlog, m.vn, m.vn, M, st);
++        if (m.dh2_mode == 2) head2::k_check<<<M, 256, 0, st>>>(m.dh2_ref, m.vn, m.vn, m.dh2.cand, m.dh2_cnt, m.rank);
++        head2::k_head_local_sl<<<M, 1024, 0, st>>>(head_args(m, M), m.dh2.cand, m.dh2.cl);
++        dmark(DP_HEAD_L, st);
++        return;
++    }
+     bind::launch(H.xf_h, st);
+     bind::launch(H.lm_head, st);
+     if (m.rs) glue::k_head_local_rs<<<M, 1024, 0, st>>>(head_args(m, M), m.tok);
+@@ -1836,6 +1861,50 @@ inline void build_draft_head_i4(Draft& D, const DraftHeadI4& c, cudaStream_t st)
+     d.dh_i4 = head_i4_records(d.head_t.lm_head, d.vn, c.ks, d.rank, "G6_DRAFT_HEAD_I4", st);
+     d.dh_tpc = c.tpc; d.dh_ks = c.ks;
+ }
++// G6_DRAFT_HEAD2=1|2 (default 0; needs --mtp; every rank, read at boot): the MTP draft's head in two stages (kernels/head2.cuh):
++// a 2-bit g32 screen of the rank's vocab slice (74.5 MB at TP4, made at boot from the MXFP8 head records), the exact
++// MXFP8 logits of the screen's best head2::SL rows (read out of the target's records), and the head record over those
++// candidates (the log-sum-exp over the whole row, screen logits outside them). Drafts only: the target's head and the
++// verify steps are unchanged. A draft is the MXFP8 head's argmax whenever that token is among its slice's SL screen best
++// (dhead2_test; an offline replay of 24k recorded draft-head inputs: no miss). Draft steps of more than
++// head2::MXM rows keep the head GEMV (INT4 with G6_DRAFT_HEAD_I4, else MXFP8). 2 = also the MXFP8 GEMV of the slice per
++// draft step and a count of the rows whose MXFP8 argmax is not a candidate (a line every 4096 rows; measurement only).
++// T > 0: a draft is sampled among the candidates (top_p and top-k lists over the whole row, as today). In the S2 runtime
++// signature.
++inline int draft_head2_env()
++{
++    std::string err;
++    const int v = env_choice("G6_DRAFT_HEAD2", 2, 0, &err);
++    if (v < 0) die(err);
++    return v;
++}
++// after build_draft, before prepare / any capture of a draft step
++inline void build_draft_head2(Draft& D, int mode, cudaStream_t st)
++{
++    Model& d = D.d;
++    if (!mode) return;
++    const bind::Tensor& mx = d.head_t.lm_head;
++    if (!mx.p || mx.nd != 3 || mx.shape[0] * 16 != d.vn || mx.shape[1] != HID / 32 || mx.shape[2] != head_i4::MXGR)
++        die("G6_DRAFT_HEAD2: G.lm_head.mx.gv is not this rank's [vn/16][192][528] MXFP8 slice");
++    if (const char* e = head2::init()) die(std::string("G6_DRAFT_HEAD2: ") + e);
++    uint4* codes = dmalloc<uint4>(head2::code_bytes(d.vn) / 16);
++    __half2* scales = dmalloc<__half2>(head2::scale_bytes(d.vn) / 4);
++    head2::convert(static_cast<const uint8_t*>(mx.p), codes, scales, d.vn, st);
++    G6RT_CK(cudaGetLastError());
++    d.dh2.codes = codes; d.dh2.scales = scales; d.dh2.mx = static_cast<const uint8_t*>(mx.p);
++    d.dh2.cand = dmalloc<int>((size_t)head2::MXM * head2::SL);
++    d.dh2.cl = dmalloc<float>((size_t)head2::MXM * head2::SL);
++    if (mode == 2)
++    {
++        d.dh2_ref = dmalloc<float>((size_t)head2::MXM * d.vn);
++        d.dh2_cnt = dmalloc<unsigned>(2);
++        G6RT_CK(cudaMemsetAsync(d.dh2_cnt, 0, 8, st));
++    }
++    G6RT_CK(cudaStreamSynchronize(st));
++    d.dh2_mode = mode;
++    fprintf(stderr, "# rank %d: G6_DRAFT_HEAD2=%d: 2-bit g32 screen records %.1f MB, %d candidates rescored on MXFP8, steps of <= %d rows\n",
++            d.rank, mode, head2::bytes(d.vn) / 1e6, head2::SL, head2::MXM);
++}
+ #ifdef DEC_S2
+ inline const __half* s2_draft_hid(Draft& D, bool chain, cudaStream_t st);
+ inline void s2_draft_keep(Draft& D, cudaStream_t st);
+diff --git a/engine/runtime/tests/dhead2_test.cu b/engine/runtime/tests/dhead2_test.cu
+new file mode 100644
+index 0000000..aa612ec
+--- /dev/null
++++ b/engine/runtime/tests/dhead2_test.cu
+@@ -0,0 +1,463 @@
++// G6_DRAFT_HEAD2 (kernels/head2.cuh, two-stage draft head) unit test and bench: one GB10, synthetic records, no pack.
++//   dhead2_test [--time [reps]] [--rows O]
++// Check (O = 4096 vocab rows of K = 6144, M = 1, 3, 8; random head-like MXFP8 records as dhead_i4_test):
++//   1. k_mx_to_i2 against a host derivation from the MXFP8 values (head2.cuh header), byte for byte, every byte written
++//   2. k_screen against a host fp64 dot of the same 2-bit values: |error| <= 2e-3 of the row's sum of |terms| (fp16
++//      products in groups of 32, the screen's own arithmetic)
++//   3. k_screen_top against the host rule on the GPU's screen logits: the same candidate list, in the same order
++//   4. k_rescore against a host fp64 dot of the MXFP8 values (1e-5 of the sum of |terms|) and against the MXFP8 GEMV the
++//      target's head runs (bind::make_gv MXFP8): the same logit within 1e-5 of the sum of |terms|
++//   5. k_head_local_sl against glue::k_head_local on the same row logits (a fake fabric slot): byte-equal records on
++//      every row whose best logit is a candidate; the draft = the MXFP8 GEMV's argmax there
++//   Reported, not checked: the two-stage drafts against the MXFP8 GEMV's and the INT4 head's argmax, on random hidden
++//   rows (flat logits: the worst case for a screen) and on planted ones (x = a w_t + b w_u + noise: one clear token).
++//   Real drafts: an offline replay of 24k recorded draft-head inputs had no miss at SL >= 32.
++// --time: one TP4 vocab slice (O = 38784): the MXFP8 GEMV, the INT4 head (tpc 1, ks 32 = the engine's), and the
++//   two-stage head per part (screen, top, rescore) and in all, M = 1, 3, 8, mean of reps (CUDA events), bytes per launch.
++// Build: nvcc -O2 -std=c++17 -gencode=arch=compute_121a,code=sm_121a <K1H2 flags> -DG6_NR=4 -DDEC_S2 -o dhead2_test dhead2_test.cu
++// Exit code: 0 all PASS, 1 any FAIL, 2 CUDA error.
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <functional>
++#include <string>
++#include <vector>
++#include <cuda_runtime.h>
++#include "../../kernels/glue.cuh"
++#include "../../kernels/bind.cuh"
++#include "../../kernels/head_i4.cuh"
++#include "../../kernels/head2.cuh"
++
++#define CK(x)                                                                                                   \
++    do                                                                                                          \
++    {                                                                                                           \
++        const cudaError_t e_ = (x);                                                                             \
++        if (e_ != cudaSuccess)                                                                                  \
++        {                                                                                                       \
++            printf("CUDA error %s at %s:%d: %s\n", #x, __FILE__, __LINE__, cudaGetErrorString(e_));             \
++            exit(2);                                                                                            \
++        }                                                                                                       \
++    } while (0)
++
++static int g_pass = 0, g_fail = 0;
++static void report(bool ok, const std::string& s)
++{
++    printf("%s %s\n", ok ? "PASS" : "FAIL", s.c_str());
++    fflush(stdout);
++    (ok ? g_pass : g_fail)++;
++}
++static uint32_t rnd(uint64_t i, uint32_t seed)
++{
++    uint32_t x = (uint32_t)i ^ (((uint32_t)(i >> 32) + seed) * 0x9e3779b9u) ^ (seed * 0x85ebca6bu);
++    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
++    return x;
++}
++static float e4m3_host(uint8_t b)
++{
++    const int e = (b >> 3) & 15, m = b & 7;
++    const float v = e ? std::ldexp((float)(8 + m), e - 10) : std::ldexp((float)m, -9);
++    return (b & 0x80) ? -v : v;
++}
++static float e8m0_host(uint8_t c) { return c ? std::ldexp(1.f, (int)c - 127) : std::ldexp(1.f, -127); }
++
++// canonical codes [n][K] (E4M3), scales [n][K/32] (E8M0) -> MXFP8 GEMV record [n/16][K/32][528] (as dhead_i4_test)
++static std::vector<uint8_t> mx_record(const std::vector<uint8_t>& c, const std::vector<uint8_t>& s, int n, int K)
++{
++    const int ng = K / 32;
++    std::vector<uint8_t> out((size_t)n / 16 * ng * 528);
++    for (int t = 0; t < n / 16; ++t)
++        for (int g = 0; g < ng; ++g)
++        {
++            uint8_t* rec = &out[((size_t)t * ng + g) * 528];
++            for (int h = 0; h < 2; ++h)
++                for (int l = 0; l < 32; ++l)
++                {
++                    const int r = l / 4, cc = l % 4;
++                    const int rows[8] = {r, r, r + 8, r + 8, r, r, r + 8, r + 8};
++                    const int ks[8] = {2 * cc, 2 * cc + 1, 2 * cc, 2 * cc + 1, 2 * cc + 8, 2 * cc + 9, 2 * cc + 8, 2 * cc + 9};
++                    for (int i = 0; i < 8; ++i) rec[h * 256 + l * 8 + i] = c[(size_t)(16 * t + rows[i]) * K + 32 * g + 16 * h + ks[i]];
++                }
++            for (int i = 0; i < 8; ++i)
++            {
++                rec[512 + 2 * i] = s[(size_t)(16 * t + i) * ng + g];
++                rec[512 + 2 * i + 1] = s[(size_t)(16 * t + i + 8) * ng + g];
++            }
++        }
++    return out;
++}
++// random head-like MXFP8 rows: no NaN codes, scales 2^-11 .. 2^-6, a few all-zero groups (scale 0 path)
++static void random_mx(int n, int K, uint32_t seed, std::vector<uint8_t>& c, std::vector<uint8_t>& s)
++{
++    c.resize((size_t)n * K);
++    s.resize((size_t)n * K / 32);
++    for (size_t i = 0; i < c.size(); ++i)
++    {
++        uint8_t b = (uint8_t)rnd(i, seed);
++        if ((b & 0x7f) == 0x7f) b &= 0xbf;
++        c[i] = b;
++    }
++    for (size_t i = 0; i < s.size(); ++i) s[i] = (uint8_t)(116 + rnd(i, seed + 1) % 6);
++    for (int i = 0; i < n; i += 37)
++        for (int j = 0; j < 32; ++j) c[(size_t)i * K + j] = 0;
++}
++static float mxv(const std::vector<uint8_t>& c, const std::vector<uint8_t>& s, int K, int row, int k)
++{
++    return e4m3_host(c[(size_t)row * K + k]) * e8m0_host(s[(size_t)row * (K / 32) + k / 32]);
++}
++// the 2-bit records of head2.cuh's header, from the MXFP8 values: codes [n][96] x 16 bytes, scales [n][192] fp16; and
++// the dequantized values [n][K]
++static void i2_host(const std::vector<uint8_t>& c, const std::vector<uint8_t>& s, int n, int K, std::vector<uint8_t>& codes,
++                    std::vector<__half>& sc, std::vector<float>& val)
++{
++    const int ng = K / 32, nch = K / 64;
++    codes.assign((size_t)n * nch * 16, 0);
++    sc.assign((size_t)n * ng, __float2half_rn(0.f));
++    val.assign((size_t)n * K, 0.f);
++    for (int i = 0; i < n; ++i)
++        for (int g = 0; g < ng; ++g)
++        {
++            float v[32], amax = 0.f;
++            for (int j = 0; j < 32; ++j) { v[j] = mxv(c, s, K, i, 32 * g + j); amax = std::max(amax, std::fabs(v[j])); }
++            const __half h = __float2half_rn(amax / 1.5f);
++            sc[(size_t)i * ng + g] = h;
++            const float sf = __half2float(h);
++            for (int j = 0; j < 32; ++j)
++            {
++                const int q = sf != 0.f ? std::min(std::max((int)std::floor(v[j] / sf + 2.f), 0), 3) : 2;
++                const int e = (g & 1) * 32 + j, word = e >> 4, ii = e & 15;
++                uint32_t* w = reinterpret_cast<uint32_t*>(&codes[((size_t)i * nch + g / 2) * 16]) + word;
++                *w |= (uint32_t)q << (2 * (ii >> 1) + 16 * (ii & 1));
++                val[(size_t)i * K + 32 * g + j] = (q - 1.5f) * sf;
++            }
++        }
++}
++
++static bind::Tensor mk(const void* p, long long a, long long b, long long c)
++{
++    bind::Tensor t;
++    t.p = p; t.nd = 3; t.shape[0] = a; t.shape[1] = b; t.shape[2] = c;
++    return t;
++}
++// y [M][O] f32 = x [M][K] fp16 @ W^T through bind (fragment table + gv launch), as the engine's head
++struct Gemv
++{
++    bind::Xfrag f;
++    bind::Gv g;
++    void make(const void* rec, int codec, int O, int K, int tpc, int ks, int M, const __half* x, u32* xf, float* y)
++    {
++        f.on = 1; f.src = x; f.ld = K; f.K = K; f.M = M; f.f16 = xf;
++        const int GR = codec == bind::INT4 ? 288 : 528;
++        if (const char* e = bind::make_gv(mk(rec, O / 16, K / 32, GR), codec, tpc, ks, M, xf, y, gv::O_F32, g)) { printf("make_gv: %s\n", e); exit(2); }
++    }
++    void run(cudaStream_t st) { bind::launch(f, st); bind::launch(g, st); }
++};
++
++// fake fabric for the head-local kernels: one collective, send slot only
++struct FakeFab
++{
++    g6::FabricDev f{};
++    u64* stepp = nullptr;
++    unsigned* ticket = nullptr;
++    void init(size_t slot)
++    {
++        f.ncoll = 1; f.nr = 1; f.rank = 0;
++        f.stride = (slot + 8 + 255) & ~(size_t)255;
++        CK(cudaMalloc(&f.send, 2 * f.stride));
++        CK(cudaMalloc(&f.doorbell, 8));
++        CK(cudaMalloc(&stepp, 8));
++        CK(cudaMemset(stepp, 0, 8));
++        CK(cudaMalloc(&ticket, 4));
++        CK(cudaMemset(ticket, 0, 4));
++    }
++};
++
++static void check(int O, uint32_t seed)
++{
++    const int K = HID, ng = K / 32;
++    std::vector<uint8_t> c, s;
++    random_mx(O, K, seed, c, s);
++    const std::vector<uint8_t> rec = mx_record(c, s, O, K);
++    std::vector<uint8_t> hcodes;
++    std::vector<__half> hsc;
++    std::vector<float> hval;
++    i2_host(c, s, O, K, hcodes, hsc, hval);
++    uint8_t *dmx, *dcodes;
++    __half2* dsc;
++    CK(cudaMalloc(&dmx, rec.size()));
++    CK(cudaMemcpy(dmx, rec.data(), rec.size(), cudaMemcpyHostToDevice));
++    CK(cudaMalloc(&dcodes, head2::code_bytes(O)));
++    CK(cudaMalloc(&dsc, head2::scale_bytes(O)));
++    CK(cudaMemset(dcodes, 0xa5, head2::code_bytes(O)));
++    CK(cudaMemset(dsc, 0xa5, head2::scale_bytes(O)));
++    head2::convert(dmx, reinterpret_cast<uint4*>(dcodes), dsc, O, nullptr);
++    CK(cudaDeviceSynchronize());
++    {
++        std::vector<uint8_t> gc(head2::code_bytes(O));
++        std::vector<__half> gs((size_t)O * ng);
++        CK(cudaMemcpy(gc.data(), dcodes, gc.size(), cudaMemcpyDeviceToHost));
++        CK(cudaMemcpy(gs.data(), dsc, gs.size() * 2, cudaMemcpyDeviceToHost));
++        size_t bc = 0, bs = 0;
++        for (size_t i = 0; i < gc.size(); ++i) bc += gc[i] != hcodes[i];
++        for (size_t i = 0; i < gs.size(); ++i) bs += memcmp(&gs[i], &hsc[i], 2) != 0;
++        report(bc == 0 && bs == 0, "k_mx_to_i2 O=" + std::to_string(O) + ": codes " + std::to_string(bc) + " bytes and scales " +
++                                       std::to_string(bs) + " differ from the host derivation");
++    }
++    for (int planted = 0; planted < 2; ++planted)
++        for (int M : {1, 3, 8})
++        {
++            // hidden rows: random fp16 in [-2, 2], or planted x = 2.5 w_t / |w_t|^2-ish + 1.5 w_u + noise
++            std::vector<__half> hx((size_t)M * K);
++            for (int m = 0; m < M; ++m)
++            {
++                const int tt = (int)(rnd(m, seed + 9) % O), uu = (int)(rnd(m, seed + 10) % O);
++                double nt = 0, nu = 0;
++                for (int k = 0; k < K; ++k) { const double a = mxv(c, s, K, tt, k), b = mxv(c, s, K, uu, k); nt += a * a; nu += b * b; }
++                for (int k = 0; k < K; ++k)
++                {
++                    float v = 4.f * ((rnd((uint64_t)m * K + k, seed + 11) >> 8) * (1.f / 16777216.f)) - 2.f;
++                    if (planted) v = (float)(0.25 * v + 6.0 * mxv(c, s, K, tt, k) / std::sqrt(nt) * std::sqrt(K) * 0.1 +
++                                             4.0 * mxv(c, s, K, uu, k) / std::sqrt(nu) * std::sqrt(K) * 0.1);
++                    hx[(size_t)m * K + k] = __float2half_rn(v);
++                }
++            }
++            __half* dx;
++            float *dy, *dmxy, *di4y, *dcl;
++            int* dcand;
++            u32* xf;
++            CK(cudaMalloc(&dx, hx.size() * 2));
++            CK(cudaMemcpy(dx, hx.data(), hx.size() * 2, cudaMemcpyHostToDevice));
++            CK(cudaMalloc(&dy, (size_t)M * O * 4));
++            CK(cudaMalloc(&dmxy, (size_t)M * O * 4));
++            CK(cudaMalloc(&di4y, (size_t)M * O * 4));
++            CK(cudaMalloc(&dcl, (size_t)M * head2::SL * 4));
++            CK(cudaMalloc(&dcand, (size_t)M * head2::SL * 4));
++            CK(cudaMalloc(&xf, (size_t)K / 16 * 64 * 4 * g6mx::NT));
++            // the engine's heads: MXFP8 (the exact reference) and INT4 (today's draft head)
++            uint8_t* di4;
++            CK(cudaMalloc(&di4, head_i4::bytes(O / 16, ng)));
++            head_i4::launch(dmx, di4, O / 16, ng, nullptr);
++#if DEC_I4PAIR
++            launch_i4pair(di4, O / 16, ng, 32, nullptr);
++#endif
++            Gemv gm, gi;
++            gm.make(dmx, bind::MXFP8, O, K, 1, 32, M, dx, xf, dmxy);
++            gm.run(nullptr);
++            gi.make(di4, bind::INT4, O, K, 1, 32, M, dx, xf, di4y);
++            gi.run(nullptr);
++            head2::Bufs b;
++            b.codes = reinterpret_cast<const uint4*>(dcodes); b.scales = dsc; b.mx = dmx; b.cand = dcand; b.cl = dcl;
++            head2::launch_screen(b.codes, b.scales, dx, K, dy, O, O, M, nullptr);
++            CK(cudaDeviceSynchronize());
++            const std::string tag = std::string(planted ? "planted" : "random") + " M=" + std::to_string(M) + " O=" + std::to_string(O);
++            std::vector<float> ys((size_t)M * O), ym((size_t)M * O), yi((size_t)M * O);
++            CK(cudaMemcpy(ys.data(), dy, ys.size() * 4, cudaMemcpyDeviceToHost));
++            CK(cudaMemcpy(ym.data(), dmxy, ym.size() * 4, cudaMemcpyDeviceToHost));
++            CK(cudaMemcpy(yi.data(), di4y, yi.size() * 4, cudaMemcpyDeviceToHost));
++            {   // 2. the screen against fp64
++                double worst = 0;
++                for (int m = 0; m < M; ++m)
++                    for (int v = 0; v < O; ++v)
++                    {
++                        double d = 0, a = 0;
++                        for (int k = 0; k < K; ++k)
++                        {
++                            const double t = (double)hval[(size_t)v * K + k] * __half2float(hx[(size_t)m * K + k]);
++                            d += t; a += std::fabs(t);
++                        }
++                        worst = std::max(worst, std::fabs(ys[(size_t)m * O + v] - d) / (a + 1e-30));
++                    }
++                char buf[160];
++                snprintf(buf, sizeof buf, "k_screen %s: worst |error| / sum|terms| %.2e (limit 2e-3)", tag.c_str(), worst);
++                report(worst <= 2e-3, buf);
++            }
++            // 3. the candidates: host rule on the GPU's screen logits
++            head2::k_screen_top<<<M, 1024>>>(dy, O, O, dcand);
++            CK(cudaDeviceSynchronize());
++            std::vector<int> gcand((size_t)M * head2::SL);
++            CK(cudaMemcpy(gcand.data(), dcand, gcand.size() * 4, cudaMemcpyDeviceToHost));
++            {
++                size_t bad = 0;
++                for (int m = 0; m < M; ++m)
++                {
++                    const float* row = &ys[(size_t)m * O];
++                    float mx = -INFINITY;
++                    for (int v = 0; v < O; ++v) mx = std::max(mx, row[v]);
++                    auto bin = [&](float v) { const float bb = (mx - v) * (head2::BINS / head2::RANGE); return bb < (float)(head2::BINS - 1) ? (int)bb : head2::BINS - 1; };
++                    std::vector<int> hist(head2::BINS, 0);
++                    for (int v = 0; v < O; ++v) ++hist[bin(row[v])];
++                    int cut = 0, lt = 0;
++                    while (lt + hist[cut] < head2::SL) lt += hist[cut++];
++                    std::vector<int> want;
++                    for (int v = 0; v < O; ++v) if (bin(row[v]) < cut) want.push_back(v);
++                    for (int v = 0; v < O && (int)want.size() < head2::SL; ++v) if (bin(row[v]) == cut) want.push_back(v);
++                    for (int j = 0; j < head2::SL; ++j) bad += want[j] != gcand[(size_t)m * head2::SL + j];
++                }
++                report(bad == 0, "k_screen_top " + tag + ": " + std::to_string(bad) + " candidate entries differ from the host rule");
++            }
++            // 4. rescoring against fp64 and the MXFP8 GEMV
++            head2::k_rescore<<<dim3(M, head2::SL / 8), 256>>>(dmx, dx, K, dcand, dy, O, dcl);
++            CK(cudaDeviceSynchronize());
++            std::vector<float> cl((size_t)M * head2::SL), y2((size_t)M * O);
++            CK(cudaMemcpy(cl.data(), dcl, cl.size() * 4, cudaMemcpyDeviceToHost));
++            CK(cudaMemcpy(y2.data(), dy, y2.size() * 4, cudaMemcpyDeviceToHost));
++            {
++                double w64 = 0, wgv = 0;
++                size_t ybad = 0;
++                for (int m = 0; m < M; ++m)
++                    for (int j = 0; j < head2::SL; ++j)
++                    {
++                        const int v = gcand[(size_t)m * head2::SL + j];
++                        double d = 0, a = 0;
++                        for (int k = 0; k < K; ++k)
++                        {
++                            const double t = (double)mxv(c, s, K, v, k) * __half2float(hx[(size_t)m * K + k]);
++                            d += t; a += std::fabs(t);
++                        }
++                        const float e = cl[(size_t)m * head2::SL + j];
++                        w64 = std::max(w64, std::fabs(e - d) / (a + 1e-30));
++                        wgv = std::max(wgv, std::fabs((double)e - ym[(size_t)m * O + v]) / (a + 1e-30));
++                        ybad += memcmp(&y2[(size_t)m * O + v], &e, 4) != 0;
++                    }
++                char buf[200];
++                snprintf(buf, sizeof buf, "k_rescore %s: worst |error| / sum|terms| %.2e vs fp64, %.2e vs the MXFP8 GEMV (limit 1e-5); %zu row logits not written",
++                         tag.c_str(), w64, wgv, ybad);
++                report(w64 <= 1e-5 && wgv <= 1e-5 && ybad == 0, buf);
++            }
++            // 5. head-local records: k_head_local_sl vs k_head_local on the same rows (greedy, no top_p)
++            {
++                FakeFab F;
++                F.init(glue::head_bytes(M, 0));
++                glue::SampleRow* rows;
++                int *tok, *tok2;
++                float *lp, *lp2;
++                CK(cudaMalloc(&rows, M * sizeof(glue::SampleRow)));
++                std::vector<glue::SampleRow> hr(M);
++                for (int m = 0; m < M; ++m) hr[m] = glue::SampleRow{0.f, 1u, 0u, 100 + m, 0, 0.f, 0, 0};
++                CK(cudaMemcpy(rows, hr.data(), M * sizeof(glue::SampleRow), cudaMemcpyHostToDevice));
++                CK(cudaMalloc(&tok, M * 4)); CK(cudaMalloc(&tok2, M * 4)); CK(cudaMalloc(&lp, M * 4)); CK(cudaMalloc(&lp2, M * 4));
++                glue::HeadArgs a{F.f, F.stepp, 0, M, dy, O, 1000, O, rows, F.ticket, tok, lp};
++                std::vector<glue::HeadRec> r1(M), r2(M);
++                glue::k_head_local<<<M, 1024>>>(a);
++                CK(cudaDeviceSynchronize());
++                CK(cudaMemcpy(r1.data(), F.f.send, M * sizeof(glue::HeadRec), cudaMemcpyDeviceToHost));
++                head2::k_head_local_sl<<<M, 1024>>>(a, dcand, dcl);
++                CK(cudaDeviceSynchronize());
++                CK(cudaMemcpy(r2.data(), F.f.send, M * sizeof(glue::HeadRec), cudaMemcpyDeviceToHost));
++                int eq = 0, comparable = 0, bad = 0, agree_mx = 0, agree_i4 = 0, cand_has = 0;
++                for (int m = 0; m < M; ++m)
++                {
++                    const float* row = &y2[(size_t)m * O];
++                    const int best = (int)(std::max_element(row, row + O) - row);
++                    bool in = false;
++                    for (int j = 0; j < head2::SL; ++j) in |= gcand[(size_t)m * head2::SL + j] == best;
++                    if (in) { ++comparable; if (!memcmp(&r1[m], &r2[m], sizeof(glue::HeadRec))) ++eq; else ++bad; }
++                    const int amx = (int)(std::max_element(&ym[(size_t)m * O], &ym[(size_t)m * O] + O) - &ym[(size_t)m * O]);
++                    const int ai4 = (int)(std::max_element(&yi[(size_t)m * O], &yi[(size_t)m * O] + O) - &yi[(size_t)m * O]);
++                    bool has = false;
++                    for (int j = 0; j < head2::SL; ++j) has |= gcand[(size_t)m * head2::SL + j] == amx;
++                    cand_has += has;
++                    agree_mx += r2[m].id - 1000 == amx;
++                    agree_i4 += ai4 == amx;
++                }
++                report(bad == 0, "k_head_local_sl " + tag + ": " + std::to_string(eq) + " of " + std::to_string(comparable) +
++                                     " rows (best logit a candidate) byte-equal to k_head_local");
++                printf("INFO %s: MXFP8 argmax among the candidates %d/%d; two-stage draft == MXFP8 GEMV argmax %d/%d; INT4 head == MXFP8 %d/%d\n",
++                       tag.c_str(), cand_has, M, agree_mx, M, agree_i4, M);
++                cudaFree(rows); cudaFree(tok); cudaFree(tok2); cudaFree(lp); cudaFree(lp2);
++                cudaFree(F.f.send); cudaFree(F.f.doorbell); cudaFree(F.stepp); cudaFree(F.ticket);
++            }
++            cudaFree(dx); cudaFree(dy); cudaFree(dmxy); cudaFree(di4y); cudaFree(dcl); cudaFree(dcand); cudaFree(xf); cudaFree(di4);
++        }
++    cudaFree(dmx); cudaFree(dcodes); cudaFree(dsc);
++}
++
++// one TP4 vocab slice: MXFP8 GEMV, INT4 head, two-stage head (parts and all)
++static void time_heads(int O, int reps)
++{
++    const int K = HID, ng = K / 32;
++    const size_t mxb = (size_t)O / 16 * ng * 528, i4b = head_i4::bytes(O / 16, ng), i2b = head2::bytes(O);
++    std::vector<uint8_t> h(mxb);
++    for (size_t i = 0; i < mxb; ++i)
++    {
++        uint8_t v = (uint8_t)rnd(i, 7u);
++        if (i % 528 >= 512) v = (uint8_t)(116 + v % 6);
++        else if ((v & 0x7f) == 0x7f) v &= 0xbf;
++        h[i] = v;
++    }
++    uint8_t *dmx, *di4, *dcodes;
++    __half2* dsc;
++    CK(cudaMalloc(&dmx, mxb));
++    CK(cudaMemcpy(dmx, h.data(), mxb, cudaMemcpyHostToDevice));
++    CK(cudaMalloc(&di4, i4b));
++    head_i4::launch(dmx, di4, O / 16, ng, nullptr);
++#if DEC_I4PAIR
++    launch_i4pair(di4, O / 16, ng, 32, nullptr);
++#endif
++    CK(cudaMalloc(&dcodes, head2::code_bytes(O)));
++    CK(cudaMalloc(&dsc, head2::scale_bytes(O)));
++    head2::convert(dmx, reinterpret_cast<uint4*>(dcodes), dsc, O, nullptr);
++    __half* dx;
++    float *dy, *dcl;
++    int* dcand;
++    u32* xf;
++    CK(cudaMalloc(&dx, (size_t)8 * K * 2));
++    CK(cudaMemset(dx, 0x31, (size_t)8 * K * 2));
++    CK(cudaMalloc(&dy, (size_t)8 * O * 4));
++    CK(cudaMalloc(&dcl, (size_t)8 * head2::SL * 4));
++    CK(cudaMalloc(&dcand, (size_t)8 * head2::SL * 4));
++    CK(cudaMalloc(&xf, (size_t)K / 16 * 64 * 4 * g6mx::NT));
++    CK(cudaDeviceSynchronize());
++    head2::Bufs b;
++    b.codes = reinterpret_cast<const uint4*>(dcodes); b.scales = dsc; b.mx = dmx; b.cand = dcand; b.cl = dcl;
++    cudaEvent_t e0, e1;
++    CK(cudaEventCreate(&e0));
++    CK(cudaEventCreate(&e1));
++    auto timeit = [&](const std::function<void()>& f) {
++        for (int i = 0; i < 10; ++i) f();
++        CK(cudaEventRecord(e0));
++        for (int i = 0; i < reps; ++i) f();
++        CK(cudaEventRecord(e1));
++        CK(cudaEventSynchronize(e1));
++        CK(cudaGetLastError());
++        float ms = 0;
++        CK(cudaEventElapsedTime(&ms, e0, e1));
++        return 1e3 * ms / reps;
++    };
++    for (int M : {1, 3, 8})
++    {
++        Gemv gm, gi;
++        gm.make(dmx, bind::MXFP8, O, K, 1, 32, M, dx, xf, dy);
++        gi.make(di4, bind::INT4, O, K, 1, 32, M, dx, xf, dy);
++        const double tm = timeit([&] { gm.run(nullptr); });
++        const double ti = timeit([&] { gi.run(nullptr); });
++        const double ts = timeit([&] { head2::launch_screen(b.codes, b.scales, dx, K, dy, O, O, M, nullptr); });
++        const double tt = timeit([&] { head2::k_screen_top<<<M, 1024>>>(dy, O, O, dcand); });
++        const double tr = timeit([&] { head2::k_rescore<<<dim3(M, head2::SL / 8), 256>>>(dmx, dx, K, dcand, dy, O, dcl); });
++        const double ta = timeit([&] { head2::launch_front(b, dx, K, dy, O, O, M, nullptr); });
++        printf("TIME O=%d M=%d: MXFP8 GEMV %.1f us (%.1f MB, %.0f GB/s) | INT4 head %.1f us (%.1f MB, %.0f GB/s) | two-stage %.1f us = screen %.1f "
++               "(%.1f MB, %.0f GB/s) + top %.1f + rescore %.1f | vs INT4 %+.1f us\n",
++               O, M, tm, mxb / 1e6, mxb / tm / 1e3, ti, i4b / 1e6, i4b / ti / 1e3, ta, ts, i2b / 1e6, i2b / ts / 1e3, tt, tr, ta - ti);
++        fflush(stdout);
++    }
++    cudaFree(dmx); cudaFree(di4); cudaFree(dcodes); cudaFree(dsc); cudaFree(dx); cudaFree(dy); cudaFree(dcl); cudaFree(dcand); cudaFree(xf);
++}
++
++int main(int argc, char** argv)
++{
++    int reps = 0, O = 38784;
++    for (int i = 1; i < argc; ++i)
++    {
++        if (!strcmp(argv[i], "--time")) reps = i + 1 < argc && argv[i + 1][0] != '-' ? atoi(argv[++i]) : 200;
++        else if (!strcmp(argv[i], "--rows") && i + 1 < argc) O = atoi(argv[++i]);
++        else { printf("dhead2_test [--time [reps]] [--rows O]\n"); return 2; }
++    }
++    CK(cudaSetDevice(0));
++    CK(bind::init());
++    if (const char* e = head2::init()) { printf("%s\n", e); return 2; }
++    check(4096, 1234u);
++    if (reps > 0) time_heads(O, reps);
++    printf("%d PASS, %d FAIL\n", g_pass, g_fail);
++    return g_fail ? 1 : 0;
++}

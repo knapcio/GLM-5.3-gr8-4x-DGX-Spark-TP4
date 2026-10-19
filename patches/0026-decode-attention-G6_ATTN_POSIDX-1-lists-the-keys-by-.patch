@@ -1,0 +1,344 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Mon, 19 Oct 2026 02:30:46 +0200
+Subject: [PATCH 26/30] decode attention: G6_ATTN_POSIDX=1 lists the keys by
+ position at buckets up to 2048 (E1, default off)
+
+At a capacity <= 2048 the top-2048 selection keeps every key with a finite indexer score, i.e. every key at a
+position <= the row's own, so the indexer only decides the slots' order (the fp32 order of normalize and the
+context sums on every layer). With G6_ATTN_POSIDX=1 a full-index call of capacity <= 2048 writes the
+positional index instead (pos_index: slot j = key j up to the row's position, -1 after) and skips prep_index,
+index_scores and the selector; under G6_ATTN_FRONT the ramp takes prep_index's blocks of attn_front. The
+step then skips that layer's idx_q GEMV (posidx_step, decided from the replay entry the call runs, so it is
+skipped exactly where the call does not read it); under G6_IDXQ_SPLIT its gather still runs, so the gather
+fabric's collectives keep their order on every rank. append_index, idx_k and idx_w stay (the index cache is
+needed past 2048).
+
+Larger buckets (2049 keys and up), the shared layers' reuse, the CP entry points and the v2 prefill are
+unchanged. The set of keys and every key's score are those of the indexer path; normalize and context sum
+them in position order (E1, deterministic). A nonfinite indexer score no longer drops its key (error 4). The
+flag is read once, is in the S2 runtime signature, and is off by default: with it off nothing changes.
+---
+ KNOBS.md                |  1 +
+ docs/SETTINGS.md        |  1 +
+ engine/attn/attn.cu     | 31 ++++++++++++++++++++++++++----
+ engine/attn/attn.h      |  6 +++++-
+ engine/runtime/g6m4.cu  |  6 +++---
+ engine/runtime/rank.cuh | 42 ++++++++++++++++++++++++++++++++---------
+ engine/runtime/s2.cuh   | 10 ++++++++++
+ scripts/engine_args.sh  |  3 ++-
+ tools/launch/options.py |  1 +
+ 9 files changed, 83 insertions(+), 18 deletions(-)
+
+diff --git a/KNOBS.md b/KNOBS.md
+index c3eae0a..930baea 100644
+--- a/KNOBS.md
++++ b/KNOBS.md
+@@ -81,6 +81,7 @@ manifest instead.
+ | `ATTN_QT` | unset (0) | unset (0) | unset (0) | 1 = q and rope stored lane-transposed for the scores kernel (`G6_ATTN_QT`; needs `ATTN_SC2` 2 or 4; bit-exact) |
+ | `ATTN_FRONT` | unset (0) | unset (0) | unset (0) | 1 = a decode step's first attention kernels in one launch (`G6_ATTN_FRONT`; bit-exact) |
+ | `ATTN_CTX3_SP` | unset (0) | unset (0) | unset (0) | with `ATTN_CTX3`: 64 or 128 key slots per context partition instead of 256 (`G6_ATTN_CTX3_SP`; deterministic, not bit-exact) |
++| `ATTN_POSIDX` | unset (0) | unset (0) | unset (0) | 1 = decode steps in the buckets up to 2048 list the keys by position instead of running the indexer, which selects all of them there (`G6_ATTN_POSIDX`; deterministic, not bit-exact) |
+ | `KVB` | unset (bf16) | unset (bf16) | unset (bf16) | `fp8` = kv_b (UK / UV) as the release's block FP8 bytes and scales instead of their BF16 (`G6_KVB`; half the bytes, bit-exact). Needs `V2_DENSE` (a release boot) |
+ | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
+ | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
+diff --git a/docs/SETTINGS.md b/docs/SETTINGS.md
+index 663d5c1..57599e7 100644
+--- a/docs/SETTINGS.md
++++ b/docs/SETTINGS.md
+@@ -89,6 +89,7 @@ the short version.
+ | `G6_ATTN_CTX3` | 0 | decode attention context with one test per batch of slots instead of per slot: 1 / 2 = 16 / 32 pairs per batch over 256 dims per CTA, 3 / 4 = the same over 512. Overrides `G6_ATTN_CTX2`. FP8 KV only, same bits |
+ | `G6_ATTN_CTX3_HG` | 0 | with `G6_ATTN_CTX3`: heads per CTA, 2, 4 or 8; 0 = 4 up to 4 rows, then 8 |
+ | `G6_ATTN_CTX3_SP` | 0 | with `G6_ATTN_CTX3`: 64 or 128 key slots per context partition (32 or 16 partials, merged in order) instead of 256 (8): shorter chains, more CTAs. Replicated decode only (not the CP block). FP8 KV only. Deterministic, a different fp32 summation order (not the same bits) |
++| `G6_ATTN_POSIDX` | 0 | 1 = a full-index layer's decode attention at a capacity up to 2048 (the decode buckets up to 2048, where the top-2048 selects every key) lists the keys in position order instead of running the indexer query, scores and selection, and the step skips that layer's idx_q GEMV. Larger buckets, the CP block and prefill v2 are unchanged. Deterministic, a different fp32 summation order (not the same bits); a nonfinite indexer score no longer drops its key (error 4) |
+ | `G6_ATTN_SEL2` | 0 | decode index selection: the final sort as a rank by count over 8, 16, 32 or 64 CTAs per row. Same bits |
+ | `G6_IDX_GRP` | 0 | S2 batched decode steps: the indexer reads each key tile once for up to G = 1..64 rows of one session. Same bits |
+ | `G6_ATTN_QT` | 0 | 1 = decode absorb stores q and rope lane-transposed and the scores kernel reads them with 16 B loads. Needs `G6_ATTN_SC2` 2 or 4; not with `G6_AVP1`. FP8 KV only, same bits |
+diff --git a/engine/attn/attn.cu b/engine/attn/attn.cu
+index 3da7505..d9cbaa9 100644
+--- a/engine/attn/attn.cu
++++ b/engine/attn/attn.cu
+@@ -356,6 +356,18 @@ __device__ __forceinline__ void reuse_row(Input input,int start,int row){
+ }
+ template<class Input>
+ __global__ void reuse(Input input,int start){reuse_row(input,start,blockIdx.x);}
++// G6_ATTN_POSIDX (use_posidx, E1): a full-index call whose capacity is <= TOP selects every key with a finite indexer
++// score, i.e. every key at a position <= the row's own, so the indexer only sets the slots' order (the fp32 order of
++// normalize and context). The positional index lists the row's keys in position order instead: slot j = key j for
++// j <= the row's position, -1 after (the selector's padding). No indexer query, scores or selection.
++template<class Input>
++__device__ __forceinline__ void pos_index_row(Input input,int start,int row){
++    auto a=resolve(input);if(!a.active)return;const int r=start+row;FOR_ROW(a,input,r);
++    const int p=min(a.positions[r],a.live_context-1);
++    for(int j=threadIdx.x;j<TOP;j+=blockDim.x)a.indices[(int64_t)r*TOP+j]=j<=p?j:-1;
++}
++template<class Input>
++__global__ void pos_index(Input input,int start){pos_index_row(input,start,blockIdx.x);}
+ // G6_ATTN_FRONT=1 (attn_front_on; g6_attn_replay_run with one query tile): the step's front kernels in one launch of
+ // 256-thread blocks: [0, n) append_kv rows; then a full-index layer's append_index rows, one per block, the row run twice
+ // (threads 0-127 and 128-255, each on its own shared slot: the same bytes stored twice, the same error bits), and its
+@@ -363,12 +375,15 @@ __global__ void reuse(Input input,int start){reuse_row(input,start,blockIdx.x);}
+ // body is the kernel's own. They touch disjoint buffers (the MLA cache row; the index cache row; w.iq / w.weights from
+ // index_q, index_weight and positions; the indices from reuse_indices), so no block reads what another writes and the
+ // bytes are those of the separate launches. grid n * (index ? 18 : 2), block 256.
+-template<class Input>
++// POS (G6_ATTN_POSIDX, use_posidx): a full-index layer's prep_index rows are replaced by its pos_index rows, one per block
++// (they write only the indices); grid n * 3.
++template<bool POS=false,class Input>
+ __global__ void __launch_bounds__(256) attn_front(Input input,int n,half* iq,float* iw){
+     const int b=blockIdx.x,t=threadIdx.x;
+     if(b<n){append_kv_row(input,b);return;}
+     if(!iq){reuse_row(input,0,b-n);return;}
+     if(b<2*n){append_index_row<2>(input,b-n,t&127,t>>7);return;}
++    if constexpr(POS){pos_index_row(input,0,b-2*n);return;}
+     const int k=b-2*n;prep_index_row<2>(input,0,iq,iw,k/16,2*(k%16)+(t>>7),t&127,t>>7);
+ }
+ template<bool F8=false,class Input>
+@@ -640,7 +655,9 @@ static int& attn_front_on(){static int v=[]{const char* e=getenv("G6_ATTN_FRONT"
+ // scratch and before graph capture; in the S2 runtime signature, g6m4; tests may assign them, before sizing the scratch):
+ // G6_ATTN_CTX3_SP=64 / 128 (decode-small.cuh ctx_sp): run_body's context_pk3 calls over partitions of 64 / 128 slots (32 /
+ // 16 partials, merge_parts over them in order) instead of 256 (8): 4x / 2x the CTAs, each a 4x / 2x shorter slot chain.
+-// FP8 KV only.
++// FP8 KV only. G6_ATTN_POSIDX=1 (use_posidx): a full-index call of capacity <= TOP (the decode buckets up to 2048) takes
++// the positional index (pos_index) instead of prep_index + index_scores + the selector; larger capacities, shared layers
++// and the CP entry points are unchanged.
+ static int& attn_ctx3_sp(){static int v=[]{
+ #if G6_KV4
+     return 0;
+@@ -648,6 +665,8 @@ static int& attn_ctx3_sp(){static int v=[]{
+     const char* e=getenv("G6_ATTN_CTX3_SP");const int x=e?atoi(e):0;return x==64||x==128?x:0;
+ #endif
+     }();return v;}
++static int& attn_posidx(){static int v=[]{const char* e=getenv("G6_ATTN_POSIDX");return e&&atoi(e)==1?1:0;}();return v;}
++static bool use_posidx(const G6Attn& a){return attn_posidx()&&!a.reuse_indices&&a.context<=TOP;}
+ static bool al16(const void* p){return ((uintptr_t)p&15)==0;}
+ struct Work {
+     float *q,*rope,*weights,*si,*so,*prob,*parts,*context;
+@@ -821,9 +840,10 @@ static bool use_qt(const G6Attn& a,const Work& w,int n){
+ // front: attn_front already ran the first query tile's reuse / prep_index (g6_attn_replay_run, rows <= query_tile)
+ template<class Input>
+ static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t stream,bool front=false){
+-    cudaError_t e;
++    cudaError_t e;const bool pos=use_posidx(a);
+     for(int start=0;start<a.rows;start+=a.query_tile){int n=std::min(a.rows-start,a.query_tile);const bool fr=front&&start==0;
+         if(a.reuse_indices){AMARK(1);if(!fr)ga::reuse<<<n,256,0,stream>>>(input,start);}
++        else if(pos){if(!fr)ga::pos_index<<<n,256,0,stream>>>(input,start);AMARK(1);}
+         else{if(!fr)prep_index<<<dim3(n,32),128,0,stream>>>(input,start,w.iq,w.weights);
+             if(attn_idx_grp()&&!idx_keys_shared(a,n))launch_index_scores_g(a,input,w,start,n,attn_idx_grp(),stream);
+             else LAUNCH_INDEX_SCORES(a,input,w,start,n,stream);
+@@ -996,6 +1016,8 @@ static bool cp_ok(const G6Attn* a){return a&&valid(*a)&&a->cp_nr>=2&&a->cp_nr<=8
+ }
+ extern "C" size_t g6_attn_scratch_bytes(const G6Attn* a){if(!a||!ga::valid(*a))return 0;return ga::workspace(*a,nullptr).total;}
+ extern "C" int g6_attn_ctx_sp(void){return ga::attn_ctx3_sp();}
++extern "C" int g6_attn_posidx(void){return ga::attn_posidx();}
++extern "C" int g6_attn_posidx_takes(const G6Attn* a){return a&&ga::use_posidx(*a)?1:0;}
+ extern "C" int g6_attn_append(const G6Attn* a,void* s){
+     if(!a||!ga::valid(*a)||!a->kv_a||!a->kv_norm||!a->mla_cache||!a->positions||!a->block_table||!a->error)return (int)cudaErrorInvalidValue;
+     cudaStream_t stream=(cudaStream_t)s;ga::append_kv<<<a->rows,256,0,stream>>>(*a);
+@@ -1037,7 +1059,8 @@ extern "C" int g6_attn_replay_run(const G6AttnReplay* r,void* s){
+     ga::validate_replay<<<1,256,0,stream>>>(a,r->cell);
+     ga::ReplayInput input{a,r->cell};
+     const bool front=ga::attn_front_on()&&a.rows<=a.query_tile;   // G6_ATTN_FRONT: one query tile
+-    if(front)ga::attn_front<<<a.rows*(a.reuse_indices?2:18),256,0,stream>>>(input,a.rows,a.reuse_indices?nullptr:w.iq,w.weights);
++    if(front&&ga::use_posidx(a))ga::attn_front<true><<<a.rows*3,256,0,stream>>>(input,a.rows,w.iq,w.weights);
++    else if(front)ga::attn_front<<<a.rows*(a.reuse_indices?2:18),256,0,stream>>>(input,a.rows,a.reuse_indices?nullptr:w.iq,w.weights);
+     else{ga::append_kv<<<a.rows,256,0,stream>>>(input);
+         if(!a.reuse_indices)ga::append_index<<<a.rows,128,0,stream>>>(input);}
+     AMARK(0);
+diff --git a/engine/attn/attn.h b/engine/attn/attn.h
+index b78347c..6603bc3 100644
+--- a/engine/attn/attn.h
++++ b/engine/attn/attn.h
+@@ -37,8 +37,12 @@ struct G6Attn {
+ #endif
+ };
+ extern "C" size_t g6_attn_scratch_bytes(const G6Attn*);
+-// G6_ATTN_CTX3_SP as the kernels read it (attn.cu; read once): 64 / 128, 0 = off. For the S2 runtime signature.
++// Round 10 E1 flags as the kernels read them (attn.cu; read once): G6_ATTN_CTX3_SP (64 / 128, 0 = off), G6_ATTN_POSIDX
++// (1 / 0), and whether a call with these arguments takes the positional index (a full-index call of capacity <= 2048;
++// the runtime then skips that layer's idx_q GEMV, which the call does not read). For the S2 runtime signature.
+ extern "C" int g6_attn_ctx_sp(void);
++extern "C" int g6_attn_posidx(void);
++extern "C" int g6_attn_posidx_takes(const G6Attn*);
+ extern "C" void (*g6_attn_mark)(int stage,void* stream);
+ extern "C" int g6_attn_rope_init(int cap,void* stream);   // decode RoPE table when no QO attention builds it   // decode profile hook (attn.cu AMARK); null = off
+ extern "C" int g6_attn_run(const G6Attn*,void* scratch,size_t bytes,void* stream);
+diff --git a/engine/runtime/g6m4.cu b/engine/runtime/g6m4.cu
+index 632c884..33cf11a 100644
+--- a/engine/runtime/g6m4.cu
++++ b/engine/runtime/g6m4.cu
+@@ -1506,8 +1506,8 @@ int main(int argc, char** argv)
+             bc.head_ip = cfg.ips[0];
+             bc.directory = s2dir;
+             bc.port = (uint16_t)s2port;
+-            if (g6_attn_ctx_sp())   // round 10 E1 attention flags (attn.cu), read once before the bindings
+-                fprintf(stderr, "# rank %d: decode attention E1: G6_ATTN_CTX3_SP %d\n", R, g6_attn_ctx_sp());
++            if (g6_attn_ctx_sp() || g6_attn_posidx())   // round 10 E1 attention flags (attn.cu), read once before the bindings
++                fprintf(stderr, "# rank %d: decode attention E1: G6_ATTN_CTX3_SP %d G6_ATTN_POSIDX %d\n", R, g6_attn_ctx_sp(), g6_attn_posidx());
+             bc.runtime_signature = "g6m4 s2 below " + std::to_string(s2_below) + " cap " + std::to_string(cap) + " layers " + layers_s +
+                 " mp " + std::to_string(MP) + " lanes " + std::to_string(two ? 2 : 1) + " mtp " + std::to_string(mtp) + " chunk " +
+                 std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " split 3 own " + std::to_string(pf_own) +
+@@ -1527,7 +1527,7 @@ int main(int argc, char** argv)
+                 (dsel_posclk ? " dselposclk 1" : "") +
+                 (dsel_model ? " dselmodel " + std::to_string(dsel_model) + " " + dsel_tab.str() : "") + s2::kstopb_sig(kstop.b) +
+                 (cp_step ? " cpsr " + std::to_string(cp_step) + (sc.cp_seg ? " seg" : "") : "") +
+-                (g6_attn_ctx_sp() ? " ctxsp " + std::to_string(g6_attn_ctx_sp()) : "");
++                (g6_attn_ctx_sp() ? " ctxsp " + std::to_string(g6_attn_ctx_sp()) : "") + (g6_attn_posidx() ? " posidx 1" : "");
+             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
+                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
+             g6s2::ControlLinks links = g6s2::bootstrap(bc);
+diff --git a/engine/runtime/rank.cuh b/engine/runtime/rank.cuh
+index 137ff50..78927a9 100644
+--- a/engine/runtime/rank.cuh
++++ b/engine/runtime/rank.cuh
+@@ -858,6 +858,7 @@ inline const bind::Layer& s2_layer(Model& m, int i, int M);
+ inline const bind::Layer& layer_base(Model& m, int i, int M);
+ inline bool s2_cp_step(const Model& m);
+ inline G6AttnReplay* s2_cp_replay(Model& m, int i, int M);
++inline const G6AttnReplay* s2_replay(Model& m, int i, int M);
+ inline const bind::Layer& layer_for(Model& m, int i, int M) { return m.s2on ? s2_layer(m, i, M) : layer_base(m, i, M); }
+ #define G6RT_LAYER_BASE layer_base
+ #else
+@@ -1011,9 +1012,29 @@ inline void l2pf_window(Model& m, int w, int from, int i, int M, const g6::Fabri
+     l2pf::window(w, from, i, l2pf::plan_layer(layer_for(m, i, M), y.ab.args.uk, y.ab.args.uv, y.ab.args.uks, y.ab.args.uvs), s, st);
+ }
+ 
++// G6_ATTN_POSIDX (attn.cu use_posidx, E1): layer i's attention call in this step takes the positional index (an indexer
++// layer whose replay entry has a capacity <= 2048), so it does not read idx_q and the step skips idx_q's GEMV. Decided at
++// launch / capture from the replay entry the call runs (g6_attn_posidx_takes on its fixed arguments), so the GEMV is only
++// skipped where the call takes it; a plain call (no replay entry) keeps the GEMV (unread when the call takes it). The CP
++// block never asks (launch_attn_cp: its indexer runs).
++inline bool posidx_step(Model& m, int i, int M)
++{
++    if (!g6_attn_posidx() || !m.layers[i].indexer) return false;
++#ifdef DEC_S2
++    if (m.s2on)
++    {
++        const G6AttnReplay* r = s2_replay(m, i, M);
++        return r && g6_attn_posidx_takes(&r->fixed);
++    }
++#endif
++    const Layer& y = m.layers[i];
++    return m.graph && y.rp_on[m.cur][M] && g6_attn_posidx_takes(&y.rp[m.cur][M].fixed);
++}
++
+ // G6_QA_SPLIT: this rank's tiles of the input GEMVs, publish, (mode 2: kv_a / idx in full,) gather, q_a norm
+ // P (QsPh): the phase the loopback driver wants; the get starts the next phase
+-inline void launch_layer_in_qs(Model& m, int i, const Layer& y, const bind::Layer& b, int M, cudaStream_t st, QsPh& P)
++// noiq (posidx_step): idx_q is skipped, so the q_a gather window prefetches from q_b
++inline void launch_layer_in_qs(Model& m, int i, const Layer& y, const bind::Layer& b, int M, cudaStream_t st, QsPh& P, bool noiq = false)
+ {
+     const QSplit& Q = m.qs;
+     const int c = Q.cqa[i];
+@@ -1033,7 +1054,7 @@ inline void launch_layer_in_qs(Model& m, int i, const Layer& y, const bind::Laye
+             else { bind::launch(b.kv_a, st); bind::launch(b.idx_k, st); bind::launch(b.idx_w, st); }
+         }
+         dmark(DP_IDXKW, st);
+-        l2pf_window(m, l2pf::W_Q, l2pf::T_IDXQ, i, M, &Q.g, c, (size_t)M * Q.geo[c].wmax * 2, st);
++        l2pf_window(m, l2pf::W_Q, noiq ? l2pf::T_QB : l2pf::T_IDXQ, i, M, &Q.g, c, (size_t)M * Q.geo[c].wmax * 2, st);
+     }
+     P.next();
+     if (!P.on()) return;
+@@ -1044,7 +1065,9 @@ inline void launch_layer_in_qs(Model& m, int i, const Layer& y, const bind::Laye
+ 
+ // q_a_norm's fragment table, q_b (this rank's heads) and idx_q. G6_IDXQ_SPLIT on an indexer layer: idx_q's tiles first,
+ // published, then q_b while the gather is on the wire, then the gather (the outputs are the same; only the order changes)
+-inline void launch_qb_idxq(Model& m, int i, const bind::Layer& b, int M, cudaStream_t st, QsPh& P)
++// noiq (posidx_step): no idx_q GEMV. Under G6_IDXQ_SPLIT its gather still runs (put of the unread idx_q columns, get), so
++// the gather fabric's collectives keep their order and sizes on every rank
++inline void launch_qb_idxq(Model& m, int i, const bind::Layer& b, int M, cudaStream_t st, QsPh& P, bool noiq = false)
+ {
+     const int c = m.qs.iq ? m.qs.ciq[i] : -1;
+     if (!P.on())                              // not this phase: only the gather's get may be (it starts the next one)
+@@ -1058,10 +1081,10 @@ inline void launch_qb_idxq(Model& m, int i, const bind::Layer& b, int M, cudaStr
+     if (c < 0)
+     {
+         bind::launch_q_b(b, st);
+-        bind::launch(b.idx_q, st);
++        if (!noiq) bind::launch(b.idx_q, st);
+         return;
+     }
+-    bind::launch(b.idx_q, st);
++    if (!noiq) bind::launch(b.idx_q, st);
+     qs_put(m, c, M, st);
+     bind::launch_q_b(b, st);
+     l2pf_window(m, l2pf::W_Q, l2pf::T_UK, i, M, &m.qs.g, c, (size_t)M * m.qs.geo[c].wmax * 2, st);
+@@ -1070,9 +1093,9 @@ inline void launch_qb_idxq(Model& m, int i, const bind::Layer& b, int M, cudaStr
+ }
+ 
+ // the GEMVs on the layer input (q_a + its norm, kv_a, the indexer's k and weights): one gv_multi launch when bound
+-inline void launch_layer_in(Model& m, int i, const Layer& y, const bind::Layer& b, int M, cudaStream_t st, QsPh& P)
++inline void launch_layer_in(Model& m, int i, const Layer& y, const bind::Layer& b, int M, cudaStream_t st, QsPh& P, bool noiq = false)
+ {
+-    if (m.qs.mode) { launch_layer_in_qs(m, i, y, b, M, st, P); return; }
++    if (m.qs.mode) { launch_layer_in_qs(m, i, y, b, M, st, P, noiq); return; }
+     if (!P.on()) return;
+     if (b.x_in.n)
+     {
+@@ -1267,6 +1290,7 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t
+ #endif
+     Layer& y = m.layers[i];
+     const bind::Layer& b = layer_for(m, i, M);
++    const bool noiq = posidx_step(m, i, M);   // G6_ATTN_POSIDX
+     QsPh P{qph};
+     if (P.on())
+     {
+@@ -1277,8 +1301,8 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t
+         bind::launch(b.xf_x, st);
+ #endif
+     }
+-    launch_layer_in(m, i, y, b, M, st, P);
+-    launch_qb_idxq(m, i, b, M, st, P);
++    launch_layer_in(m, i, y, b, M, st, P, noiq);
++    launch_qb_idxq(m, i, b, M, st, P, noiq);
+     if (!P.on()) return;                      // an earlier gather phase
+     dmark(DP_QB, st);
+     l2pf_window(m, l2pf::W_T, l2pf::T_UK, i, M, nullptr, 0, 0, st);
+diff --git a/engine/runtime/s2.cuh b/engine/runtime/s2.cuh
+index 3c81d78..7e4ed36 100644
+--- a/engine/runtime/s2.cuh
++++ b/engine/runtime/s2.cuh
+@@ -640,6 +640,16 @@ inline G6AttnReplay* s2_cp_replay(Model& m, int i, int M)
+     return it->second.get();
+ }
+ 
++// the batched replay entry of layer i for the current step (s2_prepare made it); nullptr: per-session calls, a CP step,
++// or no entry yet (posidx_step: then the step keeps idx_q)
++inline const G6AttnReplay* s2_replay(Model& m, int i, int M)
++{
++    const S2Model& s = *m.s2;
++    if (!s.batch || s2_cp_step(m)) return nullptr;
++    auto it = s.brp.find(std::make_tuple(s2_bucket(s), i, M));
++    return it == s.brp.end() ? nullptr : it->second.get();
++}
++
+ inline void s2_attention(Model& m, int i, int M, cudaStream_t st)
+ {
+     S2Model& s = *m.s2;
+diff --git a/scripts/engine_args.sh b/scripts/engine_args.sh
+index 2ee8091..3520d39 100644
+--- a/scripts/engine_args.sh
++++ b/scripts/engine_args.sh
+@@ -101,8 +101,9 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
+   ENGINE_ENV="$ENGINE_ENV${IDX_GRP:+ G6_IDX_GRP=$IDX_GRP}"
+   ENGINE_ENV="$ENGINE_ENV${ATTN_QT:+ G6_ATTN_QT=$ATTN_QT}"
+   ENGINE_ENV="$ENGINE_ENV${ATTN_FRONT:+ G6_ATTN_FRONT=$ATTN_FRONT}"
+-  # deterministic fp-order attention variants (ATTN_CTX3_SP; E1, docs/SETTINGS.md): off unless set
++  # deterministic fp-order attention variants (ATTN_CTX3_SP, ATTN_POSIDX; E1, docs/SETTINGS.md): off unless set
+   ENGINE_ENV="$ENGINE_ENV${ATTN_CTX3_SP:+ G6_ATTN_CTX3_SP=$ATTN_CTX3_SP}"
++  ENGINE_ENV="$ENGINE_ENV${ATTN_POSIDX:+ G6_ATTN_POSIDX=$ATTN_POSIDX}"
+   # kv_b (UK / UV) as the release's block FP8 (KVB=fp8, #50; docs/SETTINGS.md): BF16 unless set. Needs V2_DENSE
+   ENGINE_ENV="$ENGINE_ENV${KVB:+ G6_KVB=$KVB}"
+   return 0
+diff --git a/tools/launch/options.py b/tools/launch/options.py
+index ddd6e76..f0775e6 100644
+--- a/tools/launch/options.py
++++ b/tools/launch/options.py
+@@ -106,6 +106,7 @@ KEYS = {
+     'ATTN_CTX2': ('cluster', None, 'decode attention context variant (G6_ATTN_CTX2)'),
+     'ATTN_CTX3': ('cluster', None, 'decode attention context, per-batch states (G6_ATTN_CTX3)'),
+     'ATTN_CTX3_SP': ('cluster', None, 'ATTN_CTX3 slots per context partition, 64 or 128 (G6_ATTN_CTX3_SP; E1)'),
++    'ATTN_POSIDX': ('cluster', None, 'positional index at decode buckets <= 2048 (G6_ATTN_POSIDX; E1)'),
+     'ATTN_SEL2': ('cluster', None, 'decode index selection by rank (G6_ATTN_SEL2)'),
+     'IDX_GRP': ('cluster', None, 'decode indexer row grouping (G6_IDX_GRP)'),
+     'ATTN_QT': ('cluster', None, 'decode attention transposed query (G6_ATTN_QT)'),
