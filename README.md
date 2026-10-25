@@ -1,7 +1,7 @@
 # Full GLM-5.3 on 4× NVIDIA DGX Spark with gr8 (TP4)
 
 A recipe for serving full [GLM-5.3](https://huggingface.co/zai-org/GLM-5.3) on four DGX Sparks with tensor parallelism
-4, using the [gr8](https://github.com/kindlingai/gr8) engine by kindlingai at a pinned upstream commit, plus thirty
+4, using the [gr8](https://github.com/kindlingai/gr8) engine by kindlingai at a pinned upstream commit, plus thirty-one
 small patches (three of them are upstream's own open PR [#98](https://github.com/kindlingai/gr8/pull/98), backported).
 Many of the earlier releases' levers are now upstream code: the pinned commit includes the fabric MTU fix, the GEMV
 splits, the INT4 draft heads and drafter body, the route overlap, the three rounds of decode attention kernels, the MTP
@@ -15,8 +15,9 @@ fork, no weights and no images: the engine comes from upstream at `c53b5b8`, the
 image from upstream's registry. Every patch is behind a flag that defaults to off, so the patched engine behaves as
 upstream until `G6ENV_X` turns the levers on. The exceptions are the launcher's share-limit rule (0011, part of the
 launcher), the S2 drafter-shape fixes (0015, always on but invisible to the B=8 drafter: they only add capture shapes
-and row headroom), and 0016, which turns SELX prefill selection on by default from 53248-token contexts; 0012 changes
-the buckets only when `SHARE_LIMIT` is not a power of two. Upstream at `c53b5b8` turns some of its merged levers on by
+and row headroom), 0016, which turns SELX prefill selection on by default from 53248-token contexts, and 0031, the
+steering fix below (it changes nothing without a shared-scope steering profile); 0012 changes the buckets only when
+`SHARE_LIMIT` is not a power of two. Upstream at `c53b5b8` turns some of its merged levers on by
 default when serving (`G6_QA_SPLIT=2`, `G6_DRAFT_PAR=2`, `G6_MTP_KSTOP=2` and others, upstream #96); this recipe sets
 the values it measured explicitly in `G6ENV_X`. The serving setup also compacts the host memory on every box before
 each start ([Build and run](#build-and-run), step 5).
@@ -25,9 +26,18 @@ each start ([Build and run](#build-and-run), step 5).
 contexts up to 2048 tokens. It is deterministic, but its output is not byte-identical to upstream's (exactness class
 E1, [Levers](#levers)). To get upstream's summation order, remove `G6_ATTN_POSIDX=1` from `G6ENV_X`.
 
-Release **v0.9**, 2026-10-19. The tables below are this release's measurements. What changed in each release, and by
-how much, is in [CHANGELOG.md](CHANGELOG.md); A/B measurements against earlier releases and the upstream baseline are
-in [docs/history.md](docs/history.md).
+**Steering fix (0031).** In v0.9 and earlier (and upstream gr8 at `c53b5b8`), with a shared-scope steering profile
+loaded (for example jspark-ablit's `ablit-behavior-v1`), the MoE shared-expert steering was skipped in every decode
+step while two or more sessions were active (S2 mode): attention and dense layers were steered, the 47 steered MoE
+layers were not. A request that decoded alone, and prefill, were fully steered. 0031 fixes it
+([kindlingai/gr8#196](https://github.com/kindlingai/gr8/issues/196)). Without a steering profile nothing changes.
+
+Release **v0.10**, 2026-10-25. The speed and quality tables below were measured on v0.9 (2026-10-19) and were not
+re-measured for v0.10: its only change is 0031, which leaves the engine's arguments and device code unchanged without a
+steering profile, so single-session decode and every table below are unaffected. With the shared-scope profile forced on
+every request, C1 was unchanged and C2 / C4 aggregate measured −1.4 % / −0.5 % against v0.9 with the same profile
+([Quality](#quality)). What changed in each release, and by how much, is in [CHANGELOG.md](CHANGELOG.md); A/B
+measurements against earlier releases and the upstream baseline are in [docs/history.md](docs/history.md).
 
 ## speedbench
 
@@ -127,6 +137,7 @@ mapped in [CHANGELOG.md](CHANGELOG.md).
 | 0027 | attnk bench: the E1 arms of 0025 and 0026 (determinism, what must not change, the error against stock, timing) and `engine/attn/tests/attnk_r10a.sh`, the sweep | — (bench) | bench only | knapcio |
 | 0029 | MTP first form, last row only: a first-form draft step of a + 1 rows exists to write layer 78's caches for its first a rows, and only the last row's token, log-probability and hidden state are read. The caches are written in the attention block, before the MoE, so the other rows skip layer 78's routed experts (they keep the shared expert); the attention, the head and every collective run as before | `G6_MTP_LASTROW=1` | bit-exact | knapcio |
 | 0030 | MTP draft head in two stages: a 2-bit g32 screen of the rank's vocab slice (74.5 MB per rank at TP=4, made at boot from the MXFP8 head; the INT4 head is 134 MB), then the exact MXFP8 logits of the screen's 64 best rows per draft row. Draft steps of up to 8 rows; wider steps keep the INT4 head. The DFlash2 head is unchanged. 74.5 MB more device memory per rank | `G6_DRAFT_HEAD2=1` | drafting | knapcio |
+| 0031 | Steering fix for S2 batched decode: the S2 layers take the same shared-scope steering of the MoE shared-expert finalize as solo decode (one helper sets it for both bindings; an S2 binding whose steering differs from the solo one stops the engine). With a shared-scope profile every rank prints `steering S2: X of Y S2 MoE layer bindings carry the shared-scope finalize steering`, and the S2 runtime signature carries `s2steer 1`, so a rank without the fix cannot join. Host code only; `s2_steer_test` compares each S2 row against its own solo launch, byte for byte ([kindlingai/gr8#196](https://github.com/kindlingai/gr8/issues/196)) | always on (acts only with a shared-scope steering profile) | bit-exact without a profile; with one, batched steps are now steered as solo steps are | knapcio; steering by Jake Harris and Matt Mastracci, S2 / K1 by kindlingai |
 
 The measured contribution of each lever is in [docs/history.md](docs/history.md#per-lever-contributions).
 
@@ -182,6 +193,7 @@ upstream's; engaged, the sessions take turns, which changes which rows share a s
 | Route overlap exactness | identical T=0 output on the four-box cluster; byte-compared by `engine/kernels/tests/k1_ovl_test.cu` |
 | L2 prefetch and MoE split / translation prefetch exactness (`G6_L2PF`, `G6_K1_SPLIT`, `G6_K1_TLBW`) | byte-identical in `l2pf_bench` and `k1_audit`; T=0 top-20 logprobs on the 75 qeval prompts identical to the configuration without them, 75/75 prompts, KL 0 (fresh boot each) |
 | CP one-chain attention (`G6_CP_ONECHAIN=1`) | the merged call's partials byte-identical to the three separate calls (`engine/attn/tests/cpgroups.cu`); identical T=0 decode at 70K / 80K / 90K-token prompts (same output SHA as the flags-off boot) |
+| Steering fix (0031), with `ablit-behavior-v1` forced on every request | `s2_steer_test` on one GB10: 9,873 checks with DEC_SLOT (as served) and 5,128 without, 0 failures; also built for TP3 and TP6, 9,873 checks each, 0 failures. On the cluster (2026-10-24, the v0.9 configuration plus the profile): every rank prints `steering S2: 1410 of 2250` (47 of 75 MoE layers); T=0 top-20 logprobs on the 75 qeval prompts identical to v0.9 with the same profile (75/75, KL 0: solo decode unchanged); exploratory: at c2 / c4 the steered sessions' truncated top-20 logprobs were 2.4–2.7× closer to the same prompts decoded alone (KL 1.88e-2 / 1.92e-2 → 8.0e-3 / 7.1e-3, over the positions where each arm still followed the solo text, so the arms scored different position sets); RigMark concurrency, two boots per arm: C1 47.4 [53.1] vs 47.5 [53.6], C2 60.4 [35.7] vs 61.2 [35.5] (−1.4 % aggregate), C4 75.4 [23.4] vs 75.8 [23.2] (−0.5 %) |
 | Ninth decode bucket (`SHARE_LIMIT=98304`) | with a power-of-two limit the buckets, graphs and outputs are unchanged (host tests of `context_buckets`); a ninth bucket regroups verify rows, so its T=0 output is not comparable byte for byte (drafting class) |
 
 qeval is the 75-task quality screen from the earlier
@@ -298,8 +310,11 @@ and KL checks against earlier configurations are in [docs/history.md](docs/histo
   with S such sessions a session waits about ceil(S / 2) − 1 rounds between its own (three rounds with eight long
   sessions); not measured separately for this release. Without the cap the head
   box can run out of host memory.
-- **Upstream's steering profiles were not measured with these flags.** The pinned commit adds steering support
-  (upstream #69–#81, #45); this recipe neither uses nor tested it.
+- **Steering profiles are optional and not part of the measured configuration.** The pinned commit adds steering
+  support (upstream #69–#81, #45). Only jspark-ablit's `ablit-behavior-v1` (shared scope, forced on every request) was
+  run with these flags, for the checks of 0031 (Quality); the speed tables above are without a profile. In v0.9 and
+  earlier a shared-scope profile was not applied to the MoE shared expert while two or more sessions decoded (fixed in
+  0031, [kindlingai/gr8#196](https://github.com/kindlingai/gr8/issues/196)).
 - **Code decode varies more than prose** between runs and between short screens and full runs.
 - **Verify numerics are not row-count invariant in upstream gr8.** A step that verifies 3 rows and one that verifies 8
   can sum in a different order. T=0 output in upstream also depends on prefix-cache state (a cold prompt and a cached
@@ -342,7 +357,7 @@ gr8 expects, and about 90 GB of disk per box for its part of the model.
    engine and places it in the pinned upstream image:
 
    ```bash
-   docker buildx build --platform linux/arm64 -t gr8-glm53-recipe:v0.9 --load .
+   docker buildx build --platform linux/arm64 -t gr8-glm53-recipe:v0.10 --load .
    ```
 
    Use the same image on all four boxes (build it on each, or `docker save` / `docker load`).

@@ -27,11 +27,18 @@
 - **spectra-kindling** (kindlingai): upstream gr8's open PR [#98](https://github.com/kindlingai/gr8/pull/98), kv_b as
   the release's block FP8 (`G6_KVB=fp8`), carried here as patches 0017–0019 with authorship kept (still open upstream at
   the pinned commit); MIT like the rest of gr8.
-- **knapcio**: the other twenty-seven patches (DSel experiments and cost overrides, the DSel cost model and its table
+- **Jake Harris (jakejharris)**: per-request activation steering and the jspark-ablit profile `ablit-behavior-v1`
+  (upstream [#45](https://github.com/kindlingai/gr8/pull/45)), the feature that patch 0031 fixes for batched decode.
+  The profile is not included or required here.
+- **Matt Mastracci (kindlingai)**: the extracted and hardened steering series in upstream gr8 (#69–#81: profile
+  contracts and artifacts, request identity and row scales, the shared-expert steering finalizers, verified local
+  profiles and the launcher's profile loading), which 0031 builds on; and, with the gr8 contributors, the S2 batched
+  decode runtime and the K1 MoE kernel whose S2 bindings 0031 completes.
+- **knapcio**: the other twenty-eight patches (DSel experiments and cost overrides, the DSel cost model and its table
   tool, the paced L2 prefetch and its FP8 targets, the MoE split table and translation prefetch, the launch share-limit
   rule and the ninth decode bucket, the one-chain CP attention call, the per-session confidence stop in shared rounds,
   the drafter-shape fixes, the SELX default, the CP step-row cap, the positional attention index, the MTP last-row
-  routing, the two-stage MTP draft head, and the experiments and tests that are off: the router tile split, the
+  routing, the two-stage MTP draft head, the S2 steering fix, and the experiments and tests that are off: the router tile split, the
   64/128-slot context partitions, the attnk round-10 arms and a DSel host-test fix); the levers now merged upstream
   (the fabric MTU negotiation, the replicated-GEMV splits, the INT4 draft heads and drafter body, the shared-expert
   stream overlap, three rounds of decode attention kernels, the MTP confidence stop with its K-stop cap, DFlash2 after

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Mon, 19 Oct 2026 02:30:46 +0200
-Subject: [PATCH 26/30] decode attention: G6_ATTN_POSIDX=1 lists the keys by
+Subject: [PATCH 26/31] decode attention: G6_ATTN_POSIDX=1 lists the keys by
  position at buckets up to 2048 (E1, default off)
 
 At a capacity <= 2048 the top-2048 selection keeps every key with a finite indexer score, i.e. every key at a

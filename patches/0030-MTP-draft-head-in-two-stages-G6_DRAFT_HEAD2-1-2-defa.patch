@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Mon, 19 Oct 2026 02:53:14 +0200
-Subject: [PATCH 30/30] MTP draft head in two stages: G6_DRAFT_HEAD2=1|2
+Subject: [PATCH 30/31] MTP draft head in two stages: G6_DRAFT_HEAD2=1|2
  (default off, experimental)
 
 kernels/head2.cuh: a 2-bit g32 screen of the rank's vocab slice (74.5 MB at TP4 instead of 134 MB INT4 / 246 MB

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Mon, 19 Oct 2026 02:30:46 +0200
-Subject: [PATCH 27/30] attnk: round 10 E1 arms (SP = G6_ATTN_CTX3_SP, POS =
+Subject: [PATCH 27/31] attnk: round 10 E1 arms (SP = G6_ATTN_CTX3_SP, POS =
  G6_ATTN_POSIDX) and attnk_r10a.sh
 
 An E1 arm is checked for determinism (every byte of repeated poisoned calls equal), for what must not change

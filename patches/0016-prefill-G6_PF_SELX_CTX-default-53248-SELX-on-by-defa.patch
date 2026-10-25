@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Sun, 18 Oct 2026 00:57:40 +0200
-Subject: [PATCH 16/30] prefill: G6_PF_SELX_CTX default 53248 (SELX on by
+Subject: [PATCH 16/31] prefill: G6_PF_SELX_CTX default 53248 (SELX on by
  default in v0.7)
 
 ---

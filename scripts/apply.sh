@@ -7,7 +7,7 @@ set -euo pipefail
 
 GR8_URL=${GR8_URL:-https://github.com/kindlingai/gr8}
 GR8_COMMIT=c53b5b869818950a96a9b72c647d4b156b057127      # upstream main, 2026-10-18
-EXPECTED_TREE=336ec05ee8f285de533caaa7545773168892659c   # git tree id after the 30 patches; the measured engine was built from a tree that differs only in four comment lines (0030)
+EXPECTED_TREE=67de5b7ce4d44db24352cc323f636eae906f2209   # git tree id after the 31 patches; the measured engines were built from trees that differ only in comments, test messages and build.sh's test list (0030, 0031)
 
 here=$(cd "$(dirname "$0")/.." && pwd)
 dir=${1:-gr8}

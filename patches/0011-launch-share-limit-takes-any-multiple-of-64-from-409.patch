@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Fri, 16 Oct 2026 04:23:20 +0200
-Subject: [PATCH 11/30] launch: --share-limit takes any multiple of 64 from
+Subject: [PATCH 11/31] launch: --share-limit takes any multiple of 64 from
  4096
 
 The engine accepts any G6_CP_R that is a multiple of a KV page and inserts it as a decode bucket boundary

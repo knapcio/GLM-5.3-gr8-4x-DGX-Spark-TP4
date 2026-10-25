@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: spectra-kindling <spectra-kindling@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 03:21:47 -0400
-Subject: [PATCH 17/30] D2 (#50): kv_b (UK / UV) as the release's block FP8,
+Subject: [PATCH 17/31] D2 (#50): kv_b (UK / UV) as the release's block FP8,
  G6_KVB=fp8 (default off, bit-exact)
 
 ---

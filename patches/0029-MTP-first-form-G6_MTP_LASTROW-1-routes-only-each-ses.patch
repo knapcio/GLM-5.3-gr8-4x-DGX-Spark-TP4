@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Mon, 19 Oct 2026 02:30:48 +0200
-Subject: [PATCH 29/30] MTP first form: G6_MTP_LASTROW=1 routes only each
+Subject: [PATCH 29/31] MTP first form: G6_MTP_LASTROW=1 routes only each
  session's last row through layer 78's experts (default off)
 
 A first-form draft step of a+1 rows exists to write layer 78's caches for rows 0..a-1; only the last row's

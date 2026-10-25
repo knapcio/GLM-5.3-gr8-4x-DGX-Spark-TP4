@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Fri, 16 Oct 2026 02:27:27 +0200
-Subject: [PATCH 08/30] s2_dsel_table.py: measurement boot usage removes the
+Subject: [PATCH 08/31] s2_dsel_table.py: measurement boot usage removes the
  model and G6_DRAFT_PAR and appends the diagnostics
 
 ---

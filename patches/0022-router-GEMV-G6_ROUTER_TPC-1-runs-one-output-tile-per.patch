@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Sun, 18 Oct 2026 19:54:16 +0200
-Subject: [PATCH 22/30] router GEMV: G6_ROUTER_TPC=1 runs one output tile per
+Subject: [PATCH 22/31] router GEMV: G6_ROUTER_TPC=1 runs one output tile per
  CTA (16 CTAs, not 8); same bits
 
 ---

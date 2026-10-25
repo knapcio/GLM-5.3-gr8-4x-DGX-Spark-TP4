@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Fri, 16 Oct 2026 04:24:27 +0200
-Subject: [PATCH 12/30] decode buckets: nine slots, seven doublings, so an R
+Subject: [PATCH 12/31] decode buckets: nine slots, seven doublings, so an R
  off the doubling no longer drops the 2048 bucket
 
 With eight slots a SHARE_LIMIT such as 98304 filled the list (2048 .. 131072, the cap) and context_buckets merged

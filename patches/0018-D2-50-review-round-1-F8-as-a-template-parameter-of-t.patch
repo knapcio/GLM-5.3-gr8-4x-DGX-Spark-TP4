@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: spectra-kindling <spectra-kindling@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 04:41:35 -0400
-Subject: [PATCH 18/30] D2 (#50) review round 1: F8 as a template parameter of
+Subject: [PATCH 18/31] D2 (#50) review round 1: F8 as a template parameter of
  the absorb / value_project kernels (BF16 instantiations as on main), KVB=fp8
  refused without a release, dtype and scale-shape checks, BF16 copies as on
  main

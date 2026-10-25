@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Mon, 19 Oct 2026 03:01:58 +0200
-Subject: [PATCH 24/30] batch_dsel_test: the start_mtp case uses the costs set
+Subject: [PATCH 24/31] batch_dsel_test: the start_mtp case uses the costs set
  before the reset case's MTP-cheap table
 
 ---

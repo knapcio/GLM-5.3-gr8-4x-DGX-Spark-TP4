@@ -1,0 +1,645 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knapcio <knapcio@gmail.com>
+Date: Sat, 24 Oct 2026 09:31:05 +0200
+Subject: [PATCH 31/31] S2: steer the MoE shared-expert finalize in batched
+ decode steps (shared-scope profiles)
+
+s2_layer bound each S2 layer with make_layer, whose K1 arguments start zeroed, and did not copy the shared-scope
+steering fields that layer_base sets. With a shared-scope profile, decode steps shared by two or more sessions therefore
+skipped the shared-expert correction on every steered MoE layer; attention and dense-MLP steering were applied, and solo
+decode and prefill were fully steered (kindlingai/gr8#196).
+
+- k1_steer: one helper sets the finalize steering for layer_base and s2_layer. base_bind / s2_bind hold the binding
+  steps after make_layer (same code, same order); s2_bind refuses a binding whose steering differs from today's layer
+  of the same M.
+- Runtime signature " s2steer 1" with a shared-scope profile; boot receipt "steering S2: X of Y S2 MoE layer bindings
+  ..." per rank.
+- s2_steer_test: the production bindings, and S2 rows of the shared finalize and the attention consume against each
+  session's and each row's own launch, byte for byte. Built by scripts/build.sh with the other steering fixtures and by
+  scripts/c1_tests.sh (EXTRA=-DDEC_S2).
+
+Steering off: no change to the K1 arguments, the signature or the device code.
+---
+ engine/runtime/g6m4.cu                |  12 +-
+ engine/runtime/rank.cuh               |  51 ++--
+ engine/runtime/s2.cuh                 |  47 ++-
+ engine/runtime/tests/s2_steer_test.cu | 399 ++++++++++++++++++++++++++
+ scripts/build.sh                      |   5 +-
+ scripts/c1_tests.sh                   |   8 +-
+ 6 files changed, 492 insertions(+), 30 deletions(-)
+ create mode 100644 engine/runtime/tests/s2_steer_test.cu
+
+diff --git a/engine/runtime/g6m4.cu b/engine/runtime/g6m4.cu
+index fbb0f93..772f3cb 100644
+--- a/engine/runtime/g6m4.cu
++++ b/engine/runtime/g6m4.cu
+@@ -1539,7 +1539,10 @@ int main(int argc, char** argv)
+                 (dsel_posclk ? " dselposclk 1" : "") +
+                 (dsel_model ? " dselmodel " + std::to_string(dsel_model) + " " + dsel_tab.str() : "") + s2::kstopb_sig(kstop.b) +
+                 (cp_step ? " cpsr " + std::to_string(cp_step) + (sc.cp_seg ? " seg" : "") : "") +
+-                (g6_attn_ctx_sp() ? " ctxsp " + std::to_string(g6_attn_ctx_sp()) : "") + (g6_attn_posidx() ? " posidx 1" : "");
++                (g6_attn_ctx_sp() ? " ctxsp " + std::to_string(g6_attn_ctx_sp()) : "") + (g6_attn_posidx() ? " posidx 1" : "") +
++                // the S2 layers carry the shared-scope MoE finalize steering; every rank must (a rank without it would
++                // leave its share of the shared-expert correction out of batched steps)
++                (steering_boot.loaded && steering_profile.scope == steering::Scope::Shared ? " s2steer 1" : "");
+             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
+                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
+             g6s2::ControlLinks links = g6s2::bootstrap(bc);
+@@ -1560,6 +1563,13 @@ int main(int argc, char** argv)
+             {
+                 nd.capture_all(sc.limit(), mtp, plan.chunk, kstop.b, cp_step);
+                 m.dfl_tap = tap;
++                if (steering_boot.loaded)    // receipt: with shared scope every captured S2 MoE binding is steered
++                {
++                    int s2moe = 0, s2st = 0;
++                    s2_steer_count(m, s2moe, s2st);
++                    fprintf(stderr, "# rank %d: steering S2: %d of %d S2 MoE layer bindings carry the shared-scope finalize steering (scope %s)\n",
++                            R, s2st, s2moe, steering::scope_name(steering_profile.scope));
++                }
+                 wcheck::seal(R);
+                 int dev = 0;
+                 G6RT_CK(cudaGetDevice(&dev));
+diff --git a/engine/runtime/rank.cuh b/engine/runtime/rank.cuh
+index d46b32d..d1e41a6 100644
+--- a/engine/runtime/rank.cuh
++++ b/engine/runtime/rank.cuh
+@@ -864,6 +864,38 @@ inline void qs_narrow(Model& m, int i, bind::Layer& L)
+     else bind::make_gv_multi({&L.q_a, &L.kv_a, &L.idx_k, &L.idx_w}, L.M, L.x_in);
+ }
+ 
++// Shared-scope steering of layer i's MoE decode finalize (tr3.cuh tr3_fin_body): the profile's direction and alpha, the
++// step's per-row scales (k_step_in) and the dot scratch. Every decode binding of the layer takes these same fields: today's
++// layer (layer_base) and the S2 batched layers (s2_layer), so a row is steered by the same arithmetic whichever path runs
++// it. A dense layer, full scope (the MLP consume steers instead) or a model without directions (no profile, the draft
++// model) keeps make_k1's zero fields: the stock finalize, unchanged arguments.
++inline void k1_steer(const Model& m, int i, bind::K1& k)
++{
++    if (!m.layers[i].moe || m.steering_scope != steering::Scope::Shared || i >= (int)m.steering_dir.size()) return;
++    k.a.steer_dir = m.steering_dir[i]; k.a.steer_scale = m.steering_scale;
++    k.a.steer_alpha = m.steering_alpha[i]; k.a.steer_part = m.steering_part; k.a.steer_count = m.steering_count;
++}
++
++// today's layer i after make_layer: K1 steering, the head-count check, G6_QA_SPLIT narrowing, DEC_SLOT slots
++// (layer_base; s2_bind is the S2 layers' counterpart; s2_steer_test drives both)
++inline void base_bind(Model& m, int i, bind::Layer& L)
++{
++    const Layer& y = m.layers[i];
++    k1_steer(m, i, L.k1);
++    if (L.heads != y.ab.args.heads) die("kernel binder and attention binder disagree on the head count");
++    qs_narrow(m, i, L);
++#ifdef DEC_SLOT
++    // DEC_SLOT: o_proj and the K1 finalize / dense fc2 write the partial into the send slot (decslot.cuh)
++    auto slot = [&](int c) {
++        dslot::Slot q;
++        q.send = m.f.send; q.bell = m.f.doorbell; q.stepp = m.stepp; q.stride = m.f.stride;
++        q.ncoll = m.f.ncoll; q.c = c; q.ticket = m.tickets + c; q.xt = m.f.xt;
++        return q;
++    };
++    bind::set_slots(L, slot(2 * i), slot(2 * i + 1));
++#endif
++}
++
+ #ifdef DEC_S2
+ inline const bind::Layer& s2_layer(Model& m, int i, int M);
+ inline const bind::Layer& layer_base(Model& m, int i, int M);
+@@ -891,24 +923,7 @@ inline const bind::Layer& G6RT_LAYER_BASE(Model& m, int i, int M)
+         static const int fuse = getenv("G6_FUSE") ? atoi(getenv("G6_FUSE")) : 1;
+         if (const char* e = bind::make_layer(y.T, M, m.sc, io, y.L[M], fuse))
+             die("rank " + std::to_string(m.rank) + " layer " + std::to_string(y.l) + ": " + e);
+-        if (y.moe && m.steering_scope == steering::Scope::Shared && i < (int)m.steering_dir.size())
+-        {
+-            bind::K1& k = y.L[M].k1;
+-            k.a.steer_dir = m.steering_dir[i]; k.a.steer_scale = m.steering_scale;
+-            k.a.steer_alpha = m.steering_alpha[i]; k.a.steer_part = m.steering_part; k.a.steer_count = m.steering_count;
+-        }
+-        if (y.L[M].heads != y.ab.args.heads) die("kernel binder and attention binder disagree on the head count");
+-        qs_narrow(m, i, y.L[M]);
+-#ifdef DEC_SLOT
+-        // DEC_SLOT: o_proj and the K1 finalize / dense fc2 write the partial into the send slot (decslot.cuh)
+-        auto slot = [&](int c) {
+-            dslot::Slot q;
+-            q.send = m.f.send; q.bell = m.f.doorbell; q.stepp = m.stepp; q.stride = m.f.stride;
+-            q.ncoll = m.f.ncoll; q.c = c; q.ticket = m.tickets + c; q.xt = m.f.xt;
+-            return q;
+-        };
+-        bind::set_slots(y.L[M], slot(2 * i), slot(2 * i + 1));
+-#endif
++        base_bind(m, i, y.L[M]);
+         y.built[M] = true;
+     }
+     return y.L[M];
+diff --git a/engine/runtime/s2.cuh b/engine/runtime/s2.cuh
+index dfd7d0b..fc4c336 100644
+--- a/engine/runtime/s2.cuh
++++ b/engine/runtime/s2.cuh
+@@ -544,8 +544,31 @@ inline void s2_hprev_from_solo(Draft& D, int q, cudaStream_t st)
+     G6RT_CK(cudaMemcpyAsync(D.d.s2->hprev_b + (size_t)q * HID, D.hprev, HID * 2, cudaMemcpyDeviceToDevice, st));
+ }
+ 
++// the K1 steering fields of two bindings agree (the S2 layer against today's layer of the same M)
++inline bool s2_steer_same(const bind::K1& a, const bind::K1& b)
++{
++    return a.a.steer_dir == b.a.steer_dir && a.a.steer_scale == b.a.steer_scale && a.a.steer_part == b.a.steer_part &&
++           a.a.steer_count == b.a.steer_count && std::memcmp(&a.a.steer_alpha, &b.a.steer_alpha, sizeof(float)) == 0;
++}
++// an S2 layer i after make_layer (s2_layer): the head-count check, G6_QA_SPLIT narrowing as layer_base, the MoE
++// finalize's shared-scope steering (k1_steer, refused unless it equals today's layer `base` of the same M), and the
++// DEC_SLOT slots of `base`
++inline void s2_bind(Model& m, int i, const bind::Layer& base, bind::Layer& L)
++{
++    const Layer& y = m.layers[i];
++    if (L.heads != y.ab.args.heads) die("kernel binder and attention binder disagree on the head count");
++    qs_narrow(m, i, L);                                 // G6_QA_SPLIT: this rank's tiles of the input GEMVs, as layer_base
++    k1_steer(m, i, L.k1);                               // shared-scope steering of the MoE finalize, as layer_base
++    if (!s2_steer_same(L.k1, base.k1))
++        die("s2: rank " + std::to_string(m.rank) + " layer " + std::to_string(y.l) + ": K1 steering differs from today's layer");
++#ifdef DEC_SLOT
++    bind::set_slots(L, base.o_proj.slot, base.k1.a.slot);
++#endif
++}
+ // the bound layer of the step's row class (A1): today's arguments except the k1 split (split_m = cls) and o_proj's
+-// fragment source (the concatenated attention rows)
++// fragment source (the concatenated attention rows). The MoE finalize's shared-scope steering is today's (k1_steer in
++// s2_bind): without it the S2 layers keep make_k1's zero steering fields, and batched decode (2+ sessions) would run the
++// steered MoE layers' shared-expert finalize unsteered while solo decode and prefill steer it.
+ inline const bind::Layer& s2_layer(Model& m, int i, int M)
+ {
+     S2Model& s = *m.s2;
+@@ -565,15 +588,23 @@ inline const bind::Layer& s2_layer(Model& m, int i, int M)
+     std::unique_ptr<bind::Layer> L(new bind::Layer());
+     if (const char* e = bind::make_layer(y.T, M, m.sc, io, *L, fuse, s.h.cls))
+         die("s2: rank " + std::to_string(m.rank) + " layer " + std::to_string(y.l) + ": " + e);
+-    if (L->heads != y.ab.args.heads) die("kernel binder and attention binder disagree on the head count");
+-    qs_narrow(m, i, *L);                                // G6_QA_SPLIT: this rank's tiles of the input GEMVs, as layer_base
+-#ifdef DEC_SLOT
+-    bind::set_slots(*L, base.o_proj.slot, base.k1.a.slot);
+-#else
+-    (void)base;
+-#endif
++    s2_bind(m, i, base, *L);
+     return *(s.L[key] = std::move(L));
+ }
++// boot receipt, after the S2 graphs are captured: of the bound S2 layers (every (layer, M, cls) key), the MoE ones and
++// those whose finalize carries a shared-scope steering direction
++inline void s2_steer_count(const Model& m, int& moe, int& steered)
++{
++    moe = steered = 0;
++    if (!m.s2) return;
++    for (const auto& kv : m.s2->L)
++    {
++        const bind::K1& k = kv.second->k1;
++        if (!k.on || k.dense) continue;
++        ++moe;
++        steered += k.a.steer_dir != nullptr;
++    }
++}
+ 
+ // attention step of the j-th session of the step on layer i (its rows of the step's inputs, its slot's binding)
+ inline G6AttnStep s2_step(Model& m, int i, int j, int context)
+diff --git a/engine/runtime/tests/s2_steer_test.cu b/engine/runtime/tests/s2_steer_test.cu
+new file mode 100644
+index 0000000..51b3062
+--- /dev/null
++++ b/engine/runtime/tests/s2_steer_test.cu
+@@ -0,0 +1,399 @@
++// S2 batched decode steers each row as solo (K1) decode does. One GPU, synthetic inputs, no model or network.
++// Needs -DDEC_S2 (the S2 path); without it the test prints SKIP (EXTRA=-DDEC_S2 scripts/c1_tests.sh <bin_dir>).
++//
++// Part A (host): the production binding steps. base_bind (layer_base) and s2_bind (s2_layer) run on fresh K1Args (as
++// make_k1 leaves them) for dense / steered MoE / unlisted MoE / absent layers, without a profile, in shared and full
++// scope: the S2 binding's steering must equal today's and the model's; without a profile both keep make_k1's bytes
++// (all of K1Args before the DEC_SLOT slot). A regression that drops k1_steer from s2_bind dies in s2_bind's own check
++// (exit != 0) or fails these checks.
++// Part B (shared-expert site, k1_tr3_fin): the steering fields come from those bindings (S2 launch: the s2_bind binding;
++// K1 launches: the base_bind binding; "old": a binding without k1_steer, i.e. make_k1's zeros, as s2_layer bound it before), and the per-row
++// scales reach the model's device scale vector through the production k_step_in from a StepIn. One S2-shaped launch of
++// M rows from several sessions against a K1-shaped launch of each session alone and of every row alone (rows renumbered
++// from 0, the same routed / shared partials, weights, scale): identical bytes per row. Scale-0 rows equal unsteered
++// bytes, steered rows differ from them, and the old binding misses every steered row.
++// Part C (attention site, k_ar_add_norm): the same S2-vs-K1 row comparison for the consume (residual, normed output and,
++// under DEC_SLOT, the row's fragment-table words).
++// The comparisons establish row invariance given identical pre-steering data, not end-to-end solo/batch identity, and
++// read device memory after synchronization (no CPU / NIC publication check; steering_shared_test has that).
++// Pass: last line "s2_steer_test: N checks, 0 failures  ALL IDENTICAL".
++#ifndef DEC_S2
++#include <cstdio>
++int main()
++{
++    std::printf("SKIP s2_steer_test: build with -DDEC_S2 (EXTRA=-DDEC_S2 scripts/c1_tests.sh <bin_dir>)\n");
++    return 0;
++}
++#else
++#include "../prefill.cuh"
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++#define CK(x) do { auto e=(x); if(e!=cudaSuccess) { std::fprintf(stderr,"CUDA %s (%s:%d)\n",cudaGetErrorString(e),__FILE__,__LINE__); std::exit(2); } } while(0)
++using namespace g6rt;
++static int checks=0, failures=0;
++static void check(bool ok,const char* what,const char* ctx="") { ++checks; if(!ok) { ++failures; std::printf("FAIL %s %s\n",what,ctx); } }
++struct Arena {
++    std::vector<void*> owned;
++    template<class T> T* alloc(size_t n) { T* p; CK(cudaMalloc(&p,std::max<size_t>(n,1)*sizeof(T))); owned.push_back(p); CK(cudaMemset(p,0,std::max<size_t>(n,1)*sizeof(T))); return p; }
++    ~Arena() { for(void* p:owned) cudaFree(p); }
++};
++template<class T> static void put(T* p,const std::vector<T>& v) { CK(cudaMemcpy(p,v.data(),v.size()*sizeof(T),cudaMemcpyHostToDevice)); }
++template<class T> static std::vector<T> get(const T* p,size_t n) { std::vector<T> v(n); CK(cudaMemcpy(v.data(),p,n*sizeof(T),cudaMemcpyDeviceToHost)); return v; }
++
++// ------------------------------------------------------------------------------------------------- Part A
++static std::unique_ptr<bind::Layer> fresh_layer() {
++    std::unique_ptr<bind::Layer> L(new bind::Layer());
++    std::memset(&L->k1.a,0,sizeof L->k1.a);                  // make_k1: memset(&a, 0, sizeof a)
++    return L;
++}
++#ifdef DEC_SLOT
++constexpr size_t K1_HEAD=offsetof(K1Args,slot);              // the DEC_SLOT slot is K1Args' last member
++#else
++constexpr size_t K1_HEAD=sizeof(K1Args);
++#endif
++static bool steer_is(const K1Args& a,const float* dir,const float* scale,float alpha,const float* part,const unsigned* count) {
++    return a.steer_dir==dir && a.steer_scale==scale && a.steer_alpha==alpha && a.steer_part==part && a.steer_count==count;
++}
++static void wiring() {
++    Model m;
++    static unsigned tickets[2*5+1];                     // base_bind's DEC_SLOT slots point into it (never dereferenced here)
++    m.tickets=tickets;
++    const float* d0=reinterpret_cast<const float*>(uintptr_t(0x1000));
++    const float* d1=reinterpret_cast<const float*>(uintptr_t(0x2000));
++    float* scale=reinterpret_cast<float*>(uintptr_t(0x3000));
++    float* part=reinterpret_cast<float*>(uintptr_t(0x4000));
++    unsigned* count=reinterpret_cast<unsigned*>(uintptr_t(0x5000));
++    m.layers.resize(5);
++    const bool moe[5]={false,true,true,true,true};
++    for(int i=0;i<5;++i) m.layers[i].moe=moe[i];
++    const auto zero=fresh_layer();
++    // no profile (steering off): both bindings keep make_k1's bytes before the slot
++    for(int i=0;i<5;++i) {
++        auto base=fresh_layer(), s2=fresh_layer();
++        base_bind(m,i,*base); s2_bind(m,i,*base,*s2);
++        check(std::memcmp(&base->k1.a,&zero->k1.a,K1_HEAD)==0 && std::memcmp(&s2->k1.a,&zero->k1.a,K1_HEAD)==0,
++              "steering off: base_bind / s2_bind leave make_k1's K1Args bytes");
++#ifdef DEC_SLOT
++        check(std::memcmp(&s2->k1.a.slot,&base->k1.a.slot,sizeof(dslot::Slot))==0,"s2_bind takes today's K1 slot");
++#endif
++    }
++    m.steering_scale=scale; m.steering_part=part; m.steering_count=count;
++    m.steering_dir={nullptr,d0,nullptr,d1};             // layer 2: MoE outside the profile; layer 4: past the vector
++    m.steering_alpha={0.f,3.f,0.f,2.5f};
++    m.steering_scope=steering::Scope::Shared;
++    for(int i=0;i<5;++i) {
++        auto base=fresh_layer(), s2=fresh_layer(), old=fresh_layer();
++        base_bind(m,i,*base); s2_bind(m,i,*base,*s2);
++        const bool want=moe[i] && i<4;
++        if(want) {
++            check(steer_is(base->k1.a,m.steering_dir[i],scale,m.steering_alpha[i],part,count),"shared scope: today's MoE layer takes the model's steering");
++            check(steer_is(s2->k1.a,m.steering_dir[i],scale,m.steering_alpha[i],part,count),"shared scope: the S2 layer takes the same steering");
++        } else {
++            check(std::memcmp(&base->k1.a,&zero->k1.a,K1_HEAD)==0 && std::memcmp(&s2->k1.a,&zero->k1.a,K1_HEAD)==0,
++                  "shared scope: dense / absent layer keeps make_k1's bytes in both bindings");
++        }
++        check(s2_steer_same(s2->k1,base->k1),"S2 and today's binding agree");
++        if(m.steering_dir.size()>size_t(i) && m.steering_dir[i]) check(!s2_steer_same(old->k1,base->k1),"the old S2 binding (zero fields) disagrees");
++    }
++    m.steering_scope=steering::Scope::Full;
++    for(int i=0;i<5;++i) {
++        auto base=fresh_layer(), s2=fresh_layer();
++        base_bind(m,i,*base); s2_bind(m,i,*base,*s2);
++        check(std::memcmp(&base->k1.a,&zero->k1.a,K1_HEAD)==0 && std::memcmp(&s2->k1.a,&zero->k1.a,K1_HEAD)==0,
++              "full scope: finalize unsteered in both bindings (the MLP consume steers)");
++    }
++}
++
++// the model the kernel launches take their steering from: one steered MoE layer, the profile's alpha, device direction,
++// scale vector (k_step_in), dot scratch; its today / S2 / old (no k1_steer) bindings
++struct Env {
++    Arena mem;
++    Model m;
++    std::unique_ptr<bind::Layer> base, s2, old;
++    uint32_t* in=nullptr; u64* stepp=nullptr; int *tok=nullptr,*pos=nullptr,*tgt=nullptr; glue::SampleRow* srow=nullptr;
++};
++static std::vector<float> direction();
++static Env* env_make() {
++    Env* v=new Env;
++    Model& m=v->m;
++    m.layers.resize(1); m.layers[0].moe=true;
++    m.tickets=v->mem.alloc<unsigned>(3);                  // [2*nl+1], as the model allocates them
++    float* dd=v->mem.alloc<float>(HID); put(dd,direction());
++    m.steering_dir={dd}; m.steering_alpha={3.f};          // ablit-behavior-v1 embeds alpha 3.0
++    m.steering_scope=steering::Scope::Shared;
++    m.steering_scale=v->mem.alloc<float>(MX); m.steering_part=v->mem.alloc<float>(size_t(MX)*48); m.steering_count=v->mem.alloc<unsigned>(MX);
++    v->base=fresh_layer(); v->s2=fresh_layer(); v->old=fresh_layer();
++    base_bind(m,0,*v->base); s2_bind(m,0,*v->base,*v->s2);
++    v->in=v->mem.alloc<uint32_t>(sizeof(StepIn)/4+1); v->stepp=v->mem.alloc<u64>(1);
++    v->tok=v->mem.alloc<int>(MX); v->pos=v->mem.alloc<int>(MX); v->tgt=v->mem.alloc<int>(MX); v->srow=v->mem.alloc<glue::SampleRow>(MX);
++    return v;
++}
++// the step's per-row scales -> the model's device scale vector, through StepIn and the production k_step_in
++static void transport(Env& v,const std::vector<float>& scales) {
++    StepIn si; std::memset(&si,0,sizeof si);
++    si.step=1; si.M=int(scales.size()); si.context=1;
++    for(size_t r=0;r<scales.size();++r) si.steering_scale[r]=scales[r];
++    CK(cudaMemcpy(v.in,&si,sizeof si,cudaMemcpyHostToDevice));
++    k_step_in<<<1,128>>>(StepCtl{v.in,v.stepp,v.tok,v.pos,v.tgt,v.m.steering_scale,v.srow,nullptr,nullptr,0});
++    CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
++    const auto got=get(v.m.steering_scale,MX);
++    bool ok=true; for(int r=0;r<MX;++r) ok &= got[r]==(size_t(r)<scales.size() ? scales[r]:0.f);
++    check(ok,"k_step_in: per-row scales, padding +0");
++}
++static Env* ENV=nullptr;
++
++// ------------------------------------------------------------------------------------------------- Part B
++// Synthetic step of M rows, plan 0. Routed slots as the production layout of the fixture (two slots per 8-row tile,
++// column = row % 8; some routes absent), the shared expert at slot n_slots + m / 8, column m % 8.
++struct FinStep {
++    int M=0;
++    int nslots=0, nsh=0;
++    std::vector<int> experts, slots, cols; std::vector<float> weights;
++    std::vector<__half> z, ys; std::vector<float> scales;
++};
++constexpr int FB=2, FE=3;
++static FinStep make_step(int M,int seed) {
++    FinStep s; s.M=M; s.nsh=(M+7)/8; s.nslots=2*s.nsh;
++    s.experts.assign(SMAX,0); s.slots.assign(G6_MX*8,-1); s.cols.assign(G6_MX*8,0); s.weights.assign(G6_MX*8,0.f);
++    for(int q=0;q<s.nslots;++q) s.experts[q]=q%2;
++    for(int m=0;m<M;++m) for(int k=0;k<8;++k) {
++        const int t=m*8+k;
++        if((k+m+seed)%5!=0) { s.slots[t]=2*(m/8)+k%2; s.cols[t]=m%8; s.weights[t]=float(1+(k+m+seed)%3)/16.f; }
++    }
++    s.z.resize(size_t(s.nslots+s.nsh)*FB*8*HID);
++    for(int q=0;q<s.nslots+s.nsh;++q) for(int b=0;b<FB;++b) for(int m=0;m<8;++m) for(int c=0;c<HID;++c) {
++        const float v=c%128==0 ? (c/128%2 ? -1.f:1.f)*(1.f+float((q+b+m+seed)%5)/8.f) : float((c*7+q*3+b+m*5+seed)%13-6)/512.f;
++        s.z[((size_t(q)*FB+b)*8+m)*HID+c]=__float2half_rn(v);
++    }
++    s.ys.resize(size_t(M+1)*HID);
++    for(int m=0;m<M;++m) for(int c=0;c<HID;++c) s.ys[size_t(m+1)*HID+c]=__float2half_rn(float((c*3+m*7+seed)%17-8)/64.f);
++    s.scales.assign(M,0.f);
++    return s;
++}
++// rows [r0, r0 + n) of s as their own step (K1: one session's rows; n = 1: one row), rows renumbered from 0. Each
++// (row, slot parity) keeps its partials: z of (slot 2 (r / 8) + u, column r % 8) -> (slot 2 (j / 8) + u, column j % 8),
++// same expert (parity), same routes, weights and scale.
++static FinStep sub_step(const FinStep& s,int r0,int n) {
++    FinStep t; t.M=n; t.nsh=(n+7)/8; t.nslots=2*t.nsh;
++    t.experts.assign(SMAX,0); t.slots.assign(G6_MX*8,-1); t.cols.assign(G6_MX*8,0); t.weights.assign(G6_MX*8,0.f);
++    for(int q=0;q<t.nslots;++q) t.experts[q]=q%2;
++    t.z.assign(size_t(t.nslots+t.nsh)*FB*8*HID,__float2half_rn(0.f));
++    t.ys.assign(size_t(n+1)*HID,__float2half_rn(0.f));
++    auto copyz=[&](int qs,int cs,int qd,int cd) { for(int b=0;b<FB;++b) std::memcpy(&t.z[((size_t(qd)*FB+b)*8+cd)*HID],&s.z[((size_t(qs)*FB+b)*8+cs)*HID],HID*2); };
++    for(int j=0;j<n;++j) {
++        const int r=r0+j;
++        for(int k=0;k<8;++k) {
++            const int ts=r*8+k, td=j*8+k;
++            if(s.slots[ts]<0) continue;
++            t.slots[td]=2*(j/8)+k%2; t.cols[td]=j%8; t.weights[td]=s.weights[ts];
++            if(s.experts[s.slots[ts]]!=t.experts[t.slots[td]]) { std::fprintf(stderr,"sub_step: expert remap\n"); std::exit(2); }
++        }
++        for(int u=0;u<2;++u) copyz(2*(r/8)+u,r%8,2*(j/8)+u,j%8);
++        copyz(s.nslots+r/8,r%8,t.nslots+j/8,j%8);
++        std::memcpy(&t.ys[size_t(j+1)*HID],&s.ys[size_t(r+1)*HID],HID*2);
++    }
++    t.scales.assign(s.scales.begin()+r0,s.scales.begin()+r0+n);
++    return t;
++}
++// one k1_tr3_fin launch of step s with the steering of binding `bound` (its fields, the model's scale vector written by
++// k_step_in from s.scales); returns the M x HID output words (out, or the device send slot under slot)
++static std::vector<unsigned short> run_fin(const FinStep& s,bool sh,bool bf,bool slot,const K1Args& bound) {
++    Arena mem;
++    const int M=s.M;
++    std::vector<long long> tab(FE*6,0);
++    for(int e=0;e<FE;++e) { tab[e*6+2]=e*FB; tab[e*6+3]=e==1 ? 1:FB; }
++    std::vector<__half> sg(2*HID), v3(FE*FB*HID), vb(FE*FB*48);
++    for(int c=0;c<2*HID;++c) sg[c]=__float2half_rn(c%3==0 ? -1.f:1.f);
++    for(int r=0;r<FE*FB;++r) for(int c=0;c<HID;++c) v3[size_t(r)*HID+c]=__float2half_rn((c%3==0 ? -1.f:1.f)*float(2+(r+c/128)%3)/8.f);
++    for(int r=0;r<FE*FB;++r) for(int b=0;b<48;++b) vb[r*48+b]=__float2half_rn(float(2+(r+b)%3)/8.f);
++    K1Args a{}; a.M=M; a.n_slots=s.nslots; a.n_plans=1; a.B=FB; a.sh_e=2; a.out_bf16=bf; a.ysh=1;
++    a.ctl=mem.alloc<int>(3);
++    a.slot_expert=mem.alloc<int>(s.experts.size()); put(const_cast<int*>(a.slot_expert),s.experts);
++    a.tok_slot=mem.alloc<int>(s.slots.size()); put(const_cast<int*>(a.tok_slot),s.slots);
++    a.tok_col=mem.alloc<int>(s.cols.size()); put(const_cast<int*>(a.tok_col),s.cols);
++    a.tok_w=mem.alloc<float>(s.weights.size()); put(const_cast<float*>(a.tok_w),s.weights);
++    a.t_tab=mem.alloc<long long>(tab.size()); put(const_cast<long long*>(a.t_tab),tab);
++    a.t_sg=mem.alloc<__half>(sg.size()); put(const_cast<__half*>(a.t_sg),sg);
++    a.t_v3=mem.alloc<__half>(v3.size()); put(const_cast<__half*>(a.t_v3),v3);
++    a.t_v3b=mem.alloc<__half>(vb.size()); put(const_cast<__half*>(a.t_v3b),vb);
++    a.z=mem.alloc<__half>(s.z.size()); put(a.z,s.z);
++    a.ypart=mem.alloc<__half>(s.ys.size()); put(a.ypart,s.ys);
++    const size_t N=size_t(M)*HID;
++    a.out=mem.alloc<__half>(N+HID); CK(cudaMemset(a.out,0x5a,(N+HID)*2));
++    transport(*ENV,s.scales);
++    a.steer_dir=bound.steer_dir; a.steer_scale=bound.steer_scale; a.steer_alpha=bound.steer_alpha;
++    a.steer_part=bound.steer_part; a.steer_count=bound.steer_count;
++    const unsigned short* target=reinterpret_cast<const unsigned short*>(a.out);
++#ifdef DEC_SLOT
++    if(slot) {
++        const size_t stride=(N+HID)*2;
++        char* send=mem.alloc<char>(4*stride); CK(cudaMemset(send,0x5a,4*stride));
++        auto* bell=mem.alloc<unsigned long long>(2); auto* ticket=mem.alloc<unsigned>(1); auto* step=mem.alloc<u64>(1);
++        const u64 one=1; CK(cudaMemcpy(step,&one,sizeof one,cudaMemcpyHostToDevice));
++        a.slot={send,bell,step,stride,2,1,ticket,nullptr};
++        target=reinterpret_cast<const unsigned short*>(send+((1&1)*2+1)*stride);
++    }
++#else
++    if(slot) { std::fprintf(stderr,"slot case without DEC_SLOT\n"); std::exit(2); }
++#endif
++    if(sh) k1_tr3_fin<true><<<M*48,160>>>(a); else k1_tr3_fin<false><<<M*48,128>>>(a);
++    CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
++    const auto cnt=get(ENV->m.steering_count,MX);
++    check(std::all_of(cnt.begin(),cnt.end(),[](unsigned x){return x==0u;}),"finalize: arrival counters reset");
++    return get(target,N);
++}
++static bool row_eq(const std::vector<unsigned short>& a,int ra,const std::vector<unsigned short>& b,int rb) {
++    return std::memcmp(a.data()+size_t(ra)*HID,b.data()+size_t(rb)*HID,HID*2)==0;
++}
++static std::vector<float> direction() {
++    std::vector<float> d(HID); double n=0;
++    for(int c=0;c<HID;++c) { d[c]=(c/128%2 ? -1.f:1.f)*(1.f+float(c%11)/16.f); n+=double(d[c])*d[c]; }
++    for(int c=0;c<HID;++c) d[c]=float(d[c]/std::sqrt(n));
++    return d;
++}
++// the scale of session j under pattern p: 0 forced 1.0 (the served --steering-force 1.0), 1 per-session mixed, 2 all zero
++static float pattern_scale(int p,int j) { static const float mix[4]={1.f,0.f,.5f,2.f}; return p==0 ? 1.f : p==1 ? mix[j%4] : 0.f; }
++static void fin_layout(bool sh,bool bf,bool slot,const std::vector<int>& sess,int pat) {
++    int M=0; for(int n:sess) M+=n;
++    FinStep s=make_step(M,M*3+int(sess.size()));
++    { int r=0; for(size_t j=0;j<sess.size();++j) for(int k=0;k<sess[j];++k) s.scales[r++]=pattern_scale(pat,int(j)); }
++    char ctx[160]; std::snprintf(ctx,sizeof ctx,"(SH=%d bf16=%d slot=%d M=%d S=%zu pat=%d)",sh,bf,slot,M,sess.size(),pat);
++    const K1Args& S2=ENV->s2->k1.a; const K1Args& K1=ENV->base->k1.a;
++    const auto s2=run_fin(s,sh,bf,slot,S2);                      // the S2 step, s2_bind's binding
++    const auto pre=run_fin(s,sh,bf,slot,ENV->old->k1.a);         // the S2 step with the old binding = unsteered bytes
++    int r0=0, steered=0, live=0, missed=0;
++    bool sess_ok=true, row_ok=true, off_ok=true;
++    for(size_t j=0;j<sess.size();++j) {
++        const int n=sess[j];
++        const auto k1=run_fin(sub_step(s,r0,n),sh,bf,slot,K1);                  // the session alone (K1, base_bind)
++        for(int r=0;r<n;++r) {
++            sess_ok &= row_eq(s2,r0+r,k1,r);
++            const auto one=run_fin(sub_step(s,r0+r,1),sh,bf,slot,K1);              // the row alone (K1, M = 1)
++            row_ok &= row_eq(s2,r0+r,one,0);
++            if(s.scales[r0+r]!=0.f) { ++steered; live+=!row_eq(s2,r0+r,pre,r0+r); missed+=!row_eq(pre,r0+r,k1,r); }
++            else off_ok &= row_eq(s2,r0+r,pre,r0+r);
++        }
++        r0+=n;
++    }
++    check(sess_ok,"shared site: S2 row bytes == the session's own K1 launch",ctx);
++    check(row_ok,"shared site: S2 row bytes == the row's own M=1 K1 launch",ctx);
++    check(off_ok,"shared site: scale-0 rows == unsteered bytes",ctx);
++    check(live==steered,"shared site: every steered row differs from unsteered (steering live)",ctx);
++    check(missed==steered,"shared site: the old S2 binding misses every steered row (bug reproduced)",ctx);
++    std::printf("fin %s rows %d steered %d differ-from-unsteered %d old-binding-mismatch %d\n",ctx,M,steered,live,missed);
++}
++
++// ------------------------------------------------------------------------------------------------- Part C
++static float cpartial(int p,int m,int c,int seed) { return float((c*13+m*7+p*3+seed)%97-48)/64.f; }
++struct ConsOut { std::vector<float> resid; std::vector<__half> out; std::vector<u32> xf, xb; };
++// one k_ar_add_norm launch (collective 0, step 1) over rows g0..g0+M-1 of the global synthetic data
++static ConsOut run_cons(int M,int g0,const std::vector<float>& scales_global,const std::vector<float>& d,float alpha,int seed) {
++    Arena a;
++    const int nr=g6nr::NR, rank=0;
++    const size_t stride=size_t(M)*HID*2+256;
++    g6::FabricDev f{}; f.nr=nr; f.rank=rank; f.ncoll=2; f.stride=stride;
++    std::vector<char> send(4*stride,0), recv(4*nr*stride,0);
++    for(int p=0;p<nr;++p) for(int j=0;j<M;++j) for(int c=0;c<HID;++c) {
++        const auto v=__float2bfloat16(cpartial(p,g0+j,c,seed));
++        const size_t off=size_t(j)*HID*2+c*2;
++        char* dst=p==rank ? send.data()+2*stride+off : recv.data()+(2*nr+p)*stride+off;
++        std::memcpy(dst,&v,sizeof v);
++    }
++    f.send=a.alloc<char>(send.size()); f.recv=a.alloc<char>(recv.size()); put(f.send,send); put(f.recv,recv);
++    f.doorbell=a.alloc<unsigned long long>(2); f.error=a.alloc<unsigned>(1);
++    auto* step=a.alloc<u64>(1); const u64 one=1; CK(cudaMemcpy(step,&one,sizeof one,cudaMemcpyHostToDevice));
++    std::vector<float> resid(size_t(M)*HID); std::vector<__nv_bfloat16> w(HID);
++    for(int j=0;j<M;++j) for(int c=0;c<HID;++c) resid[size_t(j)*HID+c]=float(((g0+j)*31+c)%53-26)/128.f;
++    for(int c=0;c<HID;++c) w[c]=__float2bfloat16(float(3+c%5)/4.f);
++    auto* dr=a.alloc<float>(resid.size()); put(dr,resid);
++    auto* dw=a.alloc<__nv_bfloat16>(HID); put(dw,w);
++    auto* dd=a.alloc<float>(HID); put(dd,d);
++    std::vector<float> sc(scales_global.begin()+g0,scales_global.begin()+g0+M);
++    auto* ds=a.alloc<float>(M); put(ds,sc);
++    auto* out=a.alloc<__half>(size_t(M)*HID);
++    glue::ArNormArgs args{f,step,0,M,dr,dw,out,glue::RMS_EPS};
++    args.steer={dd,ds,0.f,alpha};
++#ifdef DEC_SLOT
++    const size_t fw=size_t((M+7)/8)*KSH*16*4;
++    auto* xf=a.alloc<u32>(fw); auto* xb=a.alloc<u32>(fw);
++    args.xf16=xf; args.xbf16=xb;
++#endif
++    glue::k_ar_add_norm<<<dim3(glue::RN_CL,M),glue::RN_T>>>(args);
++    CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
++    ConsOut o; o.resid=get(dr,resid.size()); o.out=get(out,size_t(M)*HID);
++#ifdef DEC_SLOT
++    o.xf=get(xf,fw); o.xb=get(xb,fw);
++#endif
++    return o;
++}
++static bool cons_row_eq(const ConsOut& a,int ra,const ConsOut& b,int rb) {
++    bool ok=std::memcmp(a.resid.data()+size_t(ra)*HID,b.resid.data()+size_t(rb)*HID,HID*4)==0 &&
++            std::memcmp(a.out.data()+size_t(ra)*HID,b.out.data()+size_t(rb)*HID,HID*2)==0;
++#ifdef DEC_SLOT
++    // the row's fragment-table words: uint4 index tile * KSH * 16 + ks * 16 + (m % 8) * 2 + half (glue.cuh frag_store)
++    const uint4* xa=reinterpret_cast<const uint4*>(a.xf.data()); const uint4* xb=reinterpret_cast<const uint4*>(b.xf.data());
++    const uint4* ya=reinterpret_cast<const uint4*>(a.xb.data()); const uint4* yb=reinterpret_cast<const uint4*>(b.xb.data());
++    for(int ks=0;ks<KSH;++ks) for(int h=0;h<2;++h) {
++        const size_t ia=size_t(ra>>3)*KSH*16+size_t(ks)*16+(ra&7)*2+h, ib=size_t(rb>>3)*KSH*16+size_t(ks)*16+(rb&7)*2+h;
++        ok &= std::memcmp(&xa[ia],&xb[ib],16)==0 && std::memcmp(&ya[ia],&yb[ib],16)==0;
++    }
++#endif
++    return ok;
++}
++static void cons_layout(const std::vector<int>& sess,int pat) {
++    int M=0; for(int n:sess) M+=n;
++    std::vector<float> sc(M), zero(M,0.f);
++    { int r=0; for(size_t j=0;j<sess.size();++j) for(int k=0;k<sess[j];++k) sc[r++]=pattern_scale(pat,int(j)); }
++    const auto d=direction(); const float alpha=3.f; const int seed=M+7*int(sess.size());
++    char ctx[120]; std::snprintf(ctx,sizeof ctx,"(M=%d S=%zu pat=%d nr=%d)",M,sess.size(),pat,g6nr::NR);
++    const auto s2=run_cons(M,0,sc,d,alpha,seed);
++    const auto un=run_cons(M,0,zero,d,alpha,seed);
++    bool sess_ok=true, row_ok=true, off_ok=true; int steered=0, live=0, r0=0;
++    for(size_t j=0;j<sess.size();++j) {
++        const int n=sess[j];
++        const auto k1=run_cons(n,r0,sc,d,alpha,seed);
++        for(int r=0;r<n;++r) {
++            sess_ok &= cons_row_eq(s2,r0+r,k1,r);
++            row_ok &= cons_row_eq(s2,r0+r,run_cons(1,r0+r,sc,d,alpha,seed),0);
++            if(sc[r0+r]!=0.f) { ++steered; live+=!cons_row_eq(s2,r0+r,un,r0+r); } else off_ok &= cons_row_eq(s2,r0+r,un,r0+r);
++        }
++        r0+=n;
++    }
++    check(sess_ok,"attention site: S2 row bytes == the session's own K1 launch",ctx);
++    check(row_ok,"attention site: S2 row bytes == the row's own M=1 K1 launch",ctx);
++    check(off_ok,"attention site: scale-0 rows == unsteered bytes",ctx);
++    check(live==steered,"attention site: every steered row differs from unsteered",ctx);
++    std::printf("consume %s rows %d steered %d differ-from-unsteered %d\n",ctx,M,steered,live);
++}
++
++int main() {
++    wiring();
++    ENV=env_make();
++    // S2 step layouts (rows per session, session-major): MTP 2 / 3 rows per session at C2 .. C8, uneven sessions, an 8-row
++    // tile boundary inside a session, the widest step; {n} alone = a solo step of n rows.
++    const std::vector<std::vector<int>> layouts={{1,1},{3,3},{2,2,2,2},{3,3,3,3},{1,8},{3,4},{5,6,5},{8,8},{3,3,3,3,3,3,3,3},
++                                                 {8,8,8,8},{4},{9}};
++    std::vector<bool> slots={false};
++#ifdef DEC_SLOT
++    slots.push_back(true);
++#endif
++    for(bool sh:{false,true}) for(bool bf:{false,true}) for(bool slot:slots) for(const auto& L:layouts) for(int pat=0;pat<3;++pat) {
++        if(G6_MX<32) { int M=0; for(int n:L) M+=n; if(M>G6_MX) continue; }
++        // keep the run short: every layout at the served form (SH, BF16, slot when built); the rest on a subset
++        const bool served=sh && bf && slot==(slots.size()>1);
++        if(!served && L.size()>4) continue;
++        fin_layout(sh,bf,slot,L,pat);
++    }
++    for(const auto& L:layouts) for(int pat=0;pat<3;++pat) {
++        if(G6_MX<32) { int M=0; for(int n:L) M+=n; if(M>G6_MX) continue; }
++        cons_layout(L,pat);
++    }
++    std::printf("s2_steer_test: %d checks, %d failures%s\n",checks,failures,failures ? "" : "  ALL IDENTICAL");
++    return failures ? 1 : 0;
++}
++#endif
+diff --git a/scripts/build.sh b/scripts/build.sh
+index f4d165a..a4aa41f 100755
+--- a/scripts/build.sh
++++ b/scripts/build.sh
+@@ -95,8 +95,9 @@ else
+   echo "tr3_e4m3_test: no GPU visible, not run"
+ fi
+ 
+-# Steering projection/consume/finalizer fixtures: compile in CI even without a GPU. No model or fabric service needed.
+-for test in steering_cuda_test steering_consume_test steering_shared_test steering_boot_cuda_test; do
++# Steering projection/consume/finalizer fixtures (and S2 batched steering, s2_steer_test): compile in CI even without a
++# GPU. No model or fabric service needed.
++for test in steering_cuda_test steering_consume_test steering_shared_test steering_boot_cuda_test s2_steer_test; do
+   # shellcheck disable=SC2086
+   nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} \
+     $K1H2_FLAGS -DG6_NR=4 -DDEC_S2 -o "$OUT/$test" "$REPO/engine/runtime/tests/$test.cu" -lcublas
+diff --git a/scripts/c1_tests.sh b/scripts/c1_tests.sh
+index ed71be2..5c9fcc8 100755
+--- a/scripts/c1_tests.sh
++++ b/scripts/c1_tests.sh
+@@ -9,7 +9,9 @@
+ # under live sessions, on caches in virtual memory, against caches that never resized; #153) and dhead_i4_test
+ # (G6_DRAFT_HEAD_I4: the MXFP8 -> INT4 head records against a host derivation, the INT4 head GEMV against a host dot;
+ # --time: MXFP8 vs INT4 head GEMV) and kvb8_test (kv_b in FP8: decode and prefill against the BF16 form of the same
+-# weights, byte for byte; --bench times absorb / value_project; #50).
++# weights, byte for byte; --bench times absorb / value_project; #50) and s2_steer_test (S2 batched decode steers each
++# row as solo decode does: the S2 and solo layer bindings, the shared-expert finalize and the attention consume per row
++# against each session's and each row's own launch; needs EXTRA=-DDEC_S2, else it only prints SKIP).
+ #   scripts/c1_tests.sh <bin_dir> [test args]       default bin_dir = ./bin; TEST=row_budget_test|s2_attn_test runs one
+ #   G6_NR=4 scripts/c1_tests.sh bin4                the TP4 build of the test
+ #   EXTRA=-DDEC_S2 scripts/c1_tests.sh bin_s2       the 32-row build: M = 1..32 against chunks of 8 (without it: M <= 8)
+@@ -114,6 +116,10 @@ fi
+ if [ "$TEST" = all ] || [ "$TEST" = steering_shared_test ]; then
+   build_run steering_shared_test -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+ fi
++if [ "$TEST" = all ] || [ "$TEST" = s2_steer_test ]; then
++  [ "$TEST" = all ] && ARGS=()
++  build_run s2_steer_test -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
++fi
+ if [ "$TEST" = all ] || [ "$TEST" = steering_consume_test ]; then
+   [ "$TEST" = all ] && ARGS=()
+   build_run steering_consume_test -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }

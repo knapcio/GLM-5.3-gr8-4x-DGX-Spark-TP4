@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Mon, 19 Oct 2026 02:47:03 +0200
-Subject: [PATCH 28/30] G6_ATTN_POSIDX: the FRONT form as its own kernel
+Subject: [PATCH 28/31] G6_ATTN_POSIDX: the FRONT form as its own kernel
  (attn_front_pos); attn_front's source as before
 
 ---

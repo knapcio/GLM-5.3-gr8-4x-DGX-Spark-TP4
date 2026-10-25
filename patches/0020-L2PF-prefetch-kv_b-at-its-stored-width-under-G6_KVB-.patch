@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: knapcio <knapcio@gmail.com>
 Date: Sun, 18 Oct 2026 19:45:00 +0200
-Subject: [PATCH 20/30] L2PF: prefetch kv_b at its stored width under
+Subject: [PATCH 20/31] L2PF: prefetch kv_b at its stored width under
  G6_KVB=fp8 (E4M3 bytes plus the f32 block scales); queue ranges 16 -> 20
 
 ---

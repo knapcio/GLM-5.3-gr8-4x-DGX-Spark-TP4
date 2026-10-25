@@ -52,6 +52,26 @@ prose 36.2 / 49.3 / 63.3, code 46.3 / 59.2 / 75.5, structured 70.6 / 65.7 / 85.0
 | v0.2 (2026-10-15) | code | 43.4 [44.3] | 58.8 [31.2] | 74.8 [21.3] |
 | v0.2 (2026-10-15) | structured | 69.5 [72.0] | 65.2 [35.4] | 84.3 [24.8] |
 
+## v0.10: steering in S2 batched decode
+
+v0.10 is v0.9 plus 0031 (the shared-scope MoE shared-expert steering in S2 steps). Measured 2026-10-24 on the four
+boxes, the v0.9 configuration with jspark-ablit's `ablit-behavior-v1` profile forced on every request
+(`STEERING_FORCE=1.0`), each boot with the host memory compacted first; v0.9 = the same configuration without 0031.
+
+| Check | v0.9 + profile | v0.10 + profile |
+|---|---|---|
+| boot receipt `steering S2` (every rank) | — (no line) | 1410 of 2250 S2 MoE layer bindings (47 of 75 MoE layers) |
+| T=0 top-20 logprobs, 75 qeval prompts (c1) | reference | 75/75 identical, KL 0 |
+| c2 / c4: truncated top-20 KL of the steered sessions vs the same prompts decoded alone (exploratory; each arm over the positions where it still followed the solo text) | 1.88e-2 / 1.92e-2 | 8.0e-3 / 7.1e-3 |
+| RigMark C1, aggregate [per-stream], two boots each | 47.5 [53.6] | 47.4 [53.1] |
+| RigMark C2 | 61.2 [35.5] | 60.4 [35.7] (−1.4 %) |
+| RigMark C4 | 75.8 [23.2] | 75.4 [23.4] (−0.5 %) |
+
+At c1 the two arms run the same path (identical logprobs); the C1 difference is inside v0.9's own boot-to-boot spread
+(46.3–48.7). The C2 / C4 differences are observed aggregates (two boots per arm); the correction's own cost in batched
+steps was not profiled separately. Without a steering profile
+0031 leaves the engine's arguments unchanged, so the release tables without a profile were not re-measured.
+
 ## v0.9: rebase, CP step rows and round-10 levers
 
 v0.9 is upstream `c53b5b8` plus thirty patches (v0.8: `6448a16` plus thirty-nine). Measured 2026-10-19, every

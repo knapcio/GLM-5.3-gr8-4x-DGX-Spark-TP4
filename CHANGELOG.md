@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.10 — 2026-10-25
+
+v0.9 plus one patch, thirty-one in all. Upstream base (`c53b5b8`) unchanged; patches 0001–0030 differ only in the
+series count of their subject lines.
+
+- Steering fix (0031): with a shared-scope steering profile (for example jspark-ablit's `ablit-behavior-v1`), every
+  decode step in S2 mode (two or more sessions active: shared steps with their verify rows and prompt tails, and a
+  session's steps while another prefills) left out the shared-expert correction on every steered MoE layer. `s2_layer`
+  bound each S2 layer with `make_layer`, whose K1 arguments start zeroed, and did not copy the steering fields that
+  `layer_base` sets. Attention and dense layers were steered in those steps; solo decode and prefill were fully
+  steered. Now one helper (`k1_steer`) sets the steering for both bindings, an S2 binding whose steering differs from
+  the solo one stops the engine, every rank prints a `steering S2: X of Y` receipt after graph capture, and the S2
+  runtime signature carries `s2steer 1` with a shared-scope profile. Host code only. New test `s2_steer_test` (built by
+  `scripts/build.sh` with the other steering fixtures). Reported upstream as
+  [kindlingai/gr8#196](https://github.com/kindlingai/gr8/issues/196).
+- Without a steering profile nothing changes (the same K1 arguments and device code), so the speed and quality tables
+  are v0.9's and were not re-measured. With `ablit-behavior-v1` forced on every request (2026-10-24, four boxes):
+  receipt 1410 of 2250 bindings (47 of 75 MoE layers) on every rank; T=0 top-20 logprobs on the 75 qeval prompts
+  identical to v0.9 with the same profile (75/75, KL 0); at c2 / c4 the steered sessions' truncated top-20 logprobs
+  were 2.4–2.7× closer to decoding alone (exploratory); RigMark C1 unchanged, C2 / C4 aggregate −1.4 % / −0.5 %, two
+  boots per arm ([docs/history.md](docs/history.md)). `s2_steer_test` on one GB10: 9,873 checks with DEC_SLOT and
+  5,128 without, 0 failures (run before the test fixture gained its ticket-array initialization, a test-only change).
+- `docker/env.example` and the Dockerfile: image tag `gr8-glm53-recipe:v0.10`.
+
 ## v0.9 — 2026-10-19
 
 Rebased onto upstream `c53b5b8` (2026-10-18; was `6448a16`). Upstream merged fifteen of v0.8's thirty-nine patches
