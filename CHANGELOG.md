@@ -22,6 +22,9 @@ series count of their subject lines.
   were 2.4–2.7× closer to decoding alone (exploratory); RigMark C1 unchanged, C2 / C4 aggregate −1.4 % / −0.5 %, two
   boots per arm ([docs/history.md](docs/history.md)). `s2_steer_test` on one GB10: 9,873 checks with DEC_SLOT and
   5,128 without, 0 failures (run before the test fixture gained its ticket-array initialization, a test-only change).
+  Rerun on this release's build of the test (2026-10-25, one GB10, every variant): 9,873 checks with DEC_SLOT, 5,128
+  without, 9,873 each at G6_NR=3 and 6, 0 failures, all identical; without DEC_S2 it prints SKIP as intended;
+  `steering_shared_test` 4,080 checks and `steering_consume_test` 2,476 checks, 0 failures.
 - `docker/env.example` and the Dockerfile: image tag `gr8-glm53-recipe:v0.10`.
 
 ## v0.9 — 2026-10-19
